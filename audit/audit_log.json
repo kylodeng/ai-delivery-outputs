@@ -109,5 +109,16 @@
       "ARCHITECTURE.md",
       "RUNBOOK.md"
     ]
+  },
+  {
+    "timestamp": "2026-04-02T12:46:00Z",
+    "tool": "uat-generate",
+    "status": "SUCCESS",
+    "source_repo": "kylodeng/ai-delivery-source",
+    "output_url": "https://github.com/kylodeng/ai-delivery-outputs/blob/main/uat/kylodeng-ai-delivery-source/v0.1.0/UAT_TEST_PACK.md",
+    "run_url": "https://github.com/kylodeng/ai-delivery-source/actions/runs/23900981640",
+    "summary": "Generated 10 UAT scenarios for v0.1.0 \u00b7 Fill in UAT_RESULTS_SHEET.csv and trigger analyse mode when done",
+    "version": "0.1.0",
+    "scenarios": 10
   }
 ]
