@@ -35,5 +35,19 @@
     "output_url": "",
     "run_url": "https://github.com/kylodeng/ai-delivery-source/actions/runs/23900145633",
     "summary": "Expecting value: line 1 column 1 (char 0)"
+  },
+  {
+    "timestamp": "2026-04-02T12:26:28Z",
+    "tool": "tech-docs",
+    "status": "SUCCESS",
+    "source_repo": "kylodeng/ai-delivery-source",
+    "output_url": "https://github.com/kylodeng/ai-delivery-outputs/blob/main/tech-docs/kylodeng-ai-delivery-source/INDEX.md",
+    "run_url": "https://github.com/kylodeng/ai-delivery-source/actions/runs/23900137935",
+    "summary": "Generated 3 documents: README, ARCHITECTURE, RUNBOOK",
+    "docs_generated": [
+      "README.md",
+      "ARCHITECTURE.md",
+      "RUNBOOK.md"
+    ]
   }
 ]
