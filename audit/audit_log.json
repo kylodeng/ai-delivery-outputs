@@ -58,5 +58,16 @@
     "output_url": "",
     "run_url": "https://github.com/kylodeng/ai-delivery-source/actions/runs/23900490062",
     "summary": "Expecting value: line 181 column 14 (char 14973)"
+  },
+  {
+    "timestamp": "2026-04-02T12:39:52Z",
+    "tool": "code-review",
+    "status": "SUCCESS",
+    "source_repo": "kylodeng/ai-delivery-source",
+    "output_url": "https://github.com/kylodeng/ai-delivery-outputs/blob/main/code-review/kylodeng-ai-delivery-source-20260402.md",
+    "run_url": "https://github.com/kylodeng/ai-delivery-source/actions/runs/23900763624",
+    "summary": "Score 62/100 - 17 findings - REQUEST_CHANGES",
+    "score": 62,
+    "findings_count": 17
   }
 ]
