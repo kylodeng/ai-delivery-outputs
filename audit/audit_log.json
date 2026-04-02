@@ -83,5 +83,17 @@
       "ARCHITECTURE.md",
       "RUNBOOK.md"
     ]
+  },
+  {
+    "timestamp": "2026-04-02T12:44:36Z",
+    "tool": "business-docs",
+    "status": "SUCCESS",
+    "source_repo": "kylodeng/ai-delivery-source",
+    "output_url": "https://github.com/kylodeng/ai-delivery-outputs/blob/main/business-docs/kylodeng-ai-delivery-source/solution-overview-v0.1.0.md",
+    "run_url": "https://github.com/kylodeng/ai-delivery-source/actions/runs/23900958643",
+    "summary": "Solution Overview drafted for Data Ingestion Pipeline v0.1.0 \u00b7 9 gap questions for human review",
+    "project": "Data Ingestion Pipeline",
+    "version": "0.1.0",
+    "gap_questions": 9
   }
 ]
