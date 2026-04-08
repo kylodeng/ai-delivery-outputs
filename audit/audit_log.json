@@ -224,5 +224,14 @@
     "output_url": "",
     "run_url": "https://github.com/kylodeng/ai-delivery-source/actions/runs/24124915968",
     "summary": "Error code: 529 - {'type': 'error', 'error': {'type': 'overloaded_error', 'message': 'Overloaded'}, 'request_id': 'req_011CZqxntZxjj2U6LAzLmmHp'}"
+  },
+  {
+    "timestamp": "2026-04-08T08:15:07Z",
+    "tool": "auto-testing",
+    "status": "FAILED",
+    "source_repo": "kylodeng/Insurance-Training-Bot-main",
+    "output_url": "",
+    "run_url": "https://github.com/kylodeng/Insurance-Training-Bot-main/actions/runs/24125131388",
+    "summary": "Error code: 529 - {'type': 'error', 'error': {'type': 'overloaded_error', 'message': 'Overloaded'}, 'request_id': 'req_011CZqyGSJghTK7ZSD4AoPQ2'}"
   }
 ]
