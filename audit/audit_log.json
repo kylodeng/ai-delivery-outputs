@@ -190,5 +190,19 @@
     "summary": "Generated 10 UAT scenarios for v0.1.0 \u00b7 Fill in UAT_RESULTS_SHEET.csv and trigger analyse mode when done",
     "version": "0.1.0",
     "scenarios": 10
+  },
+  {
+    "timestamp": "2026-04-08T05:52:52Z",
+    "tool": "tech-docs",
+    "status": "SUCCESS",
+    "source_repo": "kylodeng/Insurance-Training-Bot-main",
+    "output_url": "https://github.com/kylodeng/ai-delivery-outputs/blob/main/tech-docs/kylodeng-Insurance-Training-Bot-main/INDEX.md",
+    "run_url": "https://github.com/kylodeng/Insurance-Training-Bot-main/actions/runs/24120084290",
+    "summary": "Generated 3 documents: README, ARCHITECTURE, RUNBOOK",
+    "docs_generated": [
+      "README.md",
+      "ARCHITECTURE.md",
+      "RUNBOOK.md"
+    ]
   }
 ]
