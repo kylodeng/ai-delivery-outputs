@@ -215,5 +215,14 @@
     "summary": "Generated tests for 8 files \u00b7 36 TODOs to complete",
     "files_processed": 8,
     "mode": "generate"
+  },
+  {
+    "timestamp": "2026-04-08T08:08:49Z",
+    "tool": "auto-testing",
+    "status": "FAILED",
+    "source_repo": "kylodeng/ai-delivery-source",
+    "output_url": "",
+    "run_url": "https://github.com/kylodeng/ai-delivery-source/actions/runs/24124915968",
+    "summary": "Error code: 529 - {'type': 'error', 'error': {'type': 'overloaded_error', 'message': 'Overloaded'}, 'request_id': 'req_011CZqxntZxjj2U6LAzLmmHp'}"
   }
 ]
