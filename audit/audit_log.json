@@ -256,5 +256,16 @@
     "project": "Data Ingestion Pipeline",
     "version": "0.1.0",
     "gap_questions": 9
+  },
+  {
+    "timestamp": "2026-04-09T09:56:54Z",
+    "tool": "uat-generate",
+    "status": "SUCCESS",
+    "source_repo": "kylodeng/underwriting_chatbot-main",
+    "output_url": "https://github.com/kylodeng/ai-delivery-outputs/blob/main/uat/kylodeng-underwriting_chatbot-main/v0.1.0/UAT_TEST_PACK.md",
+    "run_url": "https://github.com/kylodeng/underwriting_chatbot-main/actions/runs/24184066080",
+    "summary": "Generated 12 UAT scenarios for v0.1.0 \u00b7 Fill in UAT_RESULTS_SHEET.csv and trigger analyse mode when done",
+    "version": "0.1.0",
+    "scenarios": 12
   }
 ]
