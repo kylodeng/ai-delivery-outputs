@@ -345,5 +345,16 @@
     "summary": "Score 62/100 - 14 findings - REQUEST_CHANGES",
     "score": 62,
     "findings_count": 14
+  },
+  {
+    "timestamp": "2026-04-13T09:53:46Z",
+    "tool": "code-review",
+    "status": "SUCCESS",
+    "source_repo": "kylodeng/Insurance-Training-Bot-main",
+    "output_url": "https://github.com/kylodeng/ai-delivery-outputs/blob/main/code-review/kylodeng-Insurance-Training-Bot-main-20260413.md",
+    "run_url": "https://github.com/kylodeng/Insurance-Training-Bot-main/actions/runs/24337065509",
+    "summary": "Score 58/100 - 20 findings - REQUEST_CHANGES",
+    "score": 58,
+    "findings_count": 20
   }
 ]
