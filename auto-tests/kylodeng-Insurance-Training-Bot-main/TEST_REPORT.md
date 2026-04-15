@@ -1,18 +1,18 @@
 # Auto-Generated Test Report
 **Repo:** kylodeng/Insurance-Training-Bot-main  
-**Generated:** 2026-04-08 05:55 UTC
+**Generated:** 2026-04-15 08:34 UTC
 
 ## Summary
 | Source File | Est. Coverage | Generated Test File | TODOs |
 |---|---|---|---|
-| `.github/scripts/shared.py` | ~70% | auto-tests/kylodeng-Insurance-Training-Bot-main/python/test_shared.py | 3 TODOs |
+| `.github/scripts/shared.py` | ~70% | auto-tests/kylodeng-Insurance-Training-Bot-main/python/test_shared.py | 1 TODOs |
 | `.github/scripts/tool1_code_review.py` | ~70% | auto-tests/kylodeng-Insurance-Training-Bot-main/python/test_tool1_code_review.py | 4 TODOs |
 | `.github/scripts/tool2_tech_docs.py` | ~70% | auto-tests/kylodeng-Insurance-Training-Bot-main/python/test_tool2_tech_docs.py | 4 TODOs |
-| `.github/scripts/tool3_business_docs.py` | ~70% | auto-tests/kylodeng-Insurance-Training-Bot-main/python/test_tool3_business_docs.py | 3 TODOs |
-| `.github/scripts/tool5_uat.py` | ~70% | auto-tests/kylodeng-Insurance-Training-Bot-main/python/test_tool5_uat.py | 7 TODOs |
-| `api/agent.py` | ~70% | auto-tests/kylodeng-Insurance-Training-Bot-main/python/test_agent.py | 6 TODOs |
+| `.github/scripts/tool3_business_docs.py` | ~70% | auto-tests/kylodeng-Insurance-Training-Bot-main/python/test_tool3_business_docs.py | 4 TODOs |
+| `.github/scripts/tool5_uat.py` | ~70% | auto-tests/kylodeng-Insurance-Training-Bot-main/python/test_tool5_uat.py | 5 TODOs |
+| `api/agent.py` | ~70% | auto-tests/kylodeng-Insurance-Training-Bot-main/python/test_agent.py | 5 TODOs |
 | `api/main.py` | ~70% | auto-tests/kylodeng-Insurance-Training-Bot-main/python/test_main.py | 5 TODOs |
-| `api/rag_tools.py` | ~70% | auto-tests/kylodeng-Insurance-Training-Bot-main/python/test_rag_tools.py | 4 TODOs |
+| `api/rag_tools.py` | ~70% | auto-tests/kylodeng-Insurance-Training-Bot-main/python/test_rag_tools.py | 1 TODOs |
 
 ## How to use
 1. Copy generated test files into your `tests/` directory
