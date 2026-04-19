@@ -1,65 +1,65 @@
-# ai-delivery-source
+# AI Delivery Source
 
-## 1. Project Overview
-
-This repository contains a customer data ingestion pipeline deployed as an AWS Lambda function, alongside a suite of five AI-powered GitHub Actions workflows. The workflows use the Anthropic Claude API to automate code review, technical documentation generation, business documentation generation, test generation, and UAT facilitation. Outputs from each workflow are written to a companion repository (`ai-delivery-outputs`) and optionally delivered by email via SendGrid.
+A GitHub-hosted repository that demonstrates a suite of five Claude AI-powered automation tools integrated into a CI/CD pipeline. Each tool handles a different phase of the software delivery lifecycle — code review, technical documentation, business documentation, automated test generation, and UAT facilitation — all driven by GitHub Actions workflows. The repository also contains a sample AWS data ingestion pipeline (`src/data_pipeline.py`) that serves as the subject for these AI tools.
 
 ---
 
-## 2. Tech Stack
+## Tech Stack
 
-| Component | Technology | Version / Notes |
+| Component | Technology | Version/Notes |
 |---|---|---|
-| Runtime language | Python | 3.12 |
-| AI model | Anthropic Claude | `claude-sonnet-4-6` |
-| CI/CD platform | GitHub Actions | Node 24 runner |
-| Cloud provider | AWS | us-east-1 (default) |
-| IaC | Terraform | AWS provider `~> 5.0` |
-| Compute | AWS Lambda | Python 3.12 runtime |
-| Storage | AWS S3 | Landing + processed buckets |
-| Data processing | pandas | [TODO: what version is pinned?] |
-| Email delivery | SendGrid | Via REST API |
-| HTTP client | requests | [TODO: what version is pinned?] |
-| AWS SDK | boto3 | [TODO: what version is pinned?] |
+| AI Model | Anthropic Claude | `claude-sonnet-4-6` |
+| Python SDK | `anthropic` | Latest (pip install) |
+| CI/CD | GitHub Actions | Ubuntu-latest runners, Node24 |
+| Python Runtime | Python | 3.12 |
+| HTTP Client | `requests` | Latest (pip install) |
+| Email Delivery | SendGrid API | Via REST |
+| IaC | Terraform (AWS provider) | `~> 5.0` |
+| Cloud Provider | AWS | us-east-1 (default) |
+| Data Processing | `pandas` | Latest |
+| AWS SDK | `boto3` | Latest |
+| Source Repo Output | GitHub API | v2022-11-28 |
 
 ---
 
-## 3. Architecture
+## Architecture
 
-The system has two distinct layers:
-
-**Data pipeline layer:** A CSV file uploaded to the `raw/` prefix of the S3 landing bucket triggers the `data-ingest` Lambda function via an S3 bucket notification. The Lambda validates each customer record (required fields, email format, age range), transforms valid rows, and writes a Parquet file to the `processed/` prefix of the same bucket. Failed rows are counted and returned in the response body but are not persisted separately.
-
-**AI workflow layer:** Five GitHub Actions workflows share a common Python utility module (`.github/scripts/shared.py`) that wraps the GitHub API, Anthropic Claude API, SendGrid email API, and output-repo file writes. Each workflow fetches source files or PR diffs from this repository, sends them to Claude with a specialist system prompt, and commits the AI-generated artefacts (review reports, markdown docs, test files, UAT packs) to the `ai-delivery-outputs` repository. Workflows are triggered by pull request events, branch/tag pushes, scheduled cron jobs, or manual dispatch.
+The repository is structured around five independent GitHub Actions workflows, each calling a corresponding Python script in `.github/scripts/`. All five scripts share common utilities from `shared.py` (GitHub API access, Claude API calls, SendGrid email, and audit logging).
 
 ```
-CSV upload
-    │
-    ▼
-S3 landing bucket  ──(s3:ObjectCreated)──►  Lambda (data_pipeline.py)
-                                                │
-                                    ┌───────────┴───────────┐
-                                    ▼                       ▼
-                              Valid rows              Failed rows
-                                    │                  (logged)
-                                    ▼
-                         S3 processed bucket
-                         (Parquet output)
-
-GitHub event (PR / push / tag / cron / manual)
-    │
-    ▼
-GitHub Actions workflow (tool1–tool5)
-    │
-    ├──► shared.py ──► GitHub API (fetch files / diff / post PR comment)
-    ├──► shared.py ──► Anthropic Claude API (generate artefact)
-    ├──► shared.py ──► GitHub API (write to ai-delivery-outputs repo)
-    └──► shared.py ──► SendGrid API (email notification)
+┌─────────────────────────────────────────────────────────┐
+│                   GitHub Actions Triggers                │
+│  PR open/sync │ push to main │ release tag │ cron │ manual│
+└──────┬────────┴──────┬───────┴──────┬──────┴──┬───┴──────┘
+       │               │              │          │
+       ▼               ▼              ▼          ▼
+  tool1_code_     tool2_tech_    tool3_biz_  tool4_auto_   tool5_uat.py
+  review.py       docs.py        docs.py     testing.py
+       │               │              │          │              │
+       └───────────────┴──────────────┴──────────┴──────────────┘
+                                │
+                          shared.py
+                    ┌───────────┼───────────┐
+                    ▼           ▼           ▼
+             GitHub API    Claude API   SendGrid API
+                    │
+                    ▼
+          ai-delivery-outputs repo
+          (generated docs, reports,
+           test files written here)
 ```
+
+- **Tool 1 (Code Review):** Triggered on PR open/sync or weekly cron. Fetches the PR diff via the GitHub API, sends it to Claude, and posts findings as a PR comment. Also writes a report to the output repo.
+- **Tool 2 (Tech Docs):** Triggered on push to `main` or weekly cron. Reads source and IaC files, generates README, architecture, and runbook documents, and writes them to the output repo.
+- **Tool 3 (Business Docs):** Triggered on version tags or manual dispatch. Produces a non-technical Solution Overview Document and a Gap Questionnaire. Writes both to the output repo.
+- **Tool 4 (Auto Testing):** Triggered on PR open/sync against source files or weekly cron. Generates test files (in the correct framework for the detected language) and performs coverage gap analysis. Writes results to the output repo.
+- **Tool 5 (UAT Facilitation):** Triggered on `release/` branch creation or manual dispatch. In `generate` mode, produces a UAT test pack as CSV and markdown. In `analyse` mode, reads a completed results CSV and outputs a defect report with a go/no-go recommendation.
+
+The **sample application** (`src/data_pipeline.py` + `infra/main.tf`) is a Lambda-triggered S3 data ingestion pipeline that reads customer CSV files from a landing bucket, validates and transforms them to Parquet, and writes to a processed bucket.
 
 ---
 
-## 4. Local Development Setup
+## Local Development Setup
 
 1. **Clone the repository**
 
@@ -75,30 +75,25 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 ```
 
-3. **Install Python dependencies**
+3. **Install dependencies**
 
 ```bash
-pip install anthropic requests boto3 pandas pyarrow
+pip install anthropic requests pandas boto3
 ```
 
-4. **Set required environment variables** (see [Environment Variables](#5-environment-variables) section)
+4. **Set required environment variables** (see [Environment Variables](#environment-variables) section)
 
 ```bash
-export ANTHROPIC_API_KEY="your-anthropic-api-key"
+export ANTHROPIC_API_KEY="your-anthropic-key"
 export GH_TOKEN="your-github-pat"
 export SENDGRID_API_KEY="your-sendgrid-key"
-export OUTPUT_REPO_OWNER="your-github-username"
 export OUTPUT_REPO="ai-delivery-outputs"
+export OUTPUT_REPO_OWNER="your-github-username"
+export NOTIFY_EMAIL="you@example.com"
+export SENDER_EMAIL="noreply@yourdomain.com"
 ```
 
-5. **Initialise Terraform** (for infrastructure changes)
-
-```bash
-cd infra
-terraform init
-```
-
-6. **Run a workflow script manually** (example: tech docs tool)
+5. **Run a tool script directly** (example: tech docs generation)
 
 ```bash
 export SOURCE_REPO_OWNER="kylodeng"
@@ -107,140 +102,153 @@ export GITHUB_RUN_URL="https://github.com/kylodeng/ai-delivery-source/actions/ru
 python .github/scripts/tool2_tech_docs.py
 ```
 
+6. **(Optional) Run the data pipeline locally against real AWS credentials**
+
+```bash
+export AWS_ACCESS_KEY_ID="your-access-key"
+export AWS_SECRET_ACCESS_KEY="your-secret-key"
+export LANDING_BUCKET="capco-data-landing-dev"
+python -c "from src.data_pipeline import lambda_handler; lambda_handler({'bucket': 'capco-data-landing-dev', 'key': 'raw/sample.csv'}, None)"
+```
+
+> **Note:** The `src/data_pipeline.py` file currently contains hardcoded AWS credentials (see [Known Issues](#known-issues--todos)). Do not commit real credentials.
+
+7. **(Optional) Initialise Terraform**
+
+```bash
+cd infra
+terraform init
+terraform plan
+```
+
 ---
 
-## 5. Environment Variables
+## Environment Variables
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `ANTHROPIC_API_KEY` | Yes | — | API key for Anthropic Claude |
-| `GH_TOKEN` | Yes | — | GitHub personal access token with repo read/write permissions |
-| `SENDGRID_API_KEY` | Yes | — | SendGrid API key for email delivery |
-| `OUTPUT_REPO` | No | `ai-delivery-outputs` | Name of the GitHub repo where generated artefacts are written |
-| `OUTPUT_REPO_OWNER` | No | `GITHUB_REPOSITORY_OWNER` | GitHub owner (user or org) of the output repo |
-| `NOTIFY_EMAIL` | No | `kylo.deng@capco.com` | Recipient address for email notifications |
-| `SENDER_EMAIL` | No | `kylo.deng@capco.com` | Sender address used by SendGrid |
-| `SOURCE_REPO_OWNER` | Yes (workflows) | `github.repository_owner` | Owner of the source repository being analysed |
-| `SOURCE_REPO_NAME` | Yes (workflows) | `github.event.repository.name` | Name of the source repository being analysed |
-| `GITHUB_RUN_URL` | No | Set by Actions runner | URL of the current workflow run, included in outputs |
-| `LANDING_BUCKET` | Yes (Lambda) | — | S3 bucket name for raw CSV uploads; set as Lambda environment variable via Terraform |
-| `REVIEW_MODE` | No | `repo` | Code review mode: `pr` or `repo` (Tool 1 only) |
-| `PR_NUMBER` | No | — | Pull request number to review (Tool 1, `pr` mode only) |
-| `TEST_MODE` | No | `generate` | Test tool mode: `generate` or `gap-analysis` (Tool 4 only) |
-| `UAT_MODE` | No | `generate` | UAT tool mode: `generate` or `analyse` (Tool 5 only) |
-| `RELEASE_VERSION` | No | — | Version string used when generating business docs or UAT packs |
-| `PROJECT_NAME` | No | Repository name | Human-readable project name for business docs |
-| `USER_STORIES` | No | — | Acceptance criteria pasted inline for UAT pack generation |
-| `UAT_RESULTS_PATH` | No | — | Path in output repo to a completed UAT results CSV (Tool 5 analyse mode) |
+| `GH_TOKEN` | Yes | — | GitHub Personal Access Token with repo read/write scope |
+| `SENDGRID_API_KEY` | Yes | — | SendGrid API key for email notifications |
+| `OUTPUT_REPO` | No | `ai-delivery-outputs` | Name of the GitHub repo where generated outputs are written |
+| `OUTPUT_REPO_OWNER` | No | `GITHUB_REPOSITORY_OWNER` | GitHub owner/org of the output repo |
+| `NOTIFY_EMAIL` | No | `kylo.deng@capco.com` | Recipient email address for notifications |
+| `SENDER_EMAIL` | No | `kylo.deng@capco.com` | Sender email address used with SendGrid |
+| `SOURCE_REPO_OWNER` | Yes (workflows) | `github.repository_owner` | Owner of the source repo being analysed |
+| `SOURCE_REPO_NAME` | Yes (workflows) | `github.event.repository.name` | Name of the source repo being analysed |
+| `GITHUB_RUN_URL` | Yes (workflows) | Constructed by Actions | URL of the current Actions run, included in outputs |
+| `LANDING_BUCKET` | No | — | S3 bucket name for the data pipeline Lambda (`src/data_pipeline.py`) |
+| `REVIEW_MODE` | No | `repo` | Set by workflow: `pr` or `repo` — controls Tool 1 review scope |
+| `PR_NUMBER` | No | — | PR number to review (Tool 1, `REVIEW_MODE=pr`) |
+| `TEST_MODE` | No | `generate` | Tool 4 mode: `generate` new tests or `gap-analysis` |
+| `UAT_MODE` | No | `generate` | Tool 5 mode: `generate` test pack or `analyse` results |
+| `RELEASE_VERSION` | No | — | Release version string used by Tool 3 and Tool 5 |
+| `PROJECT_NAME` | No | Repository name | Human-readable project name used in Tool 3 output |
+| `USER_STORIES` | No | — | Optional acceptance criteria pasted into Tool 5 `generate` mode |
+| `UAT_RESULTS_PATH` | No | — | Path in output repo to completed UAT results CSV (Tool 5 `analyse` mode) |
+
+All secrets (`ANTHROPIC_API_KEY`, `GH_TOKEN`, `SENDGRID_API_KEY`) must be configured as **GitHub Actions repository secrets**.
 
 ---
 
-## 6. Running Tests
+## Running Tests
 
-[TODO: Are there any existing tests in this repository? No test files were found in the provided source.]
+[TODO: Are there existing tests for the `.github/scripts/` tooling, or only the AI-generated tests produced by Tool 4?]
 
-The AI workflow **Tool 4** auto-generates test files for source code in this repository and commits them to the `ai-delivery-outputs` repo. To trigger test generation manually:
+Tool 4 (`tool4_auto_testing.py`) auto-generates test files for source code in the repository and writes them to the `ai-delivery-outputs` repo. To trigger it manually:
 
 ```bash
-# Via GitHub Actions UI — navigate to:
-# Actions → "Tool 4 — Auto Testing" → Run workflow → Mode: generate
-
-# Or locally (requires env vars set):
-export TEST_MODE="generate"
-python .github/scripts/tool4_auto_testing.py
+# Via GitHub Actions UI — go to Actions > Tool 4 — Auto Testing > Run workflow
+# Select mode: generate or gap-analysis
 ```
 
-To run a coverage gap analysis:
+To run any locally generated test file (Python example):
 
 ```bash
-export TEST_MODE="gap-analysis"
-python .github/scripts/tool4_auto_testing.py
+pip install pytest
+pytest path/to/generated_test_file.py -v
 ```
 
 ---
 
-## 7. Deployment
+## Deployment
 
 ### Infrastructure (Terraform)
 
 ```bash
 cd infra
-
-# Initialise providers
 terraform init
-
-# Preview changes
-terraform plan -var="environment=dev"
-
-# Apply to dev
-terraform apply -var="environment=dev"
-
-# Apply to a different environment
-terraform apply -var="environment=prod" -var="aws_region=eu-west-1"
+terraform plan -var="environment=dev" -var="aws_region=us-east-1"
+terraform apply -var="environment=dev" -var="aws_region=us-east-1"
 ```
 
-Terraform will create:
-- S3 landing bucket (`capco-data-landing-<environment>`)
-- S3 processed bucket (`capco-data-processed-<environment>`)
-- Lambda function (`data-ingest-<environment>`) from `lambda.zip`
-- IAM role and policy for the Lambda
-- S3 bucket notification to trigger the Lambda on `raw/*.csv` uploads
+This provisions:
+- S3 landing bucket (`capco-data-landing-<env>`)
+- S3 processed bucket (`capco-data-processed-<env>`)
+- Lambda function `data-ingest-<env>` (Python 3.12, 30s timeout)
+- IAM role and policy for Lambda
+- S3 bucket notification to trigger Lambda on `raw/*.csv` object creation
 
-> **Note:** `lambda.zip` must exist before running `terraform apply`. [TODO: How is `lambda.zip` built and where is the packaging step documented?]
+> ⚠️ See [Known Issues](#known-issues--todos) for security problems in the current IaC that must be fixed before production deployment.
 
-### Application (Lambda packaging)
+### Lambda Deployment Package
 
-[TODO: There is no build script or Makefile for packaging the Lambda zip. How should `lambda.zip` be assembled from `src/data_pipeline.py`?]
+[TODO: How is `lambda.zip` built and uploaded? No build script is present in the repository.]
 
-### GitHub Actions workflows
+### GitHub Actions Workflows
 
-All five workflows are deployed automatically when this repository is pushed to GitHub. Required secrets must be configured in the repository settings before any workflow will succeed:
+The five workflows run automatically based on their configured triggers. They require no manual deployment — only the repository secrets listed in [Environment Variables](#environment-variables) must be set in the GitHub repository settings.
+
+To trigger any workflow manually:
 
 ```
-Settings → Secrets and variables → Actions → New repository secret
+GitHub UI → Actions → <Workflow Name> → Run workflow
 ```
-
-Secrets to add: `ANTHROPIC_API_KEY`, `GH_TOKEN`, `SENDGRID_API_KEY`
 
 ---
 
-## 8. Known Issues / TODOs
+## Known Issues / TODOs
 
 The following issues are extracted directly from code comments:
 
-### Security (Critical)
+### Security (High / Critical)
 
-| Location | Issue |
-|---|---|
-| `src/data_pipeline.py` lines 10–11 | Hardcoded AWS access key and secret key — **must be moved to AWS Secrets Manager** |
-| `infra/main.tf` Lambda environment block | `DB_PASSWORD` hardcoded as `"SuperSecret123!"` in Terraform — should use SSM Parameter Store or Secrets Manager |
-| `infra/main.tf` `aws_iam_role_policy` | IAM policy grants `s3:*` on `"*"` — overly permissive; should be scoped to specific bucket ARNs and required actions only |
-| `infra/main.tf` `aws_s3_bucket.landing` | S3 landing bucket has **no server-side encryption** and **no public access block** configured |
+- **Hardcoded AWS credentials in `src/data_pipeline.py`:**
+  ```python
+  # TODO: move this to secrets manager
+  AWS_ACCESS_KEY = "AKIAIOSFODNN7EXAMPLE"
+  AWS_SECRET_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+  ```
+  These example credentials are committed to source. Real credentials must never be stored here; use AWS Secrets Manager or IAM roles.
 
-### Infrastructure
+- **Hardcoded DB password in `infra/main.tf`:**
+  ```hcl
+  # Hardcoded secret - should use SSM or Secrets Manager
+  DB_PASSWORD = "SuperSecret123!"
+  ```
 
-| Location | Issue |
-|---|---|
-| `infra/main.tf` `aws_s3_bucket.landing` | No resource tags defined — `# TODO: add tags` |
-| `infra/main.tf` | No S3 encryption resource for either bucket |
-| `infra/main.tf` | No CloudWatch log group or monitoring/alerting configured |
-| `infra/main.tf` | No disaster recovery or multi-region configuration |
+- **S3 landing bucket has no encryption and no public access block (`infra/main.tf`):**
+  ```hcl
+  # S3 landing bucket - NO encryption, NO public access block
+  ```
 
-### Application
+- **Overly permissive IAM policy (`infra/main.tf`):** Lambda role is granted `s3:*` on `Resource: "*"` — full S3 access across all buckets.
 
-| Location | Issue |
-|---|---|
-| `src/data_pipeline.py` `get_all_pending_files` | S3 `list_objects_v2` result is not paginated — will silently miss files if there are more than 1,000 objects |
-| `src/data_pipeline.py` `process_csv` | No error handling if the downloaded CSV is malformed (comment: `# No error handling if CSV is malformed`) |
-| `src/data_pipeline.py` `lambda_handler` | Bare `except Exception` swallows all errors without re-raising — comment: `# bare except swallows all errors` |
-| `src/data_pipeline.py` `process_csv` | Failed rows are counted but not written anywhere persistent |
+### Missing Features / Code Quality
 
-### Shared scripts
+- **No pagination in `get_all_pending_files` (`src/data_pipeline.py`):** `list_objects_v2` will silently truncate results at 1,000 objects.
 
-| Location | Issue |
-|---|---|
-| `.github/scripts/shared.py` | `send_email`, `email_html`, and `write_audit_entry` functions are imported by all five tools but their implementations are not included in the provided files — [TODO: Are these functions defined elsewhere in `shared.py`?] |
-| `.github/scripts/tool1_code_review.py` | Script body appears truncated — the `review_pr` function and main entrypoint after the comment block are cut off |
-| `.github/scripts/tool2_tech_docs.py` | `build_index` function is truncated mid-string |
-| `.github/scripts/tool4_auto_testing.py` | `build_test_report` function is truncated |
-| `.github/scripts/tool5_uat.py` | `build_test_pack_csv` function is truncated |
+- **Bare `except` in `lambda_handler` (`src/data_pipeline.py`):** Catches all exceptions including `SystemExit` and `KeyboardInterrupt`; comment notes `# bare except swallows all errors`.
+
+- **No error handling for malformed CSV (`src/data_pipeline.py`):** Commented as `# No error handling if CSV is malformed`.
+
+- **Missing resource tags (`infra/main.tf`):**
+  ```hcl
+  # TODO: add tags
+  ```
+
+- **`send_email`, `email_html`, and `write_audit_entry` functions** are imported by all tool scripts from `shared.py` but their implementations are not present in the provided source files. [TODO: Are these functions defined in a portion of `shared.py` not included in the repository snapshot?]
+
+- **`tool2_tech_docs.py` contains a truncated f-string** (`f"# Tech Documentation Index — {owner}/{r`) — the variable reference is cut off. [TODO: Is this a transcription truncation or a bug in the source file?]
+
+- **`tool4_auto_testing.py` and `tool5_uat.py`** contain truncated function definitions (`build_test_pack_csv(scenarios: list[d`) — implementation details are missing from the provided files.
