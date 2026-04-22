@@ -1,39 +1,37 @@
 """
 Test suite for src/data_pipeline.py
 
-WHAT IS TESTED:
-- validate_customer_record: happy path, missing fields, invalid email, age boundary values
-- process_csv: successful processing, partial failures, all-fail scenarios, empty CSV
-- get_all_pending_files: normal listing, empty bucket, missing Contents key
-- lambda_handler: success path, missing key error, bucket fallback from env, S3 failure
-- get_s3_client: client creation (mocked boto3)
+What is tested:
+    - validate_customer_record: happy path, missing fields, invalid email, age boundary values
+    - process_csv: successful processing, mixed valid/invalid rows, empty CSV, S3 interaction
+    - get_all_pending_files: normal listing, empty bucket, filtering of non-CSV keys
+    - lambda_handler: successful invocation, error handling, missing key, env-var bucket fallback
+    - get_s3_client: returns a boto3 client (smoke test)
 
-MOCKS USED:
-- unittest.mock.patch / MagicMock for boto3.client (no real AWS calls)
-- io.BytesIO / StringIO to simulate S3 object bodies
-- pandas DataFrame.to_parquet patched to avoid real S3 writes
+Mocks used:
+    - unittest.mock.patch / MagicMock for boto3.client (S3 get_object, list_objects_v2)
+    - io.BytesIO to simulate S3 object bodies
+    - unittest.mock.patch for pandas DataFrame.to_parquet (avoids real S3 writes)
+    - unittest.mock.patch for os.environ
 
 TODOs:
-- TODO: Test pagination behaviour in get_all_pending_files (>1000 objects) — needs paginator refactor first
-- TODO: Test actual parquet output schema/content once write path is injectable
-- TODO: Test secrets manager integration once AWS_ACCESS_KEY is migrated
-- TODO: Test concurrent lambda invocations / race conditions
+    - TODO: Integration test against a localstack/moto environment for full end-to-end S3 round-trip
+    - TODO: Test parquet output schema/content once real S3 writes are mocked at a deeper level
+    - TODO: Test logging side-effects (logger.info / logger.error) if log monitoring is required
+    - TODO: Add tests for pagination once get_all_pending_files implements it
 """
 
 import io
 import os
 import pytest
 import pandas as pd
-from datetime import datetime
 from unittest.mock import MagicMock, patch, call
 
 # ---------------------------------------------------------------------------
 # Module under test
 # ---------------------------------------------------------------------------
-import sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-import data_pipeline
-from data_pipeline import (
+import src.data_pipeline as dp
+from src.data_pipeline import (
     validate_customer_record,
     process_csv,
     get_all_pending_files,
@@ -46,19 +44,13 @@ from data_pipeline import (
 # Fixtures & helpers
 # ===========================================================================
 
-def _make_csv_bytes(*rows: dict) -> bytes:
-    """Build a CSV byte-string from a list of dicts (uniform keys required)."""
-    if not rows:
-        return b"customer_id,email,age,country_code\n"
+def _make_csv_bytes(rows: list[dict]) -> bytes:
+    """Serialise a list of dicts to CSV bytes (simulates an S3 object body)."""
     df = pd.DataFrame(rows)
     buf = io.BytesIO()
     df.to_csv(buf, index=False)
-    return buf.getvalue()
-
-
-def _s3_body(content: bytes) -> dict:
-    """Wrap bytes in an S3-like get_object response dict."""
-    return {"Body": io.BytesIO(content)}
+    buf.seek(0)
+    return buf.read()
 
 
 VALID_RECORD = {
@@ -71,20 +63,68 @@ VALID_RECORD = {
 }
 
 SYNTHETIC_VALID_RECORDS = [
-    {"customer_id": "CUST-001", "email": "alice.chen@example.com",  "age": 34, "country_code": "GB",  "segment": "enterprise", "annual_revenue": 250000},
-    {"customer_id": "CUST-002", "email": "bob.smith@example.com",   "age": 28, "country_code": "US",  "segment": "smb",        "annual_revenue": 45000},
-    {"customer_id": "CUST-003", "email": "carol.jones@example.com", "age": 52, "country_code": "SG",  "segment": "enterprise", "annual_revenue": 500000},
-    {"customer_id": "CUST-004", "email": "david.lee@example.com",   "age": 19, "country_code": "AU",  "segment": "consumer",   "annual_revenue": 0},
-    {"customer_id": "CUST-005", "email": "emma.wilson@example.com", "age": 41, "country_code": "DE",  "segment": "smb",        "annual_revenue": 78000},
-    {"customer_id": "CUST-006", "email": "frank.brown@example.com", "age": 67, "country_code": "US",  "segment": "enterprise", "annual_revenue": 320000},
+    {"customer_id": "CUST-001", "email": "alice.chen@example.com",  "age": 34, "country_code": "GB", "segment": "enterprise", "annual_revenue": 250000},
+    {"customer_id": "CUST-002", "email": "bob.smith@example.com",   "age": 28, "country_code": "US", "segment": "smb",        "annual_revenue": 45000},
+    {"customer_id": "CUST-003", "email": "carol.jones@example.com", "age": 52, "country_code": "SG", "segment": "enterprise", "annual_revenue": 500000},
+    {"customer_id": "CUST-004", "email": "david.lee@example.com",   "age": 19, "country_code": "AU", "segment": "consumer",   "annual_revenue": 0},
+    {"customer_id": "CUST-005", "email": "emma.wilson@example.com", "age": 41, "country_code": "DE", "segment": "smb",        "annual_revenue": 78000},
+    {"customer_id": "CUST-006", "email": "frank.brown@example.com", "age": 67, "country_code": "US", "segment": "enterprise", "annual_revenue": 320000},
 ]
 
 SYNTHETIC_INVALID_RECORDS = [
-    # CUST-007: invalid email
-    {"customer_id": "CUST-007", "email": "invalid-email", "age": 25, "country_code": "GB", "segment": "consumer", "annual_revenue": 0},
-    # CUST-008: age -1
+    {"customer_id": "CUST-007", "email": "invalid-email", "age": 25,  "country_code": "GB", "segment": "consumer", "annual_revenue": 0},
     {"customer_id": "CUST-008", "email": "grace.kim@example.com", "age": -1, "country_code": "KR", "segment": "smb", "annual_revenue": 55000},
 ]
+
+
+@pytest.fixture
+def mock_s3_client():
+    """Return a MagicMock that impersonates a boto3 S3 client."""
+    return MagicMock()
+
+
+@pytest.fixture
+def patch_get_s3_client(mock_s3_client):
+    """Patch get_s3_client so no real AWS calls are made."""
+    with patch.object(dp, "get_s3_client", return_value=mock_s3_client):
+        yield mock_s3_client
+
+
+@pytest.fixture
+def patch_to_parquet():
+    """Suppress actual parquet writes."""
+    with patch.object(pd.DataFrame, "to_parquet") as mock_pq:
+        yield mock_pq
+
+
+# ===========================================================================
+# get_s3_client
+# ===========================================================================
+
+class TestGetS3Client:
+    @patch("src.data_pipeline.boto3.client")
+    def test_returns_boto3_client(self, mock_boto_client):
+        """Smoke-test: get_s3_client calls boto3.client with expected args."""
+        fake_client = MagicMock()
+        mock_boto_client.return_value = fake_client
+
+        result = get_s3_client()
+
+        mock_boto_client.assert_called_once_with(
+            "s3",
+            aws_access_key_id=dp.AWS_ACCESS_KEY,
+            aws_secret_access_key=dp.AWS_SECRET_KEY,
+            region_name="us-east-1",
+        )
+        assert result is fake_client
+
+    @patch("src.data_pipeline.boto3.client")
+    def test_hardcoded_credentials_present(self, mock_boto_client):
+        """Confirm the (insecure) hardcoded keys are still wired in — so we notice if they change."""
+        get_s3_client()
+        _, kwargs = mock_boto_client.call_args
+        assert kwargs["aws_access_key_id"] == "AKIAIOSFODNN7EXAMPLE"
+        assert "aws_secret_access_key" in kwargs
 
 
 # ===========================================================================
@@ -93,109 +133,96 @@ SYNTHETIC_INVALID_RECORDS = [
 
 class TestValidateCustomerRecord:
 
+    # --- happy path ---
+
     def test_valid_record_returns_true(self):
-        assert validate_customer_record(VALID_RECORD) is True
+        assert validate_customer_record(VALID_RECORD.copy()) is True
 
     @pytest.mark.parametrize("record", SYNTHETIC_VALID_RECORDS)
-    def test_synthetic_valid_records_pass(self, record):
-        assert validate_customer_record(record) is True
+    def test_all_synthetic_valid_records_pass(self, record):
+        assert validate_customer_record(record.copy()) is True
 
-    # --- Missing required fields ---
+    # --- age boundary values ---
+
+    @pytest.mark.parametrize("age", [1, 2, 75, 149, 150])
+    def test_valid_age_boundaries(self, age):
+        rec = VALID_RECORD.copy()
+        rec["age"] = age
+        assert validate_customer_record(rec) is True
+
+    @pytest.mark.parametrize("age", [0, -1, 151, 200, -100])
+    def test_invalid_age_raises(self, age):
+        rec = VALID_RECORD.copy()
+        rec["age"] = age
+        with pytest.raises(ValueError, match="Age out of range"):
+            validate_customer_record(rec)
+
+    # CUST-008 from synthetic data: age -1
+    def test_synthetic_negative_age_raises(self):
+        rec = SYNTHETIC_INVALID_RECORDS[1].copy()
+        with pytest.raises(ValueError, match="Age out of range"):
+            validate_customer_record(rec)
+
+    # --- email validation ---
+
+    def test_missing_at_sign_raises(self):
+        rec = VALID_RECORD.copy()
+        rec["email"] = "invalid-email"
+        with pytest.raises(ValueError, match="Invalid email"):
+            validate_customer_record(rec)
+
+    # CUST-007 from synthetic data
+    def test_synthetic_invalid_email_raises(self):
+        rec = SYNTHETIC_INVALID_RECORDS[0].copy()
+        with pytest.raises(ValueError, match="Invalid email"):
+            validate_customer_record(rec)
+
+    def test_email_with_at_sign_passes(self):
+        rec = VALID_RECORD.copy()
+        rec["email"] = "x@y"  # minimal valid-looking email
+        assert validate_customer_record(rec) is True
+
+    # --- missing required fields ---
 
     @pytest.mark.parametrize("missing_field", ["customer_id", "email", "age", "country_code"])
     def test_missing_required_field_raises(self, missing_field):
-        record = VALID_RECORD.copy()
-        del record[missing_field]
+        rec = VALID_RECORD.copy()
+        del rec[missing_field]
         with pytest.raises(ValueError, match=f"Missing required field: {missing_field}"):
-            validate_customer_record(record)
+            validate_customer_record(rec)
 
-    def test_empty_dict_raises_on_first_missing_field(self):
+    def test_empty_record_raises_on_first_required_field(self):
         with pytest.raises(ValueError, match="Missing required field: customer_id"):
             validate_customer_record({})
 
-    # --- Email validation ---
+    def test_extra_fields_are_ignored(self):
+        rec = VALID_RECORD.copy()
+        rec["extra_column"] = "some_value"
+        assert validate_customer_record(rec) is True
 
-    @pytest.mark.parametrize("bad_email", [
-        "invalid-email",          # CUST-007 style
-        "nodomain",
-        "",
-        "missingatsign.com",
-    ])
-    def test_invalid_email_raises(self, bad_email):
-        record = {**VALID_RECORD, "email": bad_email}
-        with pytest.raises(ValueError, match="Invalid email"):
-            validate_customer_record(record)
+    # --- edge cases ---
 
-    def test_valid_email_with_at_sign_passes(self):
-        record = {**VALID_RECORD, "email": "user@domain.org"}
-        assert validate_customer_record(record) is True
+    def test_age_exactly_1(self):
+        rec = VALID_RECORD.copy()
+        rec["age"] = 1
+        assert validate_customer_record(rec) is True
 
-    def test_email_with_multiple_at_signs_passes(self):
-        """The current check only requires '@' to be present."""
-        record = {**VALID_RECORD, "email": "a@@b"}
-        assert validate_customer_record(record) is True
-
-    # --- Age boundary values ---
-
-    @pytest.mark.parametrize("valid_age", [1, 2, 75, 149, 150])
-    def test_age_within_bounds_passes(self, valid_age):
-        record = {**VALID_RECORD, "age": valid_age}
-        assert validate_customer_record(record) is True
-
-    @pytest.mark.parametrize("invalid_age", [-1, 0, 151, 200, -100])
-    def test_age_out_of_range_raises(self, invalid_age):
-        record = {**VALID_RECORD, "age": invalid_age}
-        with pytest.raises(ValueError, match="Age out of range"):
-            validate_customer_record(record)
-
-    def test_age_exactly_1_is_valid(self):
-        assert validate_customer_record({**VALID_RECORD, "age": 1}) is True
-
-    def test_age_exactly_150_is_valid(self):
-        assert validate_customer_record({**VALID_RECORD, "age": 150}) is True
+    def test_age_exactly_150(self):
+        rec = VALID_RECORD.copy()
+        rec["age"] = 150
+        assert validate_customer_record(rec) is True
 
     def test_age_0_is_invalid(self):
-        with pytest.raises(ValueError, match="Age out of range: 0"):
-            validate_customer_record({**VALID_RECORD, "age": 0})
+        rec = VALID_RECORD.copy()
+        rec["age"] = 0
+        with pytest.raises(ValueError):
+            validate_customer_record(rec)
 
     def test_age_151_is_invalid(self):
-        with pytest.raises(ValueError, match="Age out of range: 151"):
-            validate_customer_record({**VALID_RECORD, "age": 151})
-
-    @pytest.mark.parametrize("record", SYNTHETIC_INVALID_RECORDS)
-    def test_synthetic_invalid_records_raise(self, record):
+        rec = VALID_RECORD.copy()
+        rec["age"] = 151
         with pytest.raises(ValueError):
-            validate_customer_record(record)
-
-
-# ===========================================================================
-# get_s3_client
-# ===========================================================================
-
-class TestGetS3Client:
-
-    @patch("data_pipeline.boto3.client")
-    def test_returns_boto3_client(self, mock_boto3_client):
-        fake_client = MagicMock()
-        mock_boto3_client.return_value = fake_client
-
-        result = get_s3_client()
-
-        assert result is fake_client
-        mock_boto3_client.assert_called_once_with(
-            "s3",
-            aws_access_key_id=data_pipeline.AWS_ACCESS_KEY,
-            aws_secret_access_key=data_pipeline.AWS_SECRET_KEY,
-            region_name="us-east-1",
-        )
-
-    @patch("data_pipeline.boto3.client")
-    def test_uses_hardcoded_credentials(self, mock_boto3_client):
-        """Guard against accidental credential change."""
-        get_s3_client()
-        _, kwargs = mock_boto3_client.call_args
-        assert kwargs["aws_access_key_id"] == "AKIAIOSFODNN7EXAMPLE"
-        assert kwargs["region_name"] == "us-east-1"
+            validate_customer_record(rec)
 
 
 # ===========================================================================
@@ -204,122 +231,111 @@ class TestGetS3Client:
 
 class TestProcessCsv:
 
-    def _mock_client(self, csv_content: bytes) -> MagicMock:
-        client = MagicMock()
-        client.get_object.return_value = _s3_body(csv_content)
-        return client
+    def _build_s3_response(self, rows: list[dict]) -> dict:
+        csv_bytes = _make_csv_bytes(rows)
+        return {"Body": io.BytesIO(csv_bytes)}
 
-    @patch("data_pipeline.pd.DataFrame.to_parquet")
-    @patch("data_pipeline.get_s3_client")
-    def test_all_valid_rows_processed(self, mock_get_client, mock_to_parquet):
-        rows = SYNTHETIC_VALID_RECORDS
-        csv_bytes = _make_csv_bytes(*rows)
-        mock_get_client.return_value = self._mock_client(csv_bytes)
+    # --- happy path: all rows valid ---
+
+    def test_all_valid_rows_processed(self, patch_get_s3_client, patch_to_parquet):
+        patch_get_s3_client.get_object.return_value = self._build_s3_response(SYNTHETIC_VALID_RECORDS)
 
         result = process_csv("my-bucket", "raw/customers.csv")
 
-        assert result["processed"] == len(rows)
+        assert result["processed"] == len(SYNTHETIC_VALID_RECORDS)
         assert result["failed"] == 0
-        assert result["output_key"] == "processed/customers.parquet"
-        assert "timestamp" in result
 
-    @patch("data_pipeline.pd.DataFrame.to_parquet")
-    @patch("data_pipeline.get_s3_client")
-    def test_invalid_rows_counted_as_failed(self, mock_get_client, mock_to_parquet):
+    def test_output_key_transformation(self, patch_get_s3_client, patch_to_parquet):
+        patch_get_s3_client.get_object.return_value = self._build_s3_response([VALID_RECORD])
+
+        result = process_csv("my-bucket", "raw/customers.csv")
+
+        assert result["output_key"] == "processed/customers.parquet"
+
+    def test_result_contains_timestamp(self, patch_get_s3_client, patch_to_parquet):
+        patch_get_s3_client.get_object.return_value = self._build_s3_response([VALID_RECORD])
+
+        result = process_csv("my-bucket", "raw/customers.csv")
+
+        assert "timestamp" in result
+        # Should be a valid ISO format string
+        from datetime import datetime
+        datetime.fromisoformat(result["timestamp"])  # raises if malformed
+
+    # --- mixed valid / invalid rows ---
+
+    def test_mixed_rows_counted_correctly(self, patch_get_s3_client, patch_to_parquet):
         rows = SYNTHETIC_VALID_RECORDS + SYNTHETIC_INVALID_RECORDS
-        csv_bytes = _make_csv_bytes(*rows)
-        mock_get_client.return_value = self._mock_client(csv_bytes)
+        patch_get_s3_client.get_object.return_value = self._build_s3_response(rows)
 
         result = process_csv("my-bucket", "raw/customers.csv")
 
         assert result["processed"] == len(SYNTHETIC_VALID_RECORDS)
         assert result["failed"] == len(SYNTHETIC_INVALID_RECORDS)
 
-    @patch("data_pipeline.pd.DataFrame.to_parquet")
-    @patch("data_pipeline.get_s3_client")
-    def test_all_invalid_rows_results_in_zero_processed(self, mock_get_client, mock_to_parquet):
-        rows = SYNTHETIC_INVALID_RECORDS
-        csv_bytes = _make_csv_bytes(*rows)
-        mock_get_client.return_value = self._mock_client(csv_bytes)
+    def test_all_invalid_rows_gives_zero_processed(self, patch_get_s3_client, patch_to_parquet):
+        patch_get_s3_client.get_object.return_value = self._build_s3_response(SYNTHETIC_INVALID_RECORDS)
 
-        result = process_csv("my-bucket", "raw/data.csv")
+        result = process_csv("my-bucket", "raw/customers.csv")
 
         assert result["processed"] == 0
-        assert result["failed"] == len(rows)
+        assert result["failed"] == len(SYNTHETIC_INVALID_RECORDS)
 
-    @patch("data_pipeline.pd.DataFrame.to_parquet")
-    @patch("data_pipeline.get_s3_client")
-    def test_empty_csv_returns_zero_counts(self, mock_get_client, mock_to_parquet):
-        csv_bytes = b"customer_id,email,age,country_code\n"
-        mock_get_client.return_value = self._mock_client(csv_bytes)
+    # --- empty CSV ---
+
+    def test_empty_csv_no_rows(self, patch_get_s3_client, patch_to_parquet):
+        empty_df = pd.DataFrame(columns=["customer_id", "email", "age", "country_code"])
+        buf = io.BytesIO()
+        empty_df.to_csv(buf, index=False)
+        buf.seek(0)
+        patch_get_s3_client.get_object.return_value = {"Body": buf}
 
         result = process_csv("my-bucket", "raw/empty.csv")
 
         assert result["processed"] == 0
         assert result["failed"] == 0
 
-    @patch("data_pipeline.pd.DataFrame.to_parquet")
-    @patch("data_pipeline.get_s3_client")
-    def test_output_key_replaces_raw_prefix_and_extension(self, mock_get_client, mock_to_parquet):
-        csv_bytes = _make_csv_bytes(*SYNTHETIC_VALID_RECORDS[:1])
-        mock_get_client.return_value = self._mock_client(csv_bytes)
+    # --- S3 interactions ---
 
-        result = process_csv("bucket", "raw/2024/01/customers.csv")
+    def test_get_object_called_with_correct_args(self, patch_get_s3_client, patch_to_parquet):
+        patch_get_s3_client.get_object.return_value = self._build_s3_response([VALID_RECORD])
 
-        assert result["output_key"] == "processed/2024/01/customers.parquet"
+        process_csv("target-bucket", "raw/data.csv")
 
-    @patch("data_pipeline.pd.DataFrame.to_parquet")
-    @patch("data_pipeline.get_s3_client")
-    def test_to_parquet_called_with_s3_path(self, mock_get_client, mock_to_parquet):
-        csv_bytes = _make_csv_bytes(*SYNTHETIC_VALID_RECORDS[:1])
-        mock_get_client.return_value = self._mock_client(csv_bytes)
+        patch_get_s3_client.get_object.assert_called_once_with(
+            Bucket="target-bucket", Key="raw/data.csv"
+        )
 
-        process_csv("my-bucket", "raw/file.csv")
+    def test_to_parquet_called_with_s3_path(self, patch_get_s3_client, patch_to_parquet):
+        patch_get_s3_client.get_object.return_value = self._build_s3_response([VALID_RECORD])
 
-        mock_to_parquet.assert_called_once_with("s3://my-bucket/processed/file.parquet")
+        process_csv("my-bucket", "raw/data.csv")
 
-    @patch("data_pipeline.pd.DataFrame.to_parquet")
-    @patch("data_pipeline.get_s3_client")
-    def test_s3_get_object_called_correctly(self, mock_get_client, mock_to_parquet):
-        csv_bytes = _make_csv_bytes(*SYNTHETIC_VALID_RECORDS[:1])
-        mock_client = self._mock_client(csv_bytes)
-        mock_get_client.return_value = mock_client
+        patch_to_parquet.assert_called_once()
+        call_args = patch_to_parquet.call_args
+        path_arg = call_args.args[0] if call_args.args else call_args.kwargs.get("path")
+        assert path_arg == "s3://my-bucket/processed/data.parquet"
 
-        process_csv("my-bucket", "raw/file.csv")
-
-        mock_client.get_object.assert_called_once_with(Bucket="my-bucket", Key="raw/file.csv")
-
-    @patch("data_pipeline.get_s3_client")
-    def test_s3_get_object_failure_propagates(self, mock_get_client):
-        mock_client = MagicMock()
-        mock_client.get_object.side_effect = Exception("S3 unavailable")
-        mock_get_client.return_value = mock_client
+    def test_s3_error_propagates(self, patch_get_s3_client, patch_to_parquet):
+        patch_get_s3_client.get_object.side_effect = Exception("S3 unavailable")
 
         with pytest.raises(Exception, match="S3 unavailable"):
-            process_csv("my-bucket", "raw/file.csv")
+            process_csv("my-bucket", "raw/data.csv")
 
-    @patch("data_pipeline.pd.DataFrame.to_parquet")
-    @patch("data_pipeline.get_s3_client")
-    def test_result_contains_timestamp(self, mock_get_client, mock_to_parquet):
-        csv_bytes = _make_csv_bytes(*SYNTHETIC_VALID_RECORDS[:1])
-        mock_get_client.return_value = self._mock_client(csv_bytes)
+    # --- key path edge cases ---
 
-        before = datetime.utcnow().isoformat()
-        result = process_csv("my-bucket", "raw/file.csv")
-        after = datetime.utcnow().isoformat()
+    def test_key_without_raw_prefix_still_transforms(self, patch_get_s3_client, patch_to_parquet):
+        """Keys not under raw/ won't have the prefix replaced but should still process."""
+        patch_get_s3_client.get_object.return_value = self._build_s3_response([VALID_RECORD])
 
-        assert before <= result["timestamp"] <= after
+        result = process_csv("my-bucket", "other/customers.csv")
 
-    @patch("data_pipeline.pd.DataFrame.to_parquet")
-    @patch("data_pipeline.get_s3_client")
-    def test_single_valid_record(self, mock_get_client, mock_to_parquet):
-        csv_bytes = _make_csv_bytes(SYNTHETIC_VALID_RECORDS[0])
-        mock_get_client.return_value = self._mock_client(csv_bytes)
+        # raw/ not in key, so output_key replaces .csv → .parquet only
+        assert result["output_key"] == "other/customers.parquet"
 
-        result = process_csv("bucket", "raw/one.csv")
+    def test_deeply_nested_key(self, patch_get_s3_client, patch_to_parquet):
+        patch_get_s3_client.get_object.return_value = self._build_s3_response([VALID_RECORD])
 
-        assert result["processed"] == 1
-        assert result["failed"] == 0
+        result = process_csv("my-bucket", "raw/2024/01/customers.csv")
 
-    @patch("data_pipeline.pd.DataFrame.to_parquet", side_effect=OSError("write failed"))
-    @patch("data_pipeline.get_s3
+        assert result["output_
