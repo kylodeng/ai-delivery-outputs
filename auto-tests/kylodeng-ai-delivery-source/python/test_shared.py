@@ -1,26 +1,26 @@
 """
-Test suite for .github/scripts/shared.py
+Test module for .github/scripts/shared.py
 
 What is tested:
-  - call_claude: happy path, API response parsing
-  - clean_json: markdown fence stripping (various formats), plain JSON passthrough, edge cases
-  - get_repo_files: file filtering by extension, max_files limit, base64 decoding, decode errors
-  - get_pr_diff: URL construction, truncation at 30000 chars
-  - write_output_file: create (no SHA), update (with SHA), fallback URL
-  - post_pr_comment: correct endpoint and payload
-  - send_email: success (200/202), warning on failure
-  - email_html: SUCCESS/FAILURE status colours, content inclusion
-  - write_audit_entry: partial source (function is truncated in source)
+- call_claude: Claude API invocation, response extraction
+- clean_json: markdown fence stripping, edge cases
+- get_repo_files: GitHub tree fetching, extension filtering, max_files limit, base64 decoding
+- get_pr_diff: PR diff fetching, truncation behaviour
+- write_output_file: file creation (no SHA), file update (with SHA), URL fallback
+- post_pr_comment: PR comment posting
+- send_email: SendGrid payload construction, success/failure status codes
+- email_html: HTML output content, status colour logic
+- write_audit_entry: (stub — source truncated, cannot fully test)
 
 Mocks used:
-  - unittest.mock.patch for os.environ (to satisfy module-level env reads)
-  - unittest.mock.MagicMock / patch for anthropic.Anthropic client
-  - unittest.mock.patch for requests.get, requests.post, requests.put
-  - builtins.print patched where warning output is checked
+- unittest.mock.patch for os.environ (env vars)
+- unittest.mock.MagicMock / patch for anthropic.Anthropic client
+- unittest.mock.patch for requests.get, requests.post, requests.put
+- No real network calls, no real API keys
 
 TODOs:
-  - write_audit_entry: source is truncated — full logic untestable without complete implementation
-  - MODEL constant: currently hardcoded; test will need update if it becomes configurable
+- write_audit_entry: source code is truncated; stub tests provided
+- Integration tests requiring real GitHub/SendGrid/Anthropic credentials
 """
 
 import base64
@@ -28,18 +28,20 @@ import importlib
 import json
 import sys
 import types
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch, call
 
 import pytest
 
 # ---------------------------------------------------------------------------
-# Helpers to import the module with mandatory env vars pre-set
+# Helpers to bootstrap the module with fake env vars
+# (The module executes os.environ[] at import time, so we must patch before
+#  importing.)
 # ---------------------------------------------------------------------------
 
-REQUIRED_ENV = {
-    "ANTHROPIC_API_KEY": "test-anthropic-key",
-    "GH_TOKEN": "test-gh-token",
-    "SENDGRID_API_KEY": "test-sg-key",
+FAKE_ENV = {
+    "ANTHROPIC_API_KEY": "fake-anthropic-key",
+    "GH_TOKEN": "fake-gh-token",
+    "SENDGRID_API_KEY": "fake-sendgrid-key",
     "OUTPUT_REPO": "ai-delivery-outputs",
     "OUTPUT_REPO_OWNER": "test-owner",
     "NOTIFY_EMAIL": "notify@example.com",
@@ -48,322 +50,314 @@ REQUIRED_ENV = {
 }
 
 
-@pytest.fixture(scope="module")
-def shared(monkeypatch=None):
-    """Import shared module with env vars set.  Uses a fresh import each session."""
-    with patch.dict("os.environ", REQUIRED_ENV, clear=False):
-        # Remove cached module so env vars are re-read
+def import_shared():
+    """Import (or re-import) shared with fake environment variables."""
+    with patch.dict("os.environ", FAKE_ENV, clear=False):
+        # Remove cached module so env vars are re-evaluated
         sys.modules.pop("shared", None)
-        # The module lives at .github/scripts/shared so we manipulate sys.path
+        # Make sure the scripts directory is on the path
         import importlib.util, pathlib
-
-        spec = importlib.util.spec_from_file_location(
-            "shared", pathlib.Path(".github/scripts/shared.py")
-        )
+        spec_path = pathlib.Path(__file__).parent.parent / ".github" / "scripts" / "shared.py"
+        if not spec_path.exists():
+            # Fallback: assume tests run from repo root
+            spec_path = pathlib.Path(".github/scripts/shared.py")
+        spec = importlib.util.spec_from_file_location("shared", spec_path)
         mod = importlib.util.module_from_spec(spec)
-        # Stub anthropic before exec so the import doesn't fail if not installed
-        if "anthropic" not in sys.modules:
-            fake_anthropic = types.ModuleType("anthropic")
-            fake_anthropic.Anthropic = MagicMock()
-            sys.modules["anthropic"] = fake_anthropic
+        sys.modules["shared"] = mod
         spec.loader.exec_module(mod)
         return mod
 
 
-# ---------------------------------------------------------------------------
-# Convenience re-import fixture per test (ensures env is always set)
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture()
-def sh(shared):
-    return shared
+@pytest.fixture(scope="module")
+def shared():
+    """Module-scoped fixture: import shared once with fake env."""
+    with patch.dict("os.environ", FAKE_ENV, clear=False):
+        sys.modules.pop("shared", None)
+        import importlib.util, pathlib
+        spec_path = pathlib.Path(".github/scripts/shared.py")
+        spec = importlib.util.spec_from_file_location("shared", spec_path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["shared"] = mod
+        spec.loader.exec_module(mod)
+        return mod
 
 
 # ===========================================================================
 # clean_json
 # ===========================================================================
 
-
 class TestCleanJson:
-    def test_plain_json_unchanged(self, sh):
+
+    def test_plain_json_unchanged(self, shared):
         raw = '{"key": "value"}'
-        assert sh.clean_json(raw) == '{"key": "value"}'
+        assert shared.clean_json(raw) == '{"key": "value"}'
 
-    def test_strips_backtick_json_fence(self, sh):
+    def test_strips_json_fence(self, shared):
         raw = "```json\n{\"key\": \"value\"}\n```"
-        result = sh.clean_json(raw)
+        result = shared.clean_json(raw)
         assert result == '{"key": "value"}'
 
-    def test_strips_plain_backtick_fence(self, sh):
-        raw = "```\n{\"key\": \"value\"}\n```"
-        result = sh.clean_json(raw)
-        assert result == '{"key": "value"}'
+    def test_strips_plain_triple_backtick_fence(self, shared):
+        raw = "```\n{\"a\": 1}\n```"
+        result = shared.clean_json(raw)
+        assert result == '{"a": 1}'
 
-    def test_strips_leading_trailing_whitespace(self, sh):
-        raw = "   \n{\"a\": 1}\n   "
-        assert sh.clean_json(raw) == '{"a": 1}'
+    def test_strips_surrounding_whitespace(self, shared):
+        raw = "   \n{\"x\": 99}\n   "
+        result = shared.clean_json(raw)
+        assert result == '{"x": 99}'
 
-    def test_fence_with_extra_whitespace_inside(self, sh):
-        raw = "```json\n  {\"a\": 1}  \n```"
-        result = sh.clean_json(raw)
-        assert result.strip() == '{"a": 1}'
+    def test_strips_fence_and_whitespace(self, shared):
+        raw = "  ```json\n  {\"k\": \"v\"}\n  ```  "
+        result = shared.clean_json(raw)
+        assert result == '{"k": "v"}'
 
-    def test_empty_string(self, sh):
-        assert sh.clean_json("") == ""
+    def test_empty_string(self, shared):
+        assert shared.clean_json("") == ""
 
-    def test_no_closing_fence_strips_opening_only(self, sh):
-        """If there's no closing fence the rsplit leaves content intact."""
-        raw = "```json\n{\"key\": \"value\"}"
-        result = sh.clean_json(raw)
-        # Opening line dropped; no closing fence → content returned as-is
-        assert '{"key": "value"}' in result
+    def test_only_whitespace(self, shared):
+        assert shared.clean_json("   ") == ""
 
-    def test_nested_json_array(self, sh):
+    def test_json_array(self, shared):
         raw = "```json\n[1, 2, 3]\n```"
-        assert sh.clean_json(raw) == "[1, 2, 3]"
+        result = shared.clean_json(raw)
+        assert result == "[1, 2, 3]"
 
-    def test_multiline_json_preserved(self, sh):
-        inner = '{\n  "a": 1,\n  "b": 2\n}'
-        raw = f"```json\n{inner}\n```"
-        assert sh.clean_json(raw) == inner
+    def test_no_closing_fence(self, shared):
+        """If there is an opening fence but no closing, rsplit still works gracefully."""
+        raw = "```json\n{\"a\": 1}"
+        result = shared.clean_json(raw)
+        # rsplit on ``` that doesn't exist returns the original string unchanged
+        assert '{"a": 1}' in result
+
+    def test_nested_backticks_in_content(self, shared):
+        """Content containing single backticks should be preserved."""
+        raw = '{"code": "`hello`"}'
+        assert shared.clean_json(raw) == '{"code": "`hello`"}'
+
+    def test_multiline_json(self, shared):
+        raw = "```json\n{\n  \"a\": 1,\n  \"b\": 2\n}\n```"
+        result = shared.clean_json(raw)
+        parsed = json.loads(result)
+        assert parsed == {"a": 1, "b": 2}
 
 
 # ===========================================================================
 # call_claude
 # ===========================================================================
 
-
 class TestCallClaude:
-    def _make_response(self, text: str):
-        content_block = MagicMock()
-        content_block.text = text
-        response = MagicMock()
-        response.content = [content_block]
-        return response
 
-    def test_returns_text_from_first_content_block(self, sh):
-        fake_response = self._make_response("Hello from Claude")
+    def _make_mock_response(self, text: str):
+        mock_content = MagicMock()
+        mock_content.text = text
+        mock_response = MagicMock()
+        mock_response.content = [mock_content]
+        return mock_response
+
+    def test_happy_path_returns_text(self, shared):
         mock_client = MagicMock()
-        mock_client.messages.create.return_value = fake_response
-
+        mock_client.messages.create.return_value = self._make_mock_response("Hello!")
         with patch("anthropic.Anthropic", return_value=mock_client):
-            # Re-patch inside the module namespace
-            with patch.object(sh.anthropic, "Anthropic", return_value=mock_client):
-                result = sh.call_claude("sys prompt", "user prompt")
+            result = shared.call_claude("sys prompt", "user prompt")
+        assert result == "Hello!"
 
-        assert result == "Hello from Claude"
-
-    def test_passes_correct_model_and_params(self, sh):
-        fake_response = self._make_response("ok")
+    def test_passes_correct_model(self, shared):
         mock_client = MagicMock()
-        mock_client.messages.create.return_value = fake_response
+        mock_client.messages.create.return_value = self._make_mock_response("ok")
+        with patch("anthropic.Anthropic", return_value=mock_client):
+            shared.call_claude("sys", "usr")
+        _, kwargs = mock_client.messages.create.call_args
+        assert kwargs["model"] == shared.MODEL
 
-        with patch.object(sh.anthropic, "Anthropic", return_value=mock_client):
-            sh.call_claude("system", "user", max_tokens=1024)
-
-        call_kwargs = mock_client.messages.create.call_args
-        assert call_kwargs.kwargs["max_tokens"] == 1024
-        assert call_kwargs.kwargs["system"] == "system"
-        assert call_kwargs.kwargs["messages"] == [{"role": "user", "content": "user"}]
-
-    def test_default_max_tokens_is_4096(self, sh):
-        fake_response = self._make_response("ok")
+    def test_passes_system_and_user(self, shared):
         mock_client = MagicMock()
-        mock_client.messages.create.return_value = fake_response
+        mock_client.messages.create.return_value = self._make_mock_response("ok")
+        with patch("anthropic.Anthropic", return_value=mock_client):
+            shared.call_claude("my system", "my user")
+        _, kwargs = mock_client.messages.create.call_args
+        assert kwargs["system"] == "my system"
+        assert kwargs["messages"] == [{"role": "user", "content": "my user"}]
 
-        with patch.object(sh.anthropic, "Anthropic", return_value=mock_client):
-            sh.call_claude("s", "u")
-
-        call_kwargs = mock_client.messages.create.call_args
-        assert call_kwargs.kwargs["max_tokens"] == 4096
-
-    def test_uses_configured_api_key(self, sh):
-        fake_response = self._make_response("ok")
+    def test_default_max_tokens(self, shared):
         mock_client = MagicMock()
-        mock_client.messages.create.return_value = fake_response
+        mock_client.messages.create.return_value = self._make_mock_response("ok")
+        with patch("anthropic.Anthropic", return_value=mock_client):
+            shared.call_claude("sys", "usr")
+        _, kwargs = mock_client.messages.create.call_args
+        assert kwargs["max_tokens"] == 4096
 
-        with patch.object(sh.anthropic, "Anthropic", return_value=mock_client) as mock_cls:
-            sh.call_claude("s", "u")
-            mock_cls.assert_called_once_with(api_key=sh.ANTHROPIC_API_KEY)
-
-    def test_empty_system_and_user(self, sh):
-        fake_response = self._make_response("")
+    def test_custom_max_tokens(self, shared):
         mock_client = MagicMock()
-        mock_client.messages.create.return_value = fake_response
+        mock_client.messages.create.return_value = self._make_mock_response("ok")
+        with patch("anthropic.Anthropic", return_value=mock_client):
+            shared.call_claude("sys", "usr", max_tokens=1024)
+        _, kwargs = mock_client.messages.create.call_args
+        assert kwargs["max_tokens"] == 1024
 
-        with patch.object(sh.anthropic, "Anthropic", return_value=mock_client):
-            result = sh.call_claude("", "")
+    def test_uses_api_key_from_env(self, shared):
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = self._make_mock_response("ok")
+        with patch("anthropic.Anthropic", return_value=mock_client) as mock_cls:
+            shared.call_claude("sys", "usr")
+        mock_cls.assert_called_once_with(api_key="fake-anthropic-key")
 
-        assert result == ""
+    def test_returns_first_content_block(self, shared):
+        """Only the first content block's text should be returned."""
+        content_0 = MagicMock()
+        content_0.text = "first"
+        content_1 = MagicMock()
+        content_1.text = "second"
+        mock_response = MagicMock()
+        mock_response.content = [content_0, content_1]
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = mock_response
+        with patch("anthropic.Anthropic", return_value=mock_client):
+            result = shared.call_claude("s", "u")
+        assert result == "first"
+
+    def test_api_exception_propagates(self, shared):
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = RuntimeError("API down")
+        with patch("anthropic.Anthropic", return_value=mock_client):
+            with pytest.raises(RuntimeError, match="API down"):
+                shared.call_claude("s", "u")
 
 
 # ===========================================================================
 # get_repo_files
 # ===========================================================================
 
-
 class TestGetRepoFiles:
-    def _tree_response(self, items):
-        """Build a mock requests.get response for the tree endpoint."""
-        resp = MagicMock()
-        resp.json.return_value = {"tree": items}
-        return resp
 
-    def _blob_response(self, content: str):
-        encoded = base64.b64encode(content.encode()).decode()
-        resp = MagicMock()
-        resp.json.return_value = {"content": encoded}
-        return resp
+    def _make_tree_response(self, items):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"tree": items}
+        return mock_resp
 
-    def test_returns_matching_files(self, sh):
+    def _make_blob_response(self, content_str: str):
+        encoded = base64.b64encode(content_str.encode()).decode()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"content": encoded}
+        return mock_resp
+
+    def test_happy_path_fetches_matching_files(self, shared):
         tree = [
-            {"type": "blob", "path": "README.md", "url": "http://gh/blob1"},
-            {"type": "blob", "path": "main.py", "url": "http://gh/blob2"},
+            {"type": "blob", "path": "src/main.py", "url": "http://blob/main"},
+            {"type": "blob", "path": "src/util.js", "url": "http://blob/util"},
         ]
-        with patch("requests.get") as mock_get:
-            mock_get.side_effect = [
-                self._tree_response(tree),
-                self._blob_response("# readme content"),
-                self._blob_response("print('hello')"),
-            ]
-            result = sh.get_repo_files("owner", "repo", [".md", ".py"])
+        blob_py = self._make_blob_response("print('hello')")
 
-        assert "README.md" in result
-        assert "main.py" in result
-        assert result["README.md"] == "# readme content"
-        assert result["main.py"] == "print('hello')"
+        def fake_get(url, headers=None):
+            if "trees" in url:
+                return self._make_tree_response(tree)
+            return blob_py
 
-    def test_filters_by_extension(self, sh):
+        with patch("requests.get", side_effect=fake_get):
+            result = shared.get_repo_files("owner", "repo", [".py"])
+
+        assert "src/main.py" in result
+        assert "src/util.js" not in result
+        assert result["src/main.py"] == "print('hello')"
+
+    def test_respects_max_files_limit(self, shared):
         tree = [
-            {"type": "blob", "path": "main.py", "url": "http://gh/blob1"},
-            {"type": "blob", "path": "style.css", "url": "http://gh/blob2"},
-            {"type": "blob", "path": "data.json", "url": "http://gh/blob3"},
-        ]
-        with patch("requests.get") as mock_get:
-            mock_get.side_effect = [
-                self._tree_response(tree),
-                self._blob_response("print('hello')"),
-            ]
-            result = sh.get_repo_files("owner", "repo", [".py"])
-
-        assert "main.py" in result
-        assert "style.css" not in result
-        assert "data.json" not in result
-
-    def test_respects_max_files(self, sh):
-        tree = [
-            {"type": "blob", "path": f"file{i}.py", "url": f"http://gh/blob{i}"}
+            {"type": "blob", "path": f"file{i}.py", "url": f"http://blob/{i}"}
             for i in range(10)
         ]
-        blob_resp = self._blob_response("content")
+        blob = self._make_blob_response("content")
 
-        with patch("requests.get") as mock_get:
-            # First call = tree, subsequent = blobs
-            mock_get.side_effect = [self._tree_response(tree)] + [blob_resp] * 3
-            result = sh.get_repo_files("owner", "repo", [".py"], max_files=3)
+        def fake_get(url, headers=None):
+            if "trees" in url:
+                return self._make_tree_response(tree)
+            return blob
+
+        with patch("requests.get", side_effect=fake_get):
+            result = shared.get_repo_files("owner", "repo", [".py"], max_files=3)
 
         assert len(result) == 3
 
-    def test_skips_tree_items(self, sh):
+    def test_skips_non_blob_items(self, shared):
         tree = [
-            {"type": "tree", "path": "src", "url": "http://gh/tree1"},
-            {"type": "blob", "path": "main.py", "url": "http://gh/blob1"},
+            {"type": "tree", "path": "src/", "url": "http://tree/src"},
+            {"type": "blob", "path": "src/app.py", "url": "http://blob/app"},
         ]
-        with patch("requests.get") as mock_get:
-            mock_get.side_effect = [
-                self._tree_response(tree),
-                self._blob_response("code"),
-            ]
-            result = sh.get_repo_files("owner", "repo", [".py"])
+        blob = self._make_blob_response("# app")
 
-        assert "src" not in result
-        assert "main.py" in result
+        def fake_get(url, headers=None):
+            if "trees" in url:
+                return self._make_tree_response(tree)
+            return blob
 
-    def test_handles_empty_tree(self, sh):
-        with patch("requests.get") as mock_get:
-            mock_get.return_value = self._tree_response([])
-            result = sh.get_repo_files("owner", "repo", [".py"])
+        with patch("requests.get", side_effect=fake_get):
+            result = shared.get_repo_files("owner", "repo", [".py"])
+
+        assert "src/" not in result
+        assert "src/app.py" in result
+
+    def test_multiple_extensions(self, shared):
+        tree = [
+            {"type": "blob", "path": "a.py", "url": "http://blob/a"},
+            {"type": "blob", "path": "b.js", "url": "http://blob/b"},
+            {"type": "blob", "path": "c.md", "url": "http://blob/c"},
+        ]
+        blob = self._make_blob_response("data")
+
+        def fake_get(url, headers=None):
+            if "trees" in url:
+                return self._make_tree_response(tree)
+            return blob
+
+        with patch("requests.get", side_effect=fake_get):
+            result = shared.get_repo_files("owner", "repo", [".py", ".js"])
+
+        assert "a.py" in result
+        assert "b.js" in result
+        assert "c.md" not in result
+
+    def test_empty_tree_returns_empty_dict(self, shared):
+        def fake_get(url, headers=None):
+            mock_resp = MagicMock()
+            mock_resp.json.return_value = {"tree": []}
+            return mock_resp
+
+        with patch("requests.get", side_effect=fake_get):
+            result = shared.get_repo_files("owner", "repo", [".py"])
 
         assert result == {}
 
-    def test_handles_blob_decode_exception_gracefully(self, sh):
-        """If base64 decoding raises, file is silently skipped."""
+    def test_handles_blob_decode_exception_gracefully(self, shared):
         tree = [
-            {"type": "blob", "path": "bad.py", "url": "http://gh/blob1"},
-            {"type": "blob", "path": "good.py", "url": "http://gh/blob2"},
+            {"type": "blob", "path": "broken.py", "url": "http://blob/broken"},
+            {"type": "blob", "path": "good.py", "url": "http://blob/good"},
         ]
-        bad_resp = MagicMock()
-        bad_resp.json.return_value = {"content": "NOT_VALID_BASE64!!!"}
 
-        with patch("requests.get") as mock_get:
-            mock_get.side_effect = [
-                self._tree_response(tree),
-                bad_resp,
-                self._blob_response("good content"),
-            ]
-            result = sh.get_repo_files("owner", "repo", [".py"])
+        good_blob = self._make_blob_response("good content")
+        bad_blob = MagicMock()
+        bad_blob.json.return_value = {"content": "!!!NOT_BASE64!!!"}
 
-        # bad.py may or may not be in result depending on decode behaviour;
-        # good.py must be present
+        call_count = {"n": 0}
+
+        def fake_get(url, headers=None):
+            if "trees" in url:
+                return self._make_tree_response(tree)
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return bad_blob
+            return good_blob
+
+        with patch("requests.get", side_effect=fake_get):
+            # Should not raise
+            result = shared.get_repo_files("owner", "repo", [".py"])
+
+        # Only the good file should appear (bad one skipped silently)
         assert "good.py" in result
 
-    def test_constructs_correct_tree_url(self, sh):
-        with patch("requests.get") as mock_get:
-            mock_get.return_value = self._tree_response([])
-            sh.get_repo_files("myowner", "myrepo", [".py"])
+    def test_missing_content_key_silently_skipped(self, shared):
+        tree = [{"type": "blob", "path": "no_content.py", "url": "http://blob/x"}]
 
-        first_call_url = mock_get.call_args_list[0][0][0]
-        assert "myowner/myrepo/git/trees/HEAD" in first_call_url
-        assert "recursive=1" in first_call_url
-
-    def test_default_max_files_is_20(self, sh):
-        tree = [
-            {"type": "blob", "path": f"f{i}.py", "url": f"http://gh/b{i}"}
-            for i in range(25)
-        ]
-        blob_resp = self._blob_response("x")
-        with patch("requests.get") as mock_get:
-            mock_get.side_effect = [self._tree_response(tree)] + [blob_resp] * 20
-            result = sh.get_repo_files("o", "r", [".py"])
-
-        assert len(result) == 20
-
-
-# ===========================================================================
-# get_pr_diff
-# ===========================================================================
-
-
-class TestGetPrDiff:
-    def test_returns_diff_text(self, sh):
-        mock_resp = MagicMock()
-        mock_resp.text = "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new"
-        with patch("requests.get", return_value=mock_resp) as mock_get:
-            result = sh.get_pr_diff("owner", "repo", 42)
-
-        assert "--- a/file" in result
-
-    def test_truncates_at_30000_chars(self, sh):
-        long_diff = "x" * 40000
-        mock_resp = MagicMock()
-        mock_resp.text = long_diff
-        with patch("requests.get", return_value=mock_resp):
-            result = sh.get_pr_diff("owner", "repo", 1)
-
-        assert len(result) == 30000
-
-    def test_short_diff_not_truncated(self, sh):
-        short_diff = "diff content"
-        mock_resp = MagicMock()
-        mock_resp.text = short_diff
-        with patch("requests.get", return_value=mock_resp):
-            result = sh.get_pr_diff("owner", "repo", 1)
-
-        assert result == short_diff
-
-    def test_uses_diff_accept_header(self, sh):
-        mock_resp = MagicMock()
-        mock_resp.text = ""
-        with patch("requests.get", return_value=mock_resp) as mock_get:
-            sh.
+        def fake_get(url, headers=None):
+            if "trees" in url:
+                return self._make_tree_response(tree)
+            mock_resp = MagicMock()
+            mock
