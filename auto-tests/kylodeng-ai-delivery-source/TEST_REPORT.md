@@ -1,6 +1,6 @@
 # Auto-Generated Test Report
 **Repo:** kylodeng/ai-delivery-source  
-**Generated:** 2026-04-15 08:29 UTC
+**Generated:** 2026-04-22 08:31 UTC
 
 ## Summary
 | Source File | Est. Coverage | Generated Test File | TODOs |
@@ -9,7 +9,7 @@
 | `.github/scripts/tool1_code_review.py` | ~70% | auto-tests/kylodeng-ai-delivery-source/python/test_tool1_code_review.py | 4 TODOs |
 | `.github/scripts/tool2_tech_docs.py` | ~70% | auto-tests/kylodeng-ai-delivery-source/python/test_tool2_tech_docs.py | 4 TODOs |
 | `.github/scripts/tool3_business_docs.py` | ~70% | auto-tests/kylodeng-ai-delivery-source/python/test_tool3_business_docs.py | 4 TODOs |
-| `.github/scripts/tool5_uat.py` | ~70% | auto-tests/kylodeng-ai-delivery-source/python/test_tool5_uat.py | 4 TODOs |
+| `.github/scripts/tool5_uat.py` | ~70% | auto-tests/kylodeng-ai-delivery-source/python/test_tool5_uat.py | 5 TODOs |
 | `src/data_pipeline.py` | ~70% | auto-tests/kylodeng-ai-delivery-source/python/test_data_pipeline.py | 5 TODOs |
 
 ## How to use
