@@ -536,5 +536,19 @@
       "ARCHITECTURE.md",
       "RUNBOOK.md"
     ]
+  },
+  {
+    "timestamp": "2026-04-26T07:51:45Z",
+    "tool": "tech-docs",
+    "status": "SUCCESS",
+    "source_repo": "kylodeng/Insurance-Training-Bot-main",
+    "output_url": "https://github.com/kylodeng/ai-delivery-outputs/blob/main/tech-docs/kylodeng-Insurance-Training-Bot-main/INDEX.md",
+    "run_url": "https://github.com/kylodeng/Insurance-Training-Bot-main/actions/runs/24951522883",
+    "summary": "Generated 3 documents: README, ARCHITECTURE, RUNBOOK",
+    "docs_generated": [
+      "README.md",
+      "ARCHITECTURE.md",
+      "RUNBOOK.md"
+    ]
   }
 ]
