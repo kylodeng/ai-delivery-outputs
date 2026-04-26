@@ -1,44 +1,59 @@
 # Operational Runbook — `kylodeng/ai-delivery-source`
 
-> **Version:** 1.0 | **Last updated:** [TODO: insert date] | **Status:** Draft
+> **Last updated:** [TODO: insert date on each revision]
+> **Runbook owner:** [TODO: team/individual name]
+> **Version:** 1.0
 
 ---
 
 ## 1. Service Overview
 
-`kylodeng/ai-delivery-source` is a GitHub Actions–driven AI delivery platform that combines five automated workflow tools — code review, technical documentation generation, business documentation generation, automated test generation, and UAT facilitation — all powered by the Anthropic Claude API (model `claude-sonnet-4-6`). The platform is triggered by standard GitHub events (pull requests, merges to `main`, version tags, release branch creation, and scheduled crons) and orchestrates calls to the Claude API, the GitHub API, and SendGrid to produce outputs written to a companion repository (`ai-delivery-outputs`) and optionally notified via email. The data pipeline component (`src/data_pipeline.py`) runs as an AWS Lambda function, ingesting customer CSV files from an S3 landing bucket (`capco-data-landing-<env>`), validating and transforming them to Parquet, and writing results to a processed bucket (`capco-data-processed-<env>`).
+`kylodeng/ai-delivery-source` is a GitHub Actions–driven AI delivery platform that automates five software development lifecycle tasks using Anthropic's Claude API: automated code review (Tool 1), technical documentation generation (Tool 2), business documentation generation (Tool 3), AI-generated test suite creation and coverage gap analysis (Tool 4), and UAT test pack generation and results analysis (Tool 5). The platform reads source files from this repository, passes them to Claude (`claude-sonnet-4-6`), and writes all outputs (markdown docs, test files, CSV test packs, audit logs) to a companion repository named `ai-delivery-outputs`. Notifications are delivered via SendGrid email to `kylo.deng@capco.com`. The data pipeline component (`src/data_pipeline.py`) is deployed as an AWS Lambda function that ingests customer CSV files from an S3 landing bucket (`capco-data-landing-{env}`), validates and transforms them, and writes Parquet files to a processed bucket (`capco-data-processed-{env}`), triggered by S3 `ObjectCreated` events on the `raw/` prefix.
 
 ---
 
 ## 2. Health Checks
 
-### GitHub Actions Workflows
+Run these checks in order to confirm all components are operational.
+
+### 2.1 GitHub Actions Workflows
 
 | Check | How to verify |
 |---|---|
-| Workflows are enabled | Navigate to **Actions** tab in `kylodeng/ai-delivery-source`; confirm all 5 workflows are listed and not disabled |
-| Secrets are present | **Settings → Secrets and variables → Actions**; confirm `ANTHROPIC_API_KEY`, `GH_TOKEN`, `SENDGRID_API_KEY` exist |
-| Output repo is accessible | Confirm `ai-delivery-outputs` repo exists under the same owner and the `GH_TOKEN` has write access |
-| Scheduled jobs firing | Check the last run timestamps for the Monday 08:00 (Tool 1), Sunday 06:00 (Tool 2), Wednesday 07:00 (Tool 4) crons |
+| All 5 workflows visible | Navigate to **Actions** tab in `kylodeng/ai-delivery-source` — confirm 5 workflows listed |
+| Last run succeeded | Each workflow's last run badge shows ✅ green |
+| Output repo is writable | Confirm a recent commit exists in `ai-delivery-outputs` repo |
+| Secrets are set | Repo **Settings → Secrets → Actions** — confirm `ANTHROPIC_API_KEY`, `GH_TOKEN`, `SENDGRID_API_KEY` are present (values not visible — check for red ⚠️ indicators) |
 
-### AWS Lambda (Data Pipeline)
+### 2.2 AWS Lambda (Data Pipeline)
 
-| Check | How to verify |
+```bash
+# Check Lambda function exists and is active
+aws lambda get-function --function-name data-ingest-dev \
+  --query 'Configuration.[State,LastModified,Runtime]'
+
+# Check last invocation result (last 1 hour)
+aws logs filter-log-events \
+  --log-group-name /aws/lambda/data-ingest-dev \
+  --start-time $(date -d '1 hour ago' +%s000) \
+  --filter-pattern "statusCode"
+```
+
+### 2.3 S3 Buckets
+
+```bash
+# Confirm buckets exist and are accessible
+aws s3 ls s3://capco-data-landing-dev/raw/ --summarize
+aws s3 ls s3://capco-data-processed-dev/ --summarize
+```
+
+### 2.4 External API Connectivity
+
+| API | Check |
 |---|---|
-| Lambda function deployed | `aws lambda get-function --function-name data-ingest-<env>` returns `State: Active` |
-| S3 landing bucket exists | `aws s3 ls s3://capco-data-landing-<env>/` returns without error |
-| S3 processed bucket exists | `aws s3 ls s3://capco-data-processed-<env>/` returns without error |
-| S3 event trigger configured | `aws s3api get-bucket-notification-configuration --bucket capco-data-landing-<env>` shows `LambdaFunctionConfigurations` |
-| Lambda responds to test event | See [Useful Commands](#7-useful-commands) |
-| CloudWatch log group active | `aws logs describe-log-groups --log-group-name-prefix /aws/lambda/data-ingest` |
-
-### External API Dependencies
-
-| Dependency | Check |
-|---|---|
-| Anthropic API | Confirm `ANTHROPIC_API_KEY` is valid and not rate-limited; check [status.anthropic.com](https://status.anthropic.com) |
-| SendGrid | Confirm `SENDGRID_API_KEY` is active; check [status.sendgrid.com](https://status.sendgrid.com) |
-| GitHub API | `curl -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/rate_limit` — confirm remaining > 100 |
+| Anthropic Claude | Workflow logs show `call_claude` returning without HTTP error |
+| SendGrid | Confirm delivery receipt in `kylo.deng@capco.com` inbox after any tool run |
+| GitHub API | `GET https://api.github.com/repos/{owner}/ai-delivery-outputs` returns HTTP 200 with `GH_TOKEN` |
 
 ---
 
@@ -46,135 +61,127 @@
 
 | Symptom | Likely Cause | Resolution Steps |
 |---|---|---|
-| Workflow fails with `KeyError: 'ANTHROPIC_API_KEY'` | Secret not set or not passed to job env | 1. Go to **Settings → Secrets → Actions**. 2. Add/rotate `ANTHROPIC_API_KEY`. 3. Re-run failed workflow. |
-| Workflow fails with `KeyError: 'GH_TOKEN'` | PAT missing, expired, or lacks repo write scope | 1. Generate new PAT with `repo` and `workflow` scopes. 2. Update `GH_TOKEN` secret. 3. Re-run workflow. |
-| `write_output_file` returns 404 or 422 | `ai-delivery-outputs` repo does not exist or token lacks write access | 1. Create `ai-delivery-outputs` repo under the same owner. 2. Confirm `GH_TOKEN` has `contents:write` on that repo. |
-| Claude returns non-JSON / parse error | Model returned markdown-wrapped JSON or hallucinated format | 1. Check workflow logs for `[DEBUG] First 500 chars`. 2. Increase `max_tokens` if truncated. 3. Re-run — transient in most cases. |
-| SendGrid email not delivered | Invalid `SENDGRID_API_KEY` or sender domain not verified | 1. Verify sender `noreply@ai-delivery.capco.com` in SendGrid. 2. Rotate `SENDGRID_API_KEY` secret. |
-| Tool 1 PR comment not posted | `GH_TOKEN` lacks `pull-requests:write` permission | 1. Confirm token scopes. 2. For fine-grained PAT, add Pull Requests read/write. |
-| Lambda returns `500` / `Failed: ...` | Malformed CSV, missing `key` in event, or S3 permissions error | 1. Check CloudWatch logs: `/aws/lambda/data-ingest-<env>`. 2. Verify S3 IAM policy. 3. Test with synthetic event (see commands). |
-| Lambda cannot read from S3 | Hardcoded credentials (`AWS_ACCESS_KEY` in code) are invalid | **URGENT** — 1. Rotate exposed credentials immediately. 2. Remove hardcoded keys from `data_pipeline.py`. 3. Attach IAM role with least-privilege S3 access. 4. Redeploy Lambda. |
-| `list_objects_v2` returns truncated results | No pagination implemented; bucket has >1000 files | 1. Implement paginator (see commands). 2. As workaround, process files in batches manually. |
-| Parquet write fails | `s3fs`/`pyarrow` not installed in Lambda layer, or output path collision | 1. Check Lambda layer includes `pandas`, `pyarrow`, `s3fs`. 2. Confirm `processed/` prefix has write permissions. |
-| Scheduled workflow never triggers | Repository is inactive (GitHub disables schedules after 60 days of inactivity) | 1. Make a trivial commit or re-enable the workflow from the Actions tab. |
-| Tool 5 UAT workflow skipped on branch creation | Branch name does not match `refs/heads/release/*` | 1. Ensure branch is named `release/<version>` exactly. 2. Use manual `workflow_dispatch` as fallback. |
-| `get_repo_files` returns empty dict | Repo tree fetch fails due to large repo or auth error | 1. Check GitHub API rate limit. 2. Reduce `max_files` parameter. 3. Confirm `GH_TOKEN` has read access to source repo. |
-| Terraform apply fails | Missing variable values or AWS credentials not configured | 1. Run `terraform plan` first. 2. Export `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` or use assumed role. 3. Review error output. |
-| S3 landing bucket data exposed | No public access block and no encryption on `aws_s3_bucket.landing` | **SECURITY ISSUE** — 1. Apply `aws_s3_bucket_public_access_block`. 2. Add `aws_s3_bucket_server_side_encryption_configuration`. 3. Run `terraform apply`. |
+| Workflow fails with `KeyError: 'ANTHROPIC_API_KEY'` | Secret not set or misspelled in repository secrets | Go to repo **Settings → Secrets → Actions** → add/correct `ANTHROPIC_API_KEY` |
+| Workflow fails with `KeyError: 'GH_TOKEN'` | `GH_TOKEN` secret missing or token expired/revoked | Regenerate a GitHub PAT with `repo` and `contents:write` scopes; update `GH_TOKEN` secret |
+| Workflow fails with `KeyError: 'SENDGRID_API_KEY'` | SendGrid secret missing | Add `SENDGRID_API_KEY` to repository secrets |
+| `call_claude` raises HTTP 401 / 403 | Anthropic API key invalid or expired | Rotate the Anthropic API key and update `ANTHROPIC_API_KEY` secret |
+| `call_claude` raises HTTP 429 | Anthropic rate limit exceeded | Wait and re-trigger the workflow; consider adding retry logic [TODO: implement exponential backoff in `shared.py`] |
+| `write_output_file` returns 404 or 422 | `ai-delivery-outputs` repo does not exist or `GH_TOKEN` lacks write access | Create the repo if missing; confirm PAT has `contents:write` permission on the output repo |
+| Claude response fails JSON parse in Tool 1 | Claude returned malformed JSON or wrapped in markdown fences | Check `[DEBUG]` lines in workflow logs; re-trigger — the `extract_json` function handles most fences; if persistent, review prompt in `SYSTEM` constant |
+| Lambda invocation timeout | CSV file too large / `process_csv` takes >30s | Increase Lambda `timeout` in `infra/main.tf` (current: 30s); consider chunking large files |
+| Lambda returns `statusCode: 500` | Exception in `process_csv` or `validate_customer_record` | Check CloudWatch log group `/aws/lambda/data-ingest-{env}` for traceback |
+| S3 trigger not firing Lambda | S3 bucket notification not configured or Lambda permission missing | Run `terraform apply` to reconcile; check `aws lambda get-policy --function-name data-ingest-dev` for S3 invoke permission |
+| `get_all_pending_files` returns empty list | No `.csv` files in `raw/` prefix, or bucket name wrong | Confirm files were uploaded to correct bucket and prefix; check `LANDING_BUCKET` env var on Lambda |
+| `result_df.to_parquet` fails | `pyarrow`/`fastparquet` not in Lambda deployment package | Rebuild `lambda.zip` with pandas parquet dependencies included |
+| Email not received | SendGrid API key invalid, sender domain not verified, or `NOTIFY_EMAIL` wrong | Check SendGrid dashboard for delivery errors; verify `noreply@ai-delivery.capco.com` is an authenticated sender |
+| Tool 2 generates empty docs (`_No files found_`) | `get_repo_files` returned nothing — wrong extensions or repo has no matching files | Confirm source repo has `.py`, `.tf`, `.yaml` etc.; check `GH_TOKEN` can read the source repo |
+| Tool 5 UAT workflow skips on branch creation | Branch name does not match `refs/heads/release/*` pattern | Ensure release branches are named `release/x.y.z` — the `if:` condition filters on this prefix |
+| Terraform apply fails with credential error | AWS credentials not configured in the deploying environment | Export `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (or use IAM role) before running Terraform |
+| Hardcoded AWS keys in `data_pipeline.py` rejected | Boto3 uses env vars or instance role, not hardcoded keys, OR keys are invalid | **Immediately rotate the example keys**; remove hardcoded credentials; use IAM execution role or `AWS_*` environment variables |
 
 ---
 
 ## 4. Deployment Procedure
 
-### 4.1 Prerequisites
+### Prerequisites
 
-- AWS CLI configured with appropriate credentials
-- Terraform ≥ 1.0 installed
-- Python 3.12 installed locally (for packaging Lambda)
-- GitHub PAT with `repo` + `workflow` scopes set as `GH_TOKEN`
+- AWS CLI configured with sufficient permissions (`iam:*`, `s3:*`, `lambda:*` in the target account)
+- Terraform ≥ 1.5 installed
+- Python 3.12 installed locally
+- `lambda.zip` built and present (see step 3 below)
+- GitHub PAT with `repo`, `contents:write` scopes stored as `GH_TOKEN`
 
-### 4.2 Infrastructure Deployment (Terraform)
+---
+
+### 4.1 Infrastructure Deployment (Terraform)
 
 ```bash
-# Step 1 — Package Lambda function
-cd src/
-zip -r ../infra/lambda.zip data_pipeline.py
-cd ../infra/
-
-# Step 2 — Initialise Terraform
+# Step 1 — Initialise Terraform
+cd infra/
 terraform init
 
-# Step 3 — Review plan
+# Step 2 — Review the plan
 terraform plan -var="environment=prod"
 
-# Step 4 — Apply
+# Step 3 — Build Lambda deployment package (from repo root)
+cd ..
+pip install -r requirements.txt -t lambda_package/
+cp src/data_pipeline.py lambda_package/
+cd lambda_package && zip -r ../infra/lambda.zip . && cd ..
+
+# Step 4 — Apply infrastructure
+cd infra/
 terraform apply -var="environment=prod"
 
 # Step 5 — Confirm outputs
-terraform output landing_bucket
-terraform output processed_bucket
+terraform output
 ```
 
-### 4.3 Deploying Updated Lambda Code
+**Expected outputs:**
+```
+landing_bucket   = "capco-data-landing-prod"
+processed_bucket = "capco-data-processed-prod"
+```
+
+---
+
+### 4.2 GitHub Workflows Deployment
+
+The workflows deploy automatically when `.github/workflows/*.yml` files are merged to `main`. No manual step is needed beyond merging.
 
 ```bash
-# Step 1 — Repackage
-cd src/
-zip -r ../infra/lambda.zip data_pipeline.py
-
-# Step 2 — Update function code
-aws lambda update-function-code \
-  --function-name data-ingest-prod \
-  --zip-file fileb://../infra/lambda.zip
-
-# Step 3 — Wait for update to complete
-aws lambda wait function-updated \
-  --function-name data-ingest-prod
-
-# Step 4 — Smoke test
-aws lambda invoke \
-  --function-name data-ingest-prod \
-  --payload '{"bucket":"capco-data-landing-prod","key":"raw/test.csv"}' \
-  response.json && cat response.json
+# Verify all 5 workflows are registered after merge
+gh workflow list --repo kylodeng/ai-delivery-source
 ```
 
-### 4.4 Deploying GitHub Actions Workflow Changes
+---
+
+### 4.3 Secrets Configuration (one-time / rotation)
 
 ```bash
-# Step 1 — Create a feature branch
-git checkout -b fix/workflow-update
-
-# Step 2 — Make changes to .github/workflows/ or .github/scripts/
-
-# Step 3 — Open a PR (triggers Tool 1 code review automatically)
-git push origin fix/workflow-update
-gh pr create --title "Update workflow" --body "Description of change"
-
-# Step 4 — Merge to main after review (triggers Tool 2 doc generation)
-gh pr merge --squash
+# Set each secret via GitHub CLI
+gh secret set ANTHROPIC_API_KEY  --repo kylodeng/ai-delivery-source
+gh secret set GH_TOKEN           --repo kylodeng/ai-delivery-source
+gh secret set SENDGRID_API_KEY   --repo kylodeng/ai-delivery-source
 ```
 
-### 4.5 Rollback Steps
+---
 
-#### Lambda Rollback
+### 4.4 Rollback Steps
+
+#### Rollback — Terraform infrastructure
+
+```bash
+# Option A: Revert to previous Terraform state (if remote state is used)
+# [TODO: confirm whether remote state backend (S3/Terraform Cloud) is configured]
+terraform apply -var="environment=prod" -target=<resource_to_revert>
+
+# Option B: Destroy and re-apply from last known good tag
+git checkout <last-good-tag>
+cd infra/
+terraform apply -var="environment=prod"
+```
+
+#### Rollback — Lambda function only
 
 ```bash
 # List available versions
 aws lambda list-versions-by-function --function-name data-ingest-prod
 
-# Roll back to previous version (replace $VERSION)
+# Rollback to previous version (replace VERSION)
 aws lambda update-alias \
   --function-name data-ingest-prod \
   --name live \
-  --function-version $VERSION
-
-# OR re-deploy previous zip from git tag
-git checkout tags/v<previous-version> -- src/data_pipeline.py
-cd src && zip -r ../infra/lambda.zip data_pipeline.py
-aws lambda update-function-code \
-  --function-name data-ingest-prod \
-  --zip-file fileb://../infra/lambda.zip
+  --function-version <PREVIOUS_VERSION>
 ```
 
-> **Note:** Lambda versioning is not currently configured in `infra/main.tf`. [TODO: Should Lambda versioning and aliases be enabled for safe rollbacks?]
+> ⚠️ **Note:** Lambda versioning/aliases are not currently configured in `infra/main.tf`. [TODO: add `publish = true` and an alias resource to enable clean rollbacks.]
 
-#### Terraform Rollback
-
-```bash
-# Restore previous state from backup (if state versioning enabled)
-terraform state pull > backup.tfstate
-
-# Roll back to previous git revision of .tf files
-git checkout HEAD~1 -- infra/main.tf
-terraform plan -var="environment=prod"
-terraform apply -var="environment=prod"
-```
-
-#### Workflow Script Rollback
+#### Rollback — GitHub workflow scripts
 
 ```bash
-# Revert the offending commit
-git revert <commit-sha>
+# Revert the offending commit on main
+git revert <bad-commit-sha>
 git push origin main
 ```
 
@@ -182,116 +189,124 @@ git push origin main
 
 ## 5. Monitoring & Alerting
 
-### 5.1 AWS Lambda / Data Pipeline
+### 5.1 GitHub Actions
 
-| Metric / Log | Where | Alert threshold |
-|---|---|---|
-| Lambda invocation errors | CloudWatch Metrics → `AWS/Lambda` → `Errors` | Alert if errors > 0 in any 5-min window |
-| Lambda duration | CloudWatch Metrics → `AWS/Lambda` → `Duration` | Alert if P99 > 25,000 ms (timeout is 30 s) |
-| Lambda throttles | CloudWatch Metrics → `AWS/Lambda` → `Throttles` | Alert on any throttle |
-| Failed record count | Application log: `"failed_rows"` in Lambda response body | [TODO: define acceptable failed-row threshold] |
-| S3 `PutObject` errors | CloudWatch Metrics → `AWS/S3` → `5xxErrors` | Alert if > 0 |
-| CloudWatch Logs | `/aws/lambda/data-ingest-<env>` | Filter for `ERROR` and `Failed:` patterns |
-| Lambda log filter (errors) | `aws logs filter-log-events --log-group /aws/lambda/data-ingest-prod --filter-pattern "ERROR"` | [TODO: connect to PagerDuty or SNS alarm] |
-
-> ⚠️ **No CloudWatch alarms are currently defined in the Terraform.** [TODO: Should CloudWatch alarms and an SNS topic for alerting be added to `infra/main.tf`?]
-
-### 5.2 GitHub Actions Workflows
-
-| Signal | Where to check |
+| What to watch | Where |
 |---|---|
-| Workflow failure | **Actions** tab → filter by status `failure`; GitHub sends email to repo admin by default |
-| API rate limit exhaustion | Workflow logs — `requests` calls will return 403/429; check `X-RateLimit-Remaining` header |
-| Anthropic API errors | Workflow logs — look for `anthropic.APIError` or HTTP 529 (overloaded) |
-| SendGrid delivery failures | Workflow logs — look for non-2xx responses from `api.sendgrid.com` |
-| Output repo write failures | Workflow logs — look for 4xx from `api.github.com/repos/.../contents/` |
+| Workflow run status (pass/fail) | **Actions** tab → each workflow's run history |
+| Failed step logs | Click failed run → expand failed step → download raw logs |
+| Weekly code review cron (Mondays 08:00 UTC) | Tool 1 workflow scheduled run |
+| Weekly docs cron (Sundays 06:00 UTC) | Tool 2 workflow scheduled run |
+| Wednesday test gen cron (07:00 UTC) | Tool 4 workflow scheduled run |
 
-### 5.3 Security-Specific Monitoring
+[TODO: configure GitHub Actions notifications or webhook to a Slack/Teams channel for workflow failures]
 
-| Risk | Current status | Recommended action |
+### 5.2 AWS CloudWatch — Lambda
+
+```bash
+# Key metrics to create alarms on:
+# - Errors > 0 in 5-minute window
+# - Duration approaching timeout (>25000ms out of 30000ms limit)
+# - Throttles > 0
+
+aws cloudwatch put-metric-alarm \
+  --alarm-name "data-ingest-errors-prod" \
+  --namespace AWS/Lambda \
+  --metric-name Errors \
+  --dimensions Name=FunctionName,Value=data-ingest-prod \
+  --statistic Sum \
+  --period 300 \
+  --threshold 1 \
+  --comparison-operator GreaterThanOrEqualToThreshold \
+  --evaluation-periods 1 \
+  --alarm-actions <SNS_TOPIC_ARN>
+```
+
+**Recommended CloudWatch alarms:**
+
+| Metric | Threshold | Action |
 |---|---|---|
-| Hardcoded AWS credentials in `data_pipeline.py` | ⛔ **ACTIVE RISK** | Rotate `AKIAIOSFODNN7EXAMPLE` immediately; enable AWS IAM Access Analyzer |
-| Hardcoded `DB_PASSWORD` in Terraform Lambda env | ⛔ **ACTIVE RISK** | Move to AWS Secrets Manager or SSM Parameter Store |
-| S3 landing bucket has no encryption | ⛔ **ACTIVE RISK** | Add `aws_s3_bucket_server_side_encryption_configuration` |
-| IAM role has `s3:*` on `*` | ⚠️ Overly permissive | Scope to specific bucket ARNs and required actions only |
-| No S3 public access block | ⚠️ Risk | Add `aws_s3_bucket_public_access_block` resource |
+| `Lambda/Errors` | ≥ 1 in 5 min | Page on-call |
+| `Lambda/Duration` | > 25,000 ms | Warn — approaching timeout |
+| `Lambda/Throttles` | ≥ 1 | Warn — increase concurrency |
+| `Lambda/ConcurrentExecutions` | [TODO: set based on expected load] | Scale alert |
+
+### 5.3 CloudWatch Log Queries
+
+```bash
+# Find all failed pipeline runs in the last 24 hours
+aws logs filter-log-events \
+  --log-group-name /aws/lambda/data-ingest-prod \
+  --start-time $(date -d '24 hours ago' +%s000) \
+  --filter-pattern "statusCode: 500"
+
+# Find validation failures
+aws logs filter-log-events \
+  --log-group-name /aws/lambda/data-ingest-prod \
+  --start-time $(date -d '24 hours ago' +%s000) \
+  --filter-pattern "Failed"
+```
+
+### 5.4 S3 Monitoring
+
+- Monitor `capco-data-landing-{env}/raw/` for files that are older than [TODO: define SLA age, e.g., 1 hour] and have not moved to `processed/` — this indicates a stuck or failed pipeline.
+- [TODO: add S3 CloudWatch metrics or S3 Storage Lens for object count monitoring]
+
+### 5.5 Key Log Strings to Alert On
+
+| Log string | Meaning |
+|---|---|
+| `statusCode": 500` | Lambda invocation failed |
+| `Failed:` | Caught exception in `lambda_handler` |
+| `Could not parse Claude response as JSON` | Tool 1 JSON parsing failed |
+| `[DEBUG] JSON parse error` | Claude returned unexpected format |
+| `Missing required field` | Customer record validation failure |
+
+### 5.6 Audit Log
+
+[TODO: confirm where `write_audit_entry` writes its output — the function is referenced in scripts but not shown in the provided `shared.py` snippet. Identify the audit log destination (file, S3, CloudWatch Logs) and add monitoring.]
 
 ---
 
 ## 6. Escalation Path
 
-```
-Level 1 — On-call Engineer
-  [TODO: name, Slack handle, phone]
+| Level | Who | When to escalate | Contact |
+|---|---|---|---|
+| L1 — First response | On-call engineer | Workflow failure, Lambda errors, S3 issues | [TODO: on-call roster / PagerDuty link] |
+| L2 — Engineering lead | Platform team lead | Repeated failures, data loss, security events | [TODO: name & contact] |
+| L3 — Security | Security team | Hardcoded credential exposure, IAM breach, S3 data leak | [TODO: security team contact / incident email] |
+| L4 — Vendor support | Anthropic | Claude API outage (check https://status.anthropic.com) | [TODO: Anthropic support contract details] |
+| L4 — Vendor support | SendGrid | Email delivery failures persisting >30 min | [TODO: SendGrid support link] |
+| Business escalation | Product owner / Capco delivery lead | Go/no-go decisions, release blockers | [TODO: name & contact] |
 
-Level 2 — Platform / DevOps Lead
-  [TODO: name, Slack handle, phone]
-
-Level 3 — Engineering Manager
-  [TODO: name, email, phone]
-
-Security incidents (hardcoded secrets, data exposure):
-  [TODO: Security team contact / CISO escalation process]
-
-External vendor support:
-  Anthropic Support  → https://support.anthropic.com
-  SendGrid Support   → https://support.sendgrid.com
-  AWS Support        → https://console.aws.amazon.com/support/
-
-Notify: kylo.deng@capco.com for all P1 incidents
-```
+> ⚠️ **Security note:** Hardcoded AWS credentials exist in `src/data_pipeline.py` and a plaintext `DB_PASSWORD` is set in `infra/main.tf`. If these are real credentials, treat this as a **P1 security incident** and rotate immediately. Notify the security team.
 
 ---
 
 ## 7. Useful Commands
 
-### GitHub API — Check rate limit
+### GitHub Actions — Trigger Workflows Manually
 
 ```bash
-curl -s -H "Authorization: Bearer $GH_TOKEN" \
-  https://api.github.com/rate_limit | jq '.rate'
-```
-
-### Manually trigger a workflow
-
-```bash
-# Trigger Tool 1 (code review) in repo mode
+# Tool 1 — Code review on a specific PR
 gh workflow run tool1_code_review.yml \
-  -f review_mode=repo \
-  --repo kylodeng/ai-delivery-source
+  --repo kylodeng/ai-delivery-source \
+  -f review_mode=pr \
+  -f pr_number=42
 
-# Trigger Tool 2 (tech docs)
+# Tool 1 — Full repo review
+gh workflow run tool1_code_review.yml \
+  --repo kylodeng/ai-delivery-source \
+  -f review_mode=repo
+
+# Tool 2 — Regenerate tech docs
 gh workflow run tool2_tech_docs.yml \
   --repo kylodeng/ai-delivery-source
 
-# Trigger Tool 5 UAT (generate mode)
-gh workflow run tool5_uat.yml \
-  -f uat_mode=generate \
-  -f release_version=1.0.0 \
-  --repo kylodeng/ai-delivery-source
-```
+# Tool 3 — Generate business docs for a release
+gh workflow run tool3_business_docs.yml \
+  --repo kylodeng/ai-delivery-source \
+  -f project_name="Data Ingestion Pipeline" \
+  -f release_version="1.2.0"
 
-### Invoke Lambda with a test event
-
-```bash
-aws lambda invoke \
-  --function-name data-ingest-dev \
-  --payload '{"bucket":"capco-data-landing-dev","key":"raw/sample.csv"}' \
-  --cli-binary-format raw-in-base64-out \
-  response.json
-cat response.json
-```
-
-### Tail Lambda logs in real time
-
-```bash
-aws logs tail /aws/lambda/data-ingest-dev \
-  --follow \
-  --filter-pattern "ERROR"
-```
-
-### Filter Lambda logs for errors (last 1 hour)
-
-```bash
-aws logs filter-log-events \
-  --
+# Tool 4 —
