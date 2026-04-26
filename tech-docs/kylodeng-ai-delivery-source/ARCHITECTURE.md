@@ -4,7 +4,7 @@
 
 ## 1. Overview
 
-This system is a dual-purpose platform combining a **data ingestion pipeline** (infrastructure + application code) with an **AI-assisted software delivery toolkit**. The data pipeline ingests customer CSV files uploaded to an AWS S3 landing bucket, validates and transforms them via an AWS Lambda function, and writes the results as Parquet files to a processed S3 bucket. Layered on top of this is a suite of five GitHub Actions–based AI tools powered by Anthropic's Claude API: automated code review, technical documentation generation, business documentation generation, AI-generated test suites, and UAT facilitation. Outputs from all five AI tools are committed to a companion GitHub repository (`ai-delivery-outputs`) and notifications are delivered via SendGrid email.
+This repository implements an **AI-powered software delivery accelerator** consisting of two distinct subsystems. The first is a set of five GitHub Actions–based CI/CD workflow tools that leverage Anthropic's Claude AI model to automate code review, technical documentation generation, business documentation generation, automated test generation, and UAT facilitation — all outputs are written to a companion repository (`ai-delivery-outputs`) and notifications are sent via SendGrid email. The second is an AWS-hosted **data ingestion pipeline** (infrastructure defined in Terraform) that accepts raw customer CSV files dropped into an S3 landing bucket, validates and transforms them via an AWS Lambda function, and writes the resulting Parquet files to a processed S3 bucket — this pipeline represents the primary *subject* codebase that the five AI delivery tools operate against.
 
 ---
 
@@ -12,49 +12,42 @@ This system is a dual-purpose platform combining a **data ingestion pipeline** (
 
 | Resource | Type | Cloud Provider | Purpose |
 |---|---|---|---|
-| `capco-data-landing-{env}` | S3 Bucket | AWS | Receives raw customer CSV files uploaded externally |
-| `capco-data-processed-{env}` | S3 Bucket | AWS | Stores validated, transformed Parquet output files |
-| `data-ingest-{env}` | Lambda Function (Python 3.12) | AWS | Validates and transforms CSVs triggered by S3 events |
+| `capco-data-landing-{env}` | S3 Bucket | AWS | Receives raw customer CSV files uploaded to `raw/` prefix |
+| `capco-data-processed-{env}` | S3 Bucket | AWS | Stores validated and transformed Parquet output files |
+| `data-ingest-{env}` | Lambda Function (Python 3.12) | AWS | Validates, transforms, and moves data from landing to processed bucket |
 | `lambda-ingest-role` | IAM Role | AWS | Execution role assumed by the Lambda function |
-| `lambda-s3-policy` | IAM Role Policy | AWS | Grants S3 permissions to the Lambda role |
-| S3 Bucket Notification | S3 Event Trigger | AWS | Fires Lambda on `s3:ObjectCreated:*` for `raw/*.csv` |
-| `ai-delivery-outputs` | GitHub Repository | GitHub | Stores all AI-generated documents and test artefacts |
-| Tool 1 — Code Review | GitHub Actions Workflow | GitHub | Runs Claude code reviews on PRs and weekly |
-| Tool 2 — Tech Docs | GitHub Actions Workflow | GitHub | Generates README, architecture doc, runbook on merge to main |
-| Tool 3 — Business Docs | GitHub Actions Workflow | GitHub | Generates solution overview and gap questionnaire on release tag |
-| Tool 4 — Auto Testing | GitHub Actions Workflow | GitHub | Generates or analyses test coverage on PR or schedule |
-| Tool 5 — UAT | GitHub Actions Workflow | GitHub | Generates UAT test packs or analyses UAT results on release branches |
-| Claude (`claude-sonnet-4-6`) | LLM API | Anthropic (external) | Powers all five AI delivery tools |
-| SendGrid | Email API | Twilio/SendGrid (external) | Delivers notification emails for tool outputs |
+| `lambda-s3-policy` | IAM Role Policy | AWS | Grants Lambda permissions to access S3 (see Security section) |
+| S3 Bucket Notification | Event Trigger | AWS | Fires Lambda on `s3:ObjectCreated:*` for `raw/*.csv` objects |
+| GitHub Actions Runner (`ubuntu-latest`) | Ephemeral CI Runner | GitHub (SaaS) | Executes all five AI workflow tools |
+| `ai-delivery-outputs` | GitHub Repository | GitHub (SaaS) | Persistent store for all AI-generated documentation, test files, and UAT packs |
+| Claude (`claude-sonnet-4-6`) | Managed LLM API | Anthropic (SaaS) | AI inference for all five tools |
+| SendGrid | Transactional Email API | Twilio/SendGrid (SaaS) | Delivers notification emails to `kylo.deng@capco.com` |
 
 ---
 
 ## 3. Data Flow
 
-### Data Pipeline
+### 3a — Data Ingestion Pipeline (AWS)
 
-1. An external actor (person, system, or upstream pipeline) uploads a `.csv` file to the `capco-data-landing-{env}` S3 bucket under the `raw/` prefix.
-2. The S3 bucket notification fires an `s3:ObjectCreated:*` event to the `data-ingest-{env}` Lambda function.
-3. Lambda reads `LANDING_BUCKET` from its environment variables and the object key from the event payload.
-4. `data_pipeline.py` calls `get_s3_client()` — **⚠️ using hardcoded AWS credentials** (see Security section) — and downloads the CSV via `get_object`.
-5. Each row is validated by `validate_customer_record()` against required fields (`customer_id`, `email`, `age`, `country_code`), email format, and age range.
-6. Valid rows are collected into a DataFrame; failed rows are captured with their error messages.
-7. The validated DataFrame is written as a Parquet file to the `raw/` → `processed/` key path (`.csv` → `.parquet`) in the same landing bucket.
-   - **⚠️ Note:** Output is written back to the *landing* bucket, not the *processed* bucket — the `aws_s3_bucket.processed` resource in Terraform appears to be unused by the Lambda.
-8. Lambda returns a JSON summary `{processed, failed, output_key, timestamp}` with HTTP status 200 or 500.
+1. An external system or user uploads a `.csv` file to the `capco-data-landing-{env}` S3 bucket under the `raw/` prefix.
+2. The S3 bucket notification triggers the `data-ingest-{env}` Lambda function, passing the bucket name and object key in the event payload.
+3. Lambda (`lambda_handler`) calls `process_csv()`, which invokes `get_s3_client()` using **hardcoded AWS credentials** in `data_pipeline.py` (see Security section).
+4. Lambda downloads the CSV file via `s3.get_object()` and loads it into a Pandas DataFrame.
+5. Each row is validated by `validate_customer_record()` — checking required fields, email format, and age range. Valid rows are collected; invalid rows are logged with their error.
+6. Valid rows are converted to a Parquet file and written back to the **same landing bucket** under the `processed/` prefix (note: output goes to the landing bucket, not the processed bucket, due to a code bug — see Risks).
+7. Lambda returns a JSON response with counts of processed and failed rows, the output key, and a timestamp.
 
-### AI Delivery Toolchain
+### 3b — AI Delivery Workflows (GitHub Actions)
 
-9. A GitHub event (PR open, push to `main`, version tag, release branch creation, or schedule) triggers one of the five workflow YAML files.
-10. The workflow checks out the source repository and installs `anthropic` and `requests` Python dependencies.
-11. The corresponding tool script (`tool1_` through `tool5_`) calls `shared.get_repo_files()` or `shared.get_pr_diff()`, fetching source and IaC files from GitHub via the REST API using `GH_TOKEN`.
-12. File content (truncated to 3,000–6,000 characters per file) is assembled into a prompt and sent to the Claude API (`claude-sonnet-4-6`) via `shared.call_claude()`.
-13. Claude's response (JSON, Markdown, CSV, or structured text depending on the tool) is parsed and formatted by the tool script.
-14. Formatted output is committed to the `ai-delivery-outputs` repository via `shared.write_output_file()` (GitHub Contents API PUT).
-15. Tool 1 additionally posts a review comment directly on the PR via `shared.post_pr_comment()`.
-16. A notification email is sent to `kylo.deng@capco.com` via SendGrid with a summary and link to the output.
-17. An audit log entry is written to the `ai-delivery-outputs` repository.
-18. For Tool 1, a JSON artefact is uploaded to the GitHub Actions run via `actions/upload-artifact`.
+1. A workflow is triggered by a GitHub event (PR open, push to `main`, version tag, release branch creation, or cron schedule) or manual `workflow_dispatch`.
+2. The GitHub Actions runner checks out the source repository and installs `anthropic` and `requests` Python dependencies.
+3. The relevant tool script (`tool1_`–`tool5_`) calls `shared.py` utilities to fetch source or IaC files from the source repository via the GitHub API (authenticated with `GH_TOKEN`), or fetches the PR diff.
+4. The collected file contents are assembled into a prompt and sent to the Anthropic Claude API (`claude-sonnet-4-6`) via the `call_claude()` function using `ANTHROPIC_API_KEY`.
+5. Claude returns a structured response (JSON for code review / test gap analysis / UAT analysis; Markdown for documentation).
+6. The tool script writes the output file(s) to the `ai-delivery-outputs` GitHub repository via the GitHub Contents API (`write_output_file()`).
+7. A notification email is sent via SendGrid (`send_email()`) to `kylo.deng@capco.com` with a summary and link to the output.
+8. For Tool 1 (Code Review), a review comment is also posted directly to the PR via the GitHub Issues API (`post_pr_comment()`).
+9. For Tool 1, the raw JSON review artifact is uploaded to GitHub Actions Artifacts for the run.
 
 ---
 
@@ -62,30 +55,27 @@ This system is a dual-purpose platform combining a **data ingestion pipeline** (
 
 ### ✅ What is secured
 
-- GitHub Actions secrets (`ANTHROPIC_API_KEY`, `GH_TOKEN`, `SENDGRID_API_KEY`) are stored in GitHub Secrets and injected as environment variables — not hardcoded in workflow YAML.
-- Tool 5 UAT workflow has a branch guard (`startsWith(github.ref, 'refs/heads/release/')`) to prevent spurious `create` event triggers.
-- Lambda is invoked only via S3 event notification, not exposed directly to the internet.
-- S3 event notification is filtered to `raw/*.csv` prefix/suffix, limiting Lambda trigger surface.
+- **GitHub Secrets**: `ANTHROPIC_API_KEY`, `GH_TOKEN`, and `SENDGRID_API_KEY` are stored as GitHub Actions secrets and injected as environment variables at runtime — not committed in plaintext to workflow YAML.
+- **Lambda IAM Trust Policy**: Correctly scoped to `lambda.amazonaws.com` as the only principal that can assume the role.
+- **PR Filter on Tool 5 (UAT)**: Workflow conditionally runs only on `release/` branches or manual dispatch, preventing accidental execution.
+- **Tool 4 (Auto Testing)**: Explicitly instructs Claude to use mocks/stubs and never make real API calls in generated tests.
 
-### ❌ Gaps and explicit security failures
+### ❌ Security gaps and vulnerabilities
 
-| Issue | Severity | Detail |
-|---|---|---|
-| **Hardcoded AWS credentials in source code** | CRITICAL | `src/data_pipeline.py` lines 9–10 contain a literal `AWS_ACCESS_KEY` and `AWS_SECRET_KEY`. These will be committed to version history and are likely already leaked. Must be rotated immediately and replaced with the Lambda execution role (remove `get_s3_client()` credential parameters entirely). |
-| **Hardcoded `DB_PASSWORD` in Terraform** | CRITICAL | `infra/main.tf` Lambda environment variable `DB_PASSWORD = "SuperSecret123!"` is plaintext in IaC. Must be moved to AWS Secrets Manager or SSM Parameter Store with a `SecretString` reference. |
-| **Overly broad IAM policy (`s3:*` on `*`)** | HIGH | `aws_iam_role_policy.lambda_policy` grants full S3 access to every bucket in the account. Scope must be restricted to `s3:GetObject` on the landing bucket ARN and `s3:PutObject` on the processed bucket ARN at minimum. |
-| **S3 landing bucket has no encryption** | HIGH | `aws_s3_bucket.landing` has no `aws_s3_bucket_server_side_encryption_configuration` block. The bucket comment in Terraform even notes this explicitly. Customer PII (email, age, country code) is stored unencrypted at rest. |
-| **S3 landing bucket has no public access block** | HIGH | No `aws_s3_bucket_public_access_block` resource is defined for the landing bucket. The bucket could be made public accidentally. |
-| **S3 processed bucket has no encryption or access controls** | HIGH | Same issue as landing bucket — no SSE configuration, no public access block defined. |
-| **No S3 bucket versioning or object lock** | MEDIUM | Neither bucket has versioning enabled, meaning accidental overwrites or deletes cannot be recovered. |
-| **No VPC / network isolation for Lambda** | MEDIUM | Lambda runs in the default AWS network context with no VPC configuration, security groups, or private subnet placement. |
-| **No Lambda dead-letter queue (DLQ)** | MEDIUM | Failed Lambda invocations are silently dropped. No DLQ or `on_failure` destination is configured. |
-| **S3 list pagination not implemented** | MEDIUM | `get_all_pending_files()` calls `list_objects_v2` without handling `NextContinuationToken` — buckets with >1,000 objects will silently drop files. |
-| **Bare `except Exception` in Lambda handler** | LOW | `lambda_handler` catches all exceptions generically, masking unexpected failure modes. |
-| **No CSV input sanitisation beyond field presence** | LOW | There is no check for CSV injection characters or excessively large files that could cause memory exhaustion. |
-| **`GH_TOKEN` scope** | [TODO: What permissions does the PAT/token have? It writes to a separate output repo — verify it is scoped to only that repo and has no `admin` or `delete` permissions.] | — |
-| **No SAST or dependency scanning** | LOW | No `dependabot`, Snyk, or pip-audit runs are configured in any workflow. |
-| **No Terraform remote state** | MEDIUM | `main.tf` has no `backend` block — state is local only, no locking, no team sharing, no encryption of state file. |
+- **CRITICAL — Hardcoded AWS credentials in source code**: `data_pipeline.py` contains a hardcoded `AWS_ACCESS_KEY` and `AWS_SECRET_KEY`. These must be removed immediately and rotated. The code even has a `# TODO: move this to secrets manager` comment acknowledging this.
+- **CRITICAL — Hardcoded `DB_PASSWORD` in Terraform**: `infra/main.tf` sets `DB_PASSWORD = "SuperSecret123!"` as a plain-text Lambda environment variable. This should be stored in AWS Secrets Manager or SSM Parameter Store and retrieved at runtime.
+- **HIGH — No S3 encryption on the landing bucket**: The `aws_s3_bucket.landing` resource has no `aws_s3_bucket_server_side_encryption_configuration` block. Customer CSV data is stored unencrypted at rest.
+- **HIGH — No S3 Public Access Block on either bucket**: Neither bucket has `aws_s3_bucket_public_access_block` configured, meaning buckets could be made public by policy or ACL.
+- **HIGH — Overly permissive IAM policy**: The `lambda-s3-policy` grants `s3:*` on `Resource: "*"`, giving Lambda full S3 access to every bucket in the account. This violates the principle of least privilege. It should be scoped to specific bucket ARNs and only the required actions (`s3:GetObject`, `s3:PutObject`, `s3:ListBucket`).
+- **HIGH — No encryption on the processed S3 bucket**: `aws_s3_bucket.processed` also lacks encryption configuration.
+- **MEDIUM — No S3 versioning**: Neither bucket has versioning enabled; accidental overwrites or deletions cannot be recovered.
+- **MEDIUM — No bucket lifecycle policies**: No TTL or transition rules for landing or processed data.
+- **MEDIUM — No VPC configuration for Lambda**: Lambda runs in the default public AWS network context with no VPC, subnet, or security group constraints.
+- **MEDIUM — GitHub token scope unknown**: [TODO: What permissions does `GH_TOKEN` have? It writes to `ai-delivery-outputs` and reads source repos — confirm it is scoped to only necessary repository permissions and is not a classic PAT with broad org access.]
+- **MEDIUM — No input sanitization on `user_stories` workflow input**: Tool 5 passes `inputs.user_stories` directly as an environment variable without sanitization; a malicious value could inject environment content.
+- **LOW — No HTTPS enforcement on S3 buckets**: No bucket policy denying `aws:SecureTransport: false` requests.
+- **LOW — Claude prompt injection risk**: User-controlled content (PR diffs, repository files, user stories) is passed directly into Claude prompts. A malicious commit could attempt to manipulate Claude's output.
+- **LOW — No S3 access logging**: Neither bucket has access logging enabled.
 
 ---
 
@@ -93,28 +83,28 @@ This system is a dual-purpose platform combining a **data ingestion pipeline** (
 
 | Name | Required | Sensitivity | Where set |
 |---|---|---|---|
-| `ANTHROPIC_API_KEY` | Yes | **High** — API key for paid LLM service | GitHub Actions Secret |
-| `GH_TOKEN` | Yes | **High** — GitHub PAT with repo write access | GitHub Actions Secret |
-| `SENDGRID_API_KEY` | Yes | **High** — email service API key | GitHub Actions Secret |
+| `ANTHROPIC_API_KEY` | Yes | **Secret** — API key for Claude | GitHub Actions Secret → env |
+| `GH_TOKEN` | Yes | **Secret** — GitHub PAT for API access and writes to output repo | GitHub Actions Secret → env |
+| `SENDGRID_API_KEY` | Yes | **Secret** — SendGrid transactional email key | GitHub Actions Secret → env |
 | `OUTPUT_REPO` | No | Low | Workflow `env` block (hardcoded: `ai-delivery-outputs`) |
-| `OUTPUT_REPO_OWNER` | No | Low | Workflow `env` (resolved from `github.repository_owner`) |
-| `NOTIFY_EMAIL` | No | Low | Workflow `env` (hardcoded: `kylo.deng@capco.com`) |
-| `SENDER_EMAIL` | No | Low | Workflow `env` (hardcoded: `noreply@ai-delivery.capco.com`) |
-| `SOURCE_REPO_OWNER` | No | Low | Workflow `env` (resolved from `github.repository_owner`) |
-| `SOURCE_REPO_NAME` | No | Low | Workflow `env` (resolved from `github.event.repository.name`) |
-| `GITHUB_RUN_URL` | No | Low | Workflow `env` (constructed from GitHub context) |
-| `REVIEW_MODE` | No | Low | Set dynamically in workflow step |
-| `PR_NUMBER` | No | Low | Set dynamically in workflow step |
-| `RELEASE_VERSION` | No | Low | Set dynamically in workflow step |
-| `PROJECT_NAME` | No | Low | Set dynamically in workflow step |
-| `UAT_MODE` | No | Low | Set dynamically in workflow step |
-| `USER_STORIES` | No | Low–Medium (may contain business requirements) | Workflow dispatch input, set in step |
-| `UAT_RESULTS_PATH` | No | Low | Workflow dispatch input, set in step |
-| `TEST_MODE` | No | Low | Workflow `env` (defaults to `generate`) |
-| `LANDING_BUCKET` | Yes (Lambda) | Low | Lambda environment variable (set by Terraform) |
-| `DB_PASSWORD` | Yes (Lambda) | **CRITICAL** — plaintext secret | **⚠️ Hardcoded in `infra/main.tf`** — must move to Secrets Manager |
-| `AWS_ACCESS_KEY` | — | **CRITICAL** — AWS credential | **⚠️ Hardcoded in `src/data_pipeline.py`** — must be removed immediately |
-| `AWS_SECRET_KEY` | — | **CRITICAL** — AWS credential | **⚠️ Hardcoded in `src/data_pipeline.py`** — must be removed immediately |
+| `OUTPUT_REPO_OWNER` | No | Low | Workflow `env` block (derived from `github.repository_owner`) |
+| `NOTIFY_EMAIL` | No | Low | Workflow `env` block (hardcoded: `kylo.deng@capco.com`) |
+| `SENDER_EMAIL` | No | Low | Workflow `env` block (hardcoded: `noreply@ai-delivery.capco.com`) |
+| `SOURCE_REPO_OWNER` | No | Low | Workflow `env` block (derived from `github.repository_owner`) |
+| `SOURCE_REPO_NAME` | No | Low | Workflow `env` block (derived from event context) |
+| `GITHUB_RUN_URL` | No | Low | Workflow `env` block (derived from GitHub context) |
+| `REVIEW_MODE` | No (Tool 1) | Low | Set at runtime by workflow step |
+| `PR_NUMBER` | No (Tool 1) | Low | Set at runtime by workflow step |
+| `RELEASE_VERSION` | No (Tools 3, 5) | Low | Set at runtime by workflow step |
+| `PROJECT_NAME` | No (Tool 3) | Low | Set at runtime by workflow step or input |
+| `TEST_MODE` | No (Tool 4) | Low | Workflow `env` block (derived from input or default `generate`) |
+| `UAT_MODE` | No (Tool 5) | Low | Set at runtime by workflow step |
+| `USER_STORIES` | No (Tool 5) | Low-Medium | Set at runtime from `workflow_dispatch` input |
+| `UAT_RESULTS_PATH` | No (Tool 5) | Low | Set at runtime from `workflow_dispatch` input |
+| `LANDING_BUCKET` | Yes (Lambda) | Low | Terraform Lambda environment variable |
+| `DB_PASSWORD` | Yes (Lambda) | **CRITICAL — Secret** | **⚠️ Hardcoded in `infra/main.tf`** — must be moved to Secrets Manager |
+| `AWS_ACCESS_KEY` | — | **CRITICAL — Secret** | **⚠️ Hardcoded in `src/data_pipeline.py`** — must be removed immediately |
+| `AWS_SECRET_KEY` | — | **CRITICAL — Secret** | **⚠️ Hardcoded in `src/data_pipeline.py`** — must be removed immediately |
 
 ---
 
@@ -122,78 +112,91 @@ This system is a dual-purpose platform combining a **data ingestion pipeline** (
 
 | Dependency | Type | Purpose | Notes |
 |---|---|---|---|
-| Anthropic Claude API (`claude-sonnet-4-6`) | External paid API | LLM inference for all five AI tools | Rate limits and costs apply; no retry logic observed in `shared.py` |
-| SendGrid API | External paid API | Email delivery for tool output notifications | [TODO: Is the sender domain `ai-delivery.capco.com` verified in SendGrid?] |
-| GitHub REST API (`api.github.com`) | External API | Fetching repo files, PR diffs, posting comments, writing output files | Requires `GH_TOKEN` PAT |
-| `ai-delivery-outputs` (companion repo) | GitHub Repository | Stores all generated documents, test files, UAT packs, and audit logs | Must exist and be writable by `GH_TOKEN` before workflows run |
-| `anthropic` (PyPI) | Python library | Python SDK for Claude API | Installed at runtime via `pip install anthropic` — no pinned version |
-| `requests` (PyPI) | Python library | HTTP calls to GitHub and SendGrid APIs | Installed at runtime — no pinned version |
-| `boto3` (PyPI) | Python library | AWS SDK used by `data_pipeline.py` | Not installed in Lambda layer via Terraform — assumed bundled in `lambda.zip` |
-| `pandas` (PyPI) | Python library | CSV parsing and DataFrame operations in `data_pipeline.py` | Must be bundled in `lambda.zip` |
-| `pyarrow` / `fastparquet` | Python library | Required by `pandas.to_parquet()` | Must be bundled in `lambda.zip`; not explicitly declared anywhere |
-| GitHub Actions (`ubuntu-latest`) | CI runner | Executes all five workflow jobs | Runner image version is floating |
-| `actions/checkout@v4` | GitHub Action | Checks out source repository | Pinned to major version only |
-| `actions/setup-python@v5` | GitHub Action | Installs Python 3.12 | Pinned to major version only |
-| `actions/upload-artifact@v4` | GitHub Action | Uploads code review JSON artefact | Tool 1 only |
+| Anthropic Claude API (`claude-sonnet-4-6`) | External SaaS API | AI inference for all five workflow tools | Billed per token; no rate-limit handling in code |
+| GitHub API (`api.github.com`) | External SaaS API | Read source files, write to output repo, post PR comments | Requires `GH_TOKEN` |
+| SendGrid API | External SaaS API | Send notification emails | Requires `SENDGRID_API_KEY`; `send_email()` referenced in scripts but implementation truncated in `shared.py` |
+| `ai-delivery-outputs` (GitHub repo) | Sibling repository | Stores all AI-generated artefacts | Must exist and be writable by `GH_TOKEN` |
+| AWS S3 | AWS Managed Service | Landing and processed data storage | Two buckets provisioned via Terraform |
+| AWS Lambda | AWS Managed Service | Serverless compute for data pipeline | Python 3.12 runtime |
+| AWS IAM | AWS Managed Service | Execution role for Lambda | |
+| `anthropic` (PyPI) | Python library | Claude API client | Installed at runtime via `pip install anthropic` |
+| `requests` (PyPI) | Python library | HTTP client for GitHub and SendGrid APIs | Installed at runtime via `pip install requests` |
+| `boto3` (PyPI) | Python library | AWS SDK for S3 access in Lambda | [TODO: Is boto3 bundled in `lambda.zip` or provided by the Lambda runtime? Python 3.12 Lambda runtime includes boto3 by default] |
+| `pandas` (PyPI) | Python library | CSV parsing and Parquet conversion in Lambda | [TODO: Is pandas included in `lambda.zip`? It is not a Lambda built-in and must be packaged] |
+| `pyarrow` or `fastparquet` (PyPI) | Python library | Required by pandas for `.to_parquet()` | [TODO: Confirm which Parquet engine is bundled in `lambda.zip`] |
 
 ---
 
 ## 7. Deployment Instructions
 
-### Prerequisites
-
-- AWS CLI configured with credentials that have sufficient IAM permissions to create S3 buckets, Lambda functions, and IAM roles.
-- Terraform >= 1.0 installed.
-- Python 3.12 installed locally.
-- GitHub repository secrets configured: `ANTHROPIC_API_KEY`, `GH_TOKEN`, `SENDGRID_API_KEY`.
-- `ai-delivery-outputs` GitHub repository created and accessible to `GH_TOKEN`.
-- `lambda.zip` built and present at `infra/lambda.zip` before applying Terraform.
-
-### Build the Lambda deployment package
+### 7a — AWS Infrastructure (Terraform)
 
 ```bash
-# From repo root
-pip install boto3 pandas pyarrow -t lambda_package/
-cp src/data_pipeline.py lambda_package/
-cd lambda_package && zip -r ../infra/lambda.zip . && cd ..
-```
+# Prerequisites: AWS CLI configured with credentials for the target account
+# and Terraform >= 1.x installed
 
-### Deploy infrastructure
+cd infra/
 
-```bash
-cd infra
-
-# Initialise Terraform (local state — no remote backend configured)
+# Initialise Terraform (downloads AWS provider ~5.x)
 terraform init
 
-# Review planned changes
+# Review the execution plan
 terraform plan -var="environment=dev"
 
-# Apply
+# Apply (deploys S3 buckets, Lambda, IAM role, and S3 event trigger)
 terraform apply -var="environment=dev"
+
+# For production deployment
+terraform apply -var="environment=prod"
+
+# To destroy all resources
+terraform destroy -var="environment=dev"
 ```
 
-> **⚠️ Before applying:** Remove the hardcoded `DB_PASSWORD` from `main.tf` and replace with an SSM/Secrets Manager reference. Rotate the hardcoded credentials in `src/data_pipeline.py` before building `lambda.zip`.
-
-### Trigger AI delivery tools manually
+> **⚠️ Pre-deployment requirement**: The Lambda function requires a deployment package at `infra/lambda.zip`. [TODO: Document how `lambda.zip` is built — is there a build script that packages `src/data_pipeline.py` with pandas and pyarrow?]
 
 ```bash
-# Tool 1 — Code Review (repo-wide)
-gh workflow run tool1_code_review.yml \
-  -f review_mode=repo
+# Example lambda.zip build (assumed — not present in repo):
+pip install pandas pyarrow -t package/
+cp src/data_pipeline.py package/
+cd package && zip -r ../infra/lambda.zip . && cd ..
+```
 
-# Tool 1 — Code Review (specific PR)
-gh workflow run tool1_code_review.yml \
-  -f review_mode=pr \
-  -f pr_number=42
+### 7b — GitHub Actions Workflows
 
-# Tool 2 — Tech Documentation
-gh workflow run tool2_tech_docs.yml
+No deployment steps are required for the GitHub Actions workflows themselves — they are automatically registered by GitHub upon being committed to `.github/workflows/`. However, the following secrets **must** be configured in the repository settings before any workflow will succeed:
 
-# Tool 3 — Business Documentation
-gh workflow run tool3_business_docs.yml \
-  -f project_name="Data Ingestion Pipeline" \
-  -f release_version="1.0.0"
+```
+# Navigate to: GitHub Repo → Settings → Secrets and variables → Actions → New repository secret
 
-# Tool 4 — Auto Testing (generate mode)
-gh workflow run tool4_auto_testing.yml
+ANTHROPIC_API_KEY   = <your Anthropic API key>
+GH_TOKEN            = <GitHub PAT with repo read/write scope for both repos>
+SENDGRID_API_KEY    = <your SendGrid API key>
+```
+
+The `ai-delivery-outputs` repository must also exist under the same GitHub owner before workflows run:
+
+```bash
+# Create the output repo if it doesn't exist (via GitHub CLI)
+gh repo create kylodeng/ai-delivery-outputs --private
+```
+
+Workflows can also be triggered manually via the GitHub Actions UI:
+
+```
+# GitHub UI: Actions tab → Select workflow → Run workflow → Fill inputs
+```
+
+---
+
+## 8. Risks and TODOs
+
+### 🔴 Critical Risks
+
+| Risk | Detail |
+|---|---|
+| **Hardcoded AWS credentials in `data_pipeline.py`** | `AWS_ACCESS_KEY` and `AWS_SECRET_KEY` are committed to source. These are example values but the pattern is production-dangerous. Credentials must be removed; Lambda should use its IAM execution role (`boto3.client('s3')` with no explicit credentials). |
+| **Hardcoded `DB_PASSWORD` in Terraform** | `"SuperSecret123!"` is committed to IaC. Must be replaced with a reference to AWS Secrets Manager or SSM Parameter Store. The code has a comment acknowledging this. |
+| **No S3 encryption at rest** | Customer PII (CSV files containing `customer_id`, `email`, `age`, `country_code`) is stored unencrypted. This is likely a compliance violation (GDPR, PCI-DSS depending on context). |
+
+###
