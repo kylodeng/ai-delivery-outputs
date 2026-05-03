@@ -4,60 +4,68 @@
 
 ## 1. Service Overview
 
-The Underwriting Chatbot is a life insurance underwriting assistant that enables underwriters to assess customer risk profiles through a conversational interface. The system consists of a **FastAPI backend** (port 8000) that orchestrates a LangGraph-powered AI agent using Anthropic Claude (Haiku for fast responses, Sonnet for deep analysis) and Google Gemini models; a **frontend UI** (port 8080); a **Redis** instance (port 6379) used as a LangGraph checkpoint store for conversation memory; and a **PostgreSQL** database (port 5432) used by the frontend (Chainlit). The agent calls three tools — `get_customer_profile`, `customer_lookalike`, and `run_underwriting_assessment` — against SQLite databases containing customer profiles, model predictions, and feature importance data. Assessment results are structured using a `CatBoostClassifier`-derived model card (v1.0, deployed 2024-06-01) and returned as a validated `UnderwritingReport` Pydantic model. Five GitHub Actions CI/CD workflows provide automated code review, documentation generation, business documentation, test generation, and UAT facilitation, all powered by Claude via the Anthropic API.
+The Underwriting Chatbot is an AI-assisted life insurance underwriting platform that allows underwriters to assess customer risk profiles through a conversational interface. The system consists of a FastAPI backend that orchestrates a LangGraph-based agent, which calls specialist LLM assessment pipelines (using Anthropic Claude and Google Gemini) across multiple risk domains (finance, health, life, etc.), a Redis instance for agent conversation checkpointing, a PostgreSQL database for the Chainlit frontend session state, and several SQLite databases holding customer profile, model prediction, and feature importance data. The frontend is a Chainlit-based chat UI served on port 8080, while the backend API runs on port 8000. A pre-trained CatBoost classifier (`model_card.json`) informs risk classification labels (Preferred, Standard Plus, Standard, Substandard), and a customer lookalike service provides peer comparison. The entire stack is containerised via Docker Compose.
 
 ---
 
 ## 2. Health Checks
 
 ### Backend API
+
 ```bash
+# Confirm backend is alive
 curl -f http://localhost:8000/health
 # Expected: {"status": "ok"}
 ```
 
-### Docker Compose service status
+### Docker Container Status
+
 ```bash
 docker compose ps
-# All services should show status: running (healthy)
+# All services should show: "Up" and backend should show "(healthy)"
 ```
 
-### Redis connectivity
+### Redis Connectivity
+
 ```bash
 docker compose exec redis redis-cli ping
 # Expected: PONG
 ```
 
-### PostgreSQL connectivity
+### PostgreSQL Connectivity
+
 ```bash
 docker compose exec postgres pg_isready -U chainlit -d chainlit
 # Expected: /var/run/postgresql:5432 - accepting connections
 ```
 
-### Frontend reachability
+### Frontend Reachability
+
 ```bash
 curl -f http://localhost:8080
-# Expected: HTTP 200
+# Expected: HTTP 200 with HTML body
 ```
 
-### Backend container health (via Docker)
+### LLM API Key Validity
+
 ```bash
-docker inspect underwriting_chatbot-main-backend-1 \
-  --format='{{.State.Health.Status}}'
-# Expected: healthy
+# Check Anthropic key is set and non-empty
+docker compose exec backend printenv ANTHROPIC_API_KEY | wc -c
+# Expected: > 1
+
+# Check Google key (for Gemini fallback)
+docker compose exec backend printenv GOOGLE_API_KEY | wc -c
+# Expected: > 1
 ```
 
-### Check backend logs for startup errors
-```bash
-docker compose logs backend --tail=50
-# Should NOT contain: ERROR, Traceback, Connection refused
-```
+### SQLite Database Files
 
-### Verify SQLite databases are mounted
 ```bash
-docker compose exec backend ls -lh /data/
-# Expected: customer_profile.db, feature_importance.db,
-#           model_predictions.db, application_profile.db
+# Confirm customer profile DB is mounted and readable
+docker compose exec backend ls -lh /data/customer_profile.db
+docker compose exec backend ls -lh /data/model_predictions.db
+docker compose exec backend ls -lh /data/feature_importance.db
+docker compose exec backend ls -lh /data/application_profile.db
 ```
 
 ---
@@ -66,119 +74,135 @@ docker compose exec backend ls -lh /data/
 
 | Symptom | Likely Cause | Resolution Steps |
 |---|---|---|
-| `GET /health` returns non-200 or times out | Backend container crashed or failed to start | 1. `docker compose logs backend --tail=100` to inspect error. 2. Check env vars in `.env` are present. 3. `docker compose restart backend`. |
-| Backend health check shows `unhealthy` | App started but `/health` endpoint not responding within 5s × 5 retries | 1. Check if port 8000 is already in use: `lsof -i :8000`. 2. Inspect logs: `docker compose logs backend`. 3. `docker compose down && docker compose up -d`. |
-| Frontend fails to load / returns 502 | Backend not yet healthy when frontend started | 1. Confirm backend is healthy: `docker compose ps`. 2. `docker compose restart frontend`. The `depends_on: condition: service_healthy` should prevent this but can race on cold starts. |
-| `Redis connection refused` in backend logs | Redis container not running or REDIS_HOST env var incorrect | 1. `docker compose ps redis` — check it is running. 2. Confirm `REDIS_HOST=redis` is set in docker-compose environment. 3. `docker compose restart redis backend`. |
-| `ANTHROPIC_API_KEY` / `GOOGLE_API_KEY` errors in logs | Missing or invalid API key in `.env` | 1. Verify `.env` file exists in project root and contains valid keys. 2. `docker compose down && docker compose up -d` to reload env. |
-| LangGraph agent returns no response / hangs | Redis checkpoint store unavailable or model API rate limit hit | 1. Check Redis: `docker compose exec redis redis-cli ping`. 2. Check Anthropic/Google API status pages. 3. Reduce concurrency or retry request. |
-| `ValueError: Unsupported or unconfigured model provider` | Invalid `model` field passed in chat request, or Azure/OpenAI selected (not configured) | 1. Use only `anthropic`, `anthropic-fast`, or `gemini` as model values. 2. Check `backend/modules/LLMS.py` for supported providers. |
-| SQLite database not found (`/data/*.db`) | Volume mount missing or `.db` files not present in `./database/` | 1. Confirm `./database/` directory contains all four `.db` files. 2. Check `docker-compose.yml` volume mounts. 3. Re-provision database files. [TODO: Where are the canonical database files sourced from?] |
-| PostgreSQL init fails | `./postgres/init.sql` missing or invalid | 1. Check `./postgres/init.sql` exists. 2. `docker compose logs postgres`. 3. Remove stale volume: `docker compose down -v && docker compose up -d`. |
-| GitHub Actions workflow fails on `ANTHROPIC_API_KEY` | Secret not set in repository settings | 1. Go to repo → Settings → Secrets and variables → Actions. 2. Add `ANTHROPIC_API_KEY`, `GH_TOKEN`, `SENDGRID_API_KEY`. |
-| Streaming chat response stops mid-token | SSE connection dropped or model `max_tokens` cap hit (`specialist_max_tokens: 1500`) | 1. Check browser network tab for SSE stream errors. 2. Adjust `specialist_max_tokens` in `backend/config.yml` if legitimate truncation. 3. Restart backend. |
-| `run_underwriting_assessment` returns incomplete JSON | Aggregator LLM hit `aggregator_max_tokens: 8000` limit | 1. Increase `aggregator_max_tokens` in `backend/config.yml`. 2. Switch to Sonnet model for deeper assessments. |
-| Redis memory not persisting across restarts | Redis is in-memory only; no AOF/RDB persistence configured | This is a known limitation (noted in `graph.py` TODO). [TODO: Migrate to Azure Cache for Redis or add Redis persistence config.] |
-| `on_chat_model_stream` events not reaching frontend | `in_tool=True` flag suppressing stream during tool execution | Expected behaviour — streaming resumes after tool completes. If it never resumes, check `on_tool_end` event firing in backend logs. |
+| `backend` container shows `unhealthy` or keeps restarting | Missing `.env` file, bad API key, or port conflict on 8000 | 1. Check `docker compose logs backend`. 2. Verify `.env` exists in project root with all required vars. 3. Confirm port 8000 is free: `lsof -i :8000`. 4. Restart: `docker compose restart backend`. |
+| `/health` returns connection refused | Backend process crashed or failed to start | 1. `docker compose logs backend --tail 50`. 2. Check for import errors or missing dependencies. 3. `docker compose up --build backend`. |
+| Agent returns no response / hangs indefinitely | LLM API timeout, rate-limit, or invalid API key | 1. Confirm `ANTHROPIC_API_KEY` and `GOOGLE_API_KEY` are valid in `.env`. 2. Check Anthropic/Google status pages. 3. Review backend logs for `4xx`/`5xx` from LLM APIs. 4. Reduce `specialist_max_tokens` in `config.yml` if context window is being exceeded. |
+| `ValueError: Unsupported or unconfigured model provider` | `model` field in chat request does not match a key in `LLMS.model_mapper` | 1. Valid values are `gemini`, `anthropic`, `anthropic-fast`. 2. Check request payload `model` field. 3. `azure` and `openai` are defined but return `None` — do not use them. |
+| Redis connection error on backend start | Redis container not running or `REDIS_HOST` env var wrong | 1. `docker compose ps redis`. 2. If down: `docker compose up -d redis`. 3. Confirm `REDIS_HOST=redis` is set in backend environment (set in `docker-compose.yml`). |
+| Agent conversation loses context between messages | Redis checkpoint missing or Redis restarted without persistence | 1. Check Redis is running. 2. Note: current Redis image (`redis-stack-server`) does **not** have persistence configured — data is lost on restart. See TODO in `graph.py`. 3. Restart conversation with a new `session_id`. |
+| Frontend fails to start | Backend not healthy (frontend depends on `service_healthy`) or `DATABASE_URL` misconfigured | 1. Ensure backend passes health check first: `docker compose ps`. 2. Confirm PostgreSQL is running: `docker compose logs postgres`. 3. `docker compose restart frontend`. |
+| PostgreSQL init fails | `postgres/init.sql` missing or malformed | 1. `docker compose logs postgres`. 2. Confirm `./postgres/init.sql` exists in project root. 3. Wipe volume and reinitialise: `docker compose down -v && docker compose up -d postgres`. |
+| Customer profile not found in tool call | Customer ID not present in SQLite DB or DB file not mounted | 1. Confirm `/data/customer_profile.db` is mounted: `docker compose exec backend ls /data/`. 2. Check the customer ID format matches `CUST0000XXXX` pattern. 3. [TODO: Is there a seeding script to populate the databases?] |
+| Assessment returns empty or malformed JSON | Aggregator LLM exceeded `aggregator_max_tokens` or returned non-structured output | 1. Increase `aggregator_max_tokens` in `config.yml` (currently 8000). 2. Check backend logs for `[AGGREGATOR]` line and token counts. 3. Switch to `anthropic` (Sonnet) instead of `anthropic-fast` (Haiku) for more reliable structured output. |
+| GitHub Actions workflow fails | Missing secrets (`ANTHROPIC_API_KEY`, `GH_TOKEN`, `SENDGRID_API_KEY`) | 1. Navigate to repo **Settings → Secrets → Actions**. 2. Confirm all three secrets are present and non-expired. 3. Re-run the failed workflow. |
+| `run_underwriting_assessment` tool called before `get_customer_profile` | Agent skipped required pre-condition tool call | 1. This is a prompt-level constraint. Review agent logs for the tool call sequence. 2. Rephrase user message to request customer info explicitly first. 3. [TODO: Add guard-rail in tool implementation to reject calls without a populated profile.] |
 
 ---
 
 ## 4. Deployment Procedure
 
 ### Prerequisites
-- Docker and Docker Compose installed
-- `.env` file populated with required secrets (see Section 5)
-- `./database/*.db` SQLite files present
+
+- Docker and Docker Compose v2+ installed
+- `.env` file in project root (see required variables below)
+- SQLite database files present under `./database/`
 - `./postgres/init.sql` present
+
+### Required `.env` Variables
+
+```dotenv
+ANTHROPIC_API_KEY=<your-anthropic-key>
+GOOGLE_API_KEY=<your-google-api-key>
+# TODO: Are SENDGRID_API_KEY, GH_TOKEN needed at runtime, or only in CI?
+# TODO: What additional env vars does the frontend require beyond BACKEND_URL and DATABASE_URL?
+```
 
 ### Step-by-Step Deployment
 
 **Step 1 — Clone the repository**
+
 ```bash
 git clone https://github.com/kylodeng/underwriting_chatbot-main.git
 cd underwriting_chatbot-main
 ```
 
-**Step 2 — Create and populate the `.env` file**
+**Step 2 — Create the `.env` file**
+
 ```bash
-cp .env.example .env   # [TODO: confirm .env.example exists or document required vars]
-# Edit .env and fill in all required variables (see Section 5)
+cp .env.example .env   # TODO: confirm .env.example exists; if not, create manually
+# Edit .env and populate all required variables
 ```
 
-**Step 3 — Build Docker images**
+**Step 3 — Build and start all services**
+
 ```bash
-docker compose build --no-cache
+docker compose up --build -d
 ```
 
-**Step 4 — Start infrastructure services first**
-```bash
-docker compose up -d redis postgres
-# Wait for postgres to be ready
-sleep 10
-docker compose logs postgres | grep "database system is ready"
-```
+**Step 4 — Verify services are healthy**
 
-**Step 5 — Start backend and verify health**
-```bash
-docker compose up -d backend
-# Wait for health checks to pass (up to 15s start_period + 5×10s = 65s max)
-docker compose ps backend
-# Confirm: (healthy)
-```
-
-**Step 6 — Start frontend**
-```bash
-docker compose up -d frontend
-```
-
-**Step 7 — Verify all services are running**
 ```bash
 docker compose ps
-curl -f http://localhost:8000/health
-curl -f http://localhost:8080
+# Wait up to 60 seconds for backend to become healthy
+# Expected: redis Up, postgres Up, backend Up (healthy), frontend Up
 ```
 
-**Step 8 — Smoke test the chat endpoint**
+**Step 5 — Confirm backend health endpoint**
+
 ```bash
-curl -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message":"Hello","temperature":0.3,"session_id":"test","model":"anthropic-fast","mode":"fast"}'
+curl http://localhost:8000/health
+# Expected: {"status": "ok"}
+```
+
+**Step 6 — Access the frontend**
+
+Open `http://localhost:8080` in a browser.
+
+---
+
+### Updating to a New Version
+
+**Step 1 — Pull latest code**
+
+```bash
+git pull origin main
+```
+
+**Step 2 — Rebuild changed services**
+
+```bash
+docker compose up --build -d --no-deps backend frontend
+```
+
+**Step 3 — Verify health**
+
+```bash
+docker compose ps
+curl http://localhost:8000/health
 ```
 
 ---
 
 ### Rollback Steps
 
-**Option A — Roll back to previous Docker image**
-```bash
-# Tag current image before deployment for easy rollback
-docker tag underwriting_chatbot-main-backend:latest \
-  underwriting_chatbot-main-backend:rollback-$(date +%Y%m%d%H%M)
+**Option A — Roll back to previous Docker image (if images are tagged)**
 
-# To rollback:
-docker compose down
-docker tag underwriting_chatbot-main-backend:rollback-<TIMESTAMP> \
-  underwriting_chatbot-main-backend:latest
-docker compose up -d
+```bash
+# TODO: Confirm whether images are pushed to a registry with version tags.
+# If so:
+docker compose stop backend frontend
+# Edit docker-compose.yml to pin the previous image tag, then:
+docker compose up -d backend frontend
 ```
 
 **Option B — Roll back via Git**
+
 ```bash
-git log --oneline -10          # find last good commit
-git checkout <COMMIT_SHA>
-docker compose build --no-cache
-docker compose up -d
+git log --oneline -5             # identify last known-good commit
+git checkout <previous-commit>   # or git revert HEAD
+docker compose up --build -d --no-deps backend frontend
+docker compose ps
+curl http://localhost:8000/health
 ```
 
-**Option C — Emergency stop**
+**Option C — Full teardown and redeploy**
+
 ```bash
+# WARNING: -v removes postgres_data volume — confirm DB is backed up first
 docker compose down
-# Services will be unavailable until restarted
+git checkout <previous-commit>
+docker compose up --build -d
 ```
-
-> [TODO: Is there a container registry (ECR, ACR, Docker Hub) where tagged images are pushed? Define the versioned image tag strategy.]
-
-> [TODO: Is there a Kubernetes/cloud deployment target beyond local Docker Compose? No IaC (Terraform/Bicep) was found in the repo.]
 
 ---
 
@@ -186,195 +210,181 @@ docker compose down
 
 ### Key Metrics to Watch
 
-| Metric | Source | Threshold / Alert |
+| Metric | Where to Find | Alert Threshold |
 |---|---|---|
-| Backend health endpoint | `GET /health` | Alert if non-200 for > 30s |
-| Docker container status | `docker compose ps` | Alert if any container exits or is unhealthy |
-| Redis memory usage | `redis-cli INFO memory` → `used_memory_human` | [TODO: Set threshold based on expected session volume] |
-| PostgreSQL connections | `pg_stat_activity` | Alert if connections approach `max_connections` (default 100) |
-| LLM API latency | Backend stdout `[SPECIALIST]` / `[AGGREGATOR]` log lines | Alert if `time=` exceeds 30s per specialist call |
-| LLM token usage | Backend stdout `in=` / `out=` token counts | Monitor for unexpected spikes (cost control) |
-| GitHub Actions workflow failures | GitHub Actions UI / email notifications | Alert on any failed run |
+| Backend health status | `GET /health` response | Any non-200 response |
+| Container restart count | `docker compose ps` / `docker stats` | > 2 restarts in 5 min |
+| LLM response latency | Backend stdout: `[SPECIALIST]` and `[AGGREGATOR]` log lines (`time=Xs`) | > 30s for specialist, > 60s for aggregator |
+| LLM token consumption | Backend stdout: `in=X tok out=X tok` per assessment call | Approaching model context window limits |
+| Redis memory usage | `docker compose exec redis redis-cli info memory` | [TODO: Set threshold based on expected session volume] |
+| PostgreSQL connections | `docker compose exec postgres psql -U chainlit -c "SELECT count(*) FROM pg_stat_activity;"` | [TODO: Define max connection limit] |
+| Tool call sequence errors | Backend logs for `ValueError` or JSON parse errors | Any occurrence |
 
 ### Log Locations
 
-| Service | How to access |
-|---|---|
-| Backend (FastAPI + agent) | `docker compose logs backend -f` |
-| Redis | `docker compose logs redis -f` |
-| PostgreSQL | `docker compose logs postgres -f` |
-| Frontend | `docker compose logs frontend -f` |
+```bash
+# All services
+docker compose logs -f
 
-### Key Log Patterns to Monitor
+# Backend only (most verbose — LLM calls, tool events)
+docker compose logs -f backend
 
-```
-# Successful assessment
-[ASSESSMENT] Starting — N specialist calls (mode='fast')
-[SPECIALIST] category=...  in=X tok  out=Y tok  time=Z.XXs
-[AGGREGATOR]               in=X tok  out=Y tok  time=Z.XXs
-
-# Tool execution
-[TOOL START] <tool_name>
-[TOOL END]   <tool_name>  time=X.XXs
-
-# New chat request
-[CHAT] session=<id> model=<model> mode=<mode> msg='...'
+# Structured log patterns to grep
+docker compose logs backend | grep "\[TOOL START\]"
+docker compose logs backend | grep "\[TOOL END\]"
+docker compose logs backend | grep "\[ASSESSMENT\]"
+docker compose logs backend | grep "\[SPECIALIST\]"
+docker compose logs backend | grep "\[AGGREGATOR\]"
+docker compose logs backend | grep "\[CHAT\]"
 ```
 
-### Alerting
+### GitHub Actions CI Monitoring
 
-> [TODO: No monitoring stack (Prometheus, Datadog, CloudWatch, etc.) is configured in this repo. Recommend adding structured JSON logging and a metrics exporter.]
+- Navigate to **Actions** tab in the repository to monitor workflow runs for:
+  - Tool 1 — Code Review (triggers on PR open/sync and Mondays 08:00 UTC)
+  - Tool 2 — Tech Documentation (triggers on push to `main` and Sundays 06:00 UTC)
+  - Tool 4 — Auto Testing (triggers on PR open/sync and Wednesdays 07:00 UTC)
+- Failed runs indicate missing secrets or broken scripts — check the Actions run log.
 
-> [TODO: No alerting rules or on-call rotation defined. Integrate with PagerDuty/OpsGenie or configure GitHub Actions failure notifications.]
+### What to Alert On
+
+- `backend` container health check fails (3 consecutive failures = container marked unhealthy)
+- Any `CRITICAL` or `500` error in backend logs
+- LLM API returning `429 Too Many Requests` (rate limit hit)
+- Redis unavailable (agent will fail to checkpoint conversation state)
+- [TODO: Is there a centralised logging or APM platform (e.g. Datadog, Azure Monitor, CloudWatch) configured for this service?]
+- [TODO: Are there any existing PagerDuty/Opsgenie/Alertmanager integrations?]
 
 ---
 
 ## 6. Escalation Path
 
-| Level | Role | Contact | When to escalate |
+| Level | Role | Contact | When to Escalate |
 |---|---|---|---|
-| L1 | On-call Engineer | [TODO: fill in contact] | Service down, health check failing, unable to restart containers |
-| L2 | Backend/ML Engineer | [TODO: fill in contact] | LLM assessment errors, model output quality issues, Redis/DB failures |
-| L3 | Tech Lead | [TODO: fill in contact] | Data breach, API key compromise, architecture-level failures |
-| External | Anthropic Support | support.anthropic.com | Claude API outage, unexpected billing spikes, model deprecation |
-| External | Google Cloud Support | [TODO: fill in contract details] | Gemini API outage |
-| External | Redis Support | redis.io/support | Redis Stack issues |
+| L1 | On-call Engineer | [TODO: fill in on-call rotation contact] | Service down, health check failing, containers not starting |
+| L2 | Backend/ML Lead | [TODO: fill in team lead contact] | LLM assessment errors, model output quality issues, Redis persistence failures |
+| L3 | Platform / Infra | [TODO: fill in infra team contact] | Database corruption, Docker host failures, network/port issues |
+| L4 | LLM Vendor Support | Anthropic: console.anthropic.com/support | API outage, unexpected billing spikes, model behaviour changes |
+| L4 | LLM Vendor Support | Google Cloud Support | Gemini API outage |
+| Product Owner | [TODO: fill in product owner contact] | Decisions required on go/no-go, data issues affecting underwriting decisions |
 
-> Repository owner visible in GitHub: `kylodeng`. Notification email seen in workflows: `kylo.deng@capco.com`.
+> **Note:** This service processes insurance underwriting decisions. Any production incident that may have resulted in incorrect risk classifications must be escalated to the Product Owner and [TODO: compliance/risk team contact] immediately.
 
 ---
 
 ## 7. Useful Commands
 
-### Service Lifecycle
+### Start / Stop / Restart
 
 ```bash
-# Start all services
-docker compose up -d
+# Start all services (build if needed)
+docker compose up --build -d
 
 # Stop all services (preserve volumes)
 docker compose down
 
-# Stop and remove volumes (DESTRUCTIVE — wipes postgres data)
+# Stop and remove volumes (DESTRUCTIVE — deletes postgres_data)
 docker compose down -v
 
 # Restart a single service
 docker compose restart backend
+docker compose restart frontend
+docker compose restart redis
 
-# Rebuild and redeploy backend only
-docker compose build backend && docker compose up -d backend
-
-# View real-time logs for all services
-docker compose logs -f
-
-# View real-time logs for backend only
-docker compose logs backend -f --tail=100
+# View running containers and health status
+docker compose ps
 ```
 
-### Health & Diagnostics
+### Logs
 
 ```bash
-# Check all container statuses
-docker compose ps
+# Tail all logs
+docker compose logs -f
 
-# Backend health check
-curl -f http://localhost:8000/health && echo "OK"
+# Tail backend logs only
+docker compose logs -f backend --tail 100
+
+# Filter for LLM assessment events
+docker compose logs backend | grep -E "\[SPECIALIST\]|\[AGGREGATOR\]|\[ASSESSMENT\]"
+
+# Filter for tool calls
+docker compose logs backend | grep -E "\[TOOL START\]|\[TOOL END\]"
+
+# Filter for errors
+docker compose logs backend | grep -iE "error|exception|traceback"
+```
+
+### Health Checks
+
+```bash
+# Backend health
+curl -s http://localhost:8000/health | python3 -m json.tool
 
 # Redis ping
 docker compose exec redis redis-cli ping
 
-# Redis session key inspection
-docker compose exec redis redis-cli KEYS "*"
-
-# Postgres connectivity
+# PostgreSQL readiness
 docker compose exec postgres pg_isready -U chainlit -d chainlit
 
-# Postgres: list active connections
-docker compose exec postgres psql -U chainlit -d chainlit \
-  -c "SELECT pid, usename, application_name, state FROM pg_stat_activity;"
+# Redis memory info
+docker compose exec redis redis-cli info memory | grep used_memory_human
 
-# Check SQLite database files are mounted
-docker compose exec backend ls -lh /data/
+# PostgreSQL active connections
+docker compose exec postgres psql -U chainlit -c "SELECT count(*) FROM pg_stat_activity;"
 ```
 
-### Test Chat Endpoint
+### Test the Chat API Directly
 
 ```bash
-# Fast mode (Haiku)
+# Send a test message to the backend
 curl -X POST http://localhost:8000/chat \
   -H "Content-Type: application/json" \
   -d '{
-    "message": "Get profile for customer CUST00000001",
+    "message": "Get customer profile for CUST00000001",
     "temperature": 0.3,
-    "session_id": "ops-test-001",
+    "session_id": "test-session-001",
     "model": "anthropic-fast",
     "mode": "fast"
   }'
-
-# Deep mode (Sonnet)
-curl -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{
-    "message": "Run full risk assessment for CUST00000001",
-    "temperature": 0.3,
-    "session_id": "ops-test-002",
-    "model": "anthropic",
-    "mode": "deep"
-  }'
 ```
 
-### Redis — Clear a Specific Session
+### Database Inspection
 
 ```bash
-# List all checkpoint keys for a session
-docker compose exec redis redis-cli KEYS "*default*"
+# List SQLite DB files mounted into backend
+docker compose exec backend ls -lh /data/
 
-# Delete a session checkpoint (replace KEY with actual key)
-docker compose exec redis redis-cli DEL <KEY>
+# Query customer profile DB (if sqlite3 available in container)
+docker compose exec backend sqlite3 /data/customer_profile.db ".tables"
+docker compose exec backend sqlite3 /data/customer_profile.db "SELECT * FROM customer_profile LIMIT 5;"
 
-# Flush ALL Redis data (DESTRUCTIVE — clears all conversation history)
-docker compose exec redis redis-cli FLUSHALL
+# PostgreSQL — list tables
+docker compose exec postgres psql -U chainlit -d chainlit -c "\dt"
 ```
 
-### Config & Secrets Verification
+### Redis Inspection
 
 ```bash
-# Verify required env vars are loaded in backend container
-docker compose exec backend env | grep -E \
-  "ANTHROPIC_API_KEY|GOOGLE_API_KEY|REDIS_HOST"
+# List all Redis keys (use with caution in production — can be large)
+docker compose exec redis redis-cli keys "*"
 
-# Check config.yml values
-docker compose exec backend cat /app/config.yml
+# Count keys
+docker compose exec redis redis-cli dbsize
+
+# Flush all Redis data (DESTRUCTIVE — clears all conversation checkpoints)
+docker compose exec redis redis-cli flushall
 ```
 
-### GitHub Actions — Trigger Workflows Manually
+### Configuration
 
 ```bash
-# Requires GitHub CLI (gh) installed and authenticated
+# View current LLM config
+cat backend/config.yml
 
-# Trigger code review on a specific PR
-gh workflow run tool1_code_review.yml \
-  -f review_mode=pr -f pr_number=42
-
-# Trigger tech documentation generation
-gh workflow run tool2_tech_docs.yml
-
-# Trigger test generation
-gh workflow run tool4_auto_testing.yml -f test_mode=generate
+# Increase aggregator token budget (edit in place)
+# aggregator_max_tokens: 8000  →  increase if structured output is being truncated
+vim backend/config.yml
+docker compose restart backend
 ```
 
-### Database Inspection (SQLite)
-
-```bash
-# Inspect customer profile database
-docker compose exec backend sqlite3 /data/customer_profile.db \
-  ".tables"
-
-# Query a specific customer
-docker compose exec backend sqlite3 /data/customer_profile.db \
-  "SELECT * FROM customer_profile WHERE customer_id='CUST00000001';"
-```
-
-> [TODO: What is the table schema for each SQLite database? No schema files were found in the repo.]
-
-> [TODO: Are the
+### GitHub Actions — Manual
