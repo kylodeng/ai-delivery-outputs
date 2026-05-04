@@ -658,5 +658,14 @@
       "ARCHITECTURE.md",
       "RUNBOOK.md"
     ]
+  },
+  {
+    "timestamp": "2026-05-04T10:11:13Z",
+    "tool": "code-review",
+    "status": "FAILED",
+    "source_repo": "kylodeng/ai-delivery-source",
+    "output_url": "",
+    "run_url": "https://github.com/kylodeng/ai-delivery-source/actions/runs/25313270529",
+    "summary": "Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CahMA6KUutuXnVDVb12f8'}"
   }
 ]
