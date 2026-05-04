@@ -676,5 +676,14 @@
     "output_url": "",
     "run_url": "https://github.com/kylodeng/Insurance-Training-Bot-main/actions/runs/25313275199",
     "summary": "Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CahMBbPzRfvsNmEtveF5T'}"
+  },
+  {
+    "timestamp": "2026-05-04T10:20:54Z",
+    "tool": "code-review",
+    "status": "FAILED",
+    "source_repo": "kylodeng/underwriting_chatbot-main",
+    "output_url": "",
+    "run_url": "https://github.com/kylodeng/underwriting_chatbot-main/actions/runs/25313660436",
+    "summary": "Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.'}, 'request_id': 'req_011CahMtwzNhMVRsRf4mvie3'}"
   }
 ]
