@@ -1,18 +1,18 @@
 # Auto-Generated Test Report
 **Repo:** kylodeng/underwriting_chatbot-main  
-**Generated:** 2026-04-29 09:14 UTC
+**Generated:** 2026-05-06 09:28 UTC
 
 ## Summary
 | Source File | Est. Coverage | Generated Test File | TODOs |
 |---|---|---|---|
-| `.github/scripts/shared.py` | ~70% | auto-tests/kylodeng-underwriting_chatbot-main/python/test_shared.py | 4 TODOs |
+| `.github/scripts/shared.py` | ~70% | auto-tests/kylodeng-underwriting_chatbot-main/python/test_shared.py | 2 TODOs |
 | `.github/scripts/tool1_code_review.py` | ~70% | auto-tests/kylodeng-underwriting_chatbot-main/python/test_tool1_code_review.py | 4 TODOs |
-| `.github/scripts/tool2_tech_docs.py` | ~70% | auto-tests/kylodeng-underwriting_chatbot-main/python/test_tool2_tech_docs.py | 3 TODOs |
+| `.github/scripts/tool2_tech_docs.py` | ~70% | auto-tests/kylodeng-underwriting_chatbot-main/python/test_tool2_tech_docs.py | 4 TODOs |
 | `.github/scripts/tool3_business_docs.py` | ~70% | auto-tests/kylodeng-underwriting_chatbot-main/python/test_tool3_business_docs.py | 4 TODOs |
 | `.github/scripts/tool5_uat.py` | ~70% | auto-tests/kylodeng-underwriting_chatbot-main/python/test_tool5_uat.py | 4 TODOs |
 | `backend/agent/agent_with_skills.py` | ~70% | auto-tests/kylodeng-underwriting_chatbot-main/python/test_agent_with_skills.py | 4 TODOs |
 | `backend/agent/graph.py` | ~70% | auto-tests/kylodeng-underwriting_chatbot-main/python/test_graph.py | 4 TODOs |
-| `backend/agent/prompts.py` | ~70% | auto-tests/kylodeng-underwriting_chatbot-main/python/test_prompts.py | 4 TODOs |
+| `backend/agent/prompts.py` | ~70% | auto-tests/kylodeng-underwriting_chatbot-main/python/test_prompts.py | 3 TODOs |
 
 ## How to use
 1. Copy generated test files into your `tests/` directory
