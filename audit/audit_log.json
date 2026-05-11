@@ -760,5 +760,16 @@
       "ARCHITECTURE.md",
       "RUNBOOK.md"
     ]
+  },
+  {
+    "timestamp": "2026-05-11T10:59:32Z",
+    "tool": "code-review",
+    "status": "SUCCESS",
+    "source_repo": "kylodeng/ai-delivery-source",
+    "output_url": "https://github.com/kylodeng/ai-delivery-outputs/blob/main/code-review/kylodeng-ai-delivery-source-20260511.md",
+    "run_url": "https://github.com/kylodeng/ai-delivery-source/actions/runs/25666027613",
+    "summary": "Score 62/100 - 17 findings - REQUEST_CHANGES",
+    "score": 62,
+    "findings_count": 17
   }
 ]
