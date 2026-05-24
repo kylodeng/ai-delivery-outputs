@@ -934,5 +934,19 @@
     "summary": "Generated tests for 8 files \u00b7 30 TODOs to complete",
     "files_processed": 8,
     "mode": "generate"
+  },
+  {
+    "timestamp": "2026-05-24T08:26:01Z",
+    "tool": "tech-docs",
+    "status": "SUCCESS",
+    "source_repo": "kylodeng/ai-delivery-source",
+    "output_url": "https://github.com/kylodeng/ai-delivery-outputs/blob/main/tech-docs/kylodeng-ai-delivery-source/INDEX.md",
+    "run_url": "https://github.com/kylodeng/ai-delivery-source/actions/runs/26356238999",
+    "summary": "Generated 3 documents: README, ARCHITECTURE, RUNBOOK",
+    "docs_generated": [
+      "README.md",
+      "ARCHITECTURE.md",
+      "RUNBOOK.md"
+    ]
   }
 ]
