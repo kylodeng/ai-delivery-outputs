@@ -998,5 +998,16 @@
     "summary": "Score 62/100 - 16 findings - REQUEST_CHANGES",
     "score": 62,
     "findings_count": 16
+  },
+  {
+    "timestamp": "2026-05-25T11:58:48Z",
+    "tool": "code-review",
+    "status": "SUCCESS",
+    "source_repo": "kylodeng/underwriting_chatbot-main",
+    "output_url": "https://github.com/kylodeng/ai-delivery-outputs/blob/main/code-review/kylodeng-underwriting_chatbot-main-20260525.md",
+    "run_url": "https://github.com/kylodeng/underwriting_chatbot-main/actions/runs/26399300280",
+    "summary": "Score 62/100 - 14 findings - REQUEST_CHANGES",
+    "score": 62,
+    "findings_count": 14
   }
 ]
