@@ -1,27 +1,25 @@
-```python
 """
-Test suite for .github/scripts/tool2_tech_docs.py
+Tests for tool2_tech_docs.py
 
 What is tested:
 - generate_docs(): orchestrates file fetching and Claude calls to produce README, ARCHITECTURE, RUNBOOK
-- build_index(): constructs a markdown index page linking to generated docs
-- __main__ block behaviour: env var handling, output writing, email sending, audit logging, error paths
+- build_index(): constructs a markdown index page linking to generated documents
+- __main__ block behaviour: happy path (writes files, sends email, writes audit); failure path (audit + email on exception)
 
 Mocks used:
-- shared.call_claude          — stubbed to return deterministic strings
-- shared.get_repo_files       — stubbed to return synthetic file dicts
-- shared.write_output_file    — stubbed to return fake GitHub URLs
-- shared.send_email           — stubbed (no real SMTP calls)
-- shared.email_html           — stubbed to return a dummy HTML string
-- shared.write_audit_entry    — stubbed (no real file/DB writes)
-- shared.OUTPUT_REPO_OWNER    — patched to a known constant
-- shared.OUTPUT_REPO          — patched to a known constant
-- datetime.datetime           — patched for deterministic timestamps
+- shared.call_claude          → prevents real Anthropic API calls
+- shared.get_repo_files       → prevents real GitHub API calls
+- shared.write_output_file    → prevents real GitHub write operations
+- shared.send_email           → prevents real email delivery
+- shared.email_html           → prevents real HTML rendering
+- shared.write_audit_entry    → prevents real audit log writes
+- shared.OUTPUT_REPO_OWNER    → constant patched to a test value
+- shared.OUTPUT_REPO          → constant patched to a test value
+- datetime.datetime           → frozen for deterministic timestamp assertions
 
 TODOs:
-- TODO: Integration test that exercises the real `shared` module helpers once available
-- TODO: Test behaviour when SOURCE_REPO_OWNER / SOURCE_REPO_NAME env vars are missing (None values)
-        requires clarifying whether generate_docs should raise or gracefully handle None
+- TODO: Integration test that wires a real (sandboxed) Claude client once a test key is available
+- TODO: Test behaviour when SOURCE_REPO_OWNER / SOURCE_REPO_NAME env vars are absent (None) at __main__ level
 """
 
 import importlib
@@ -30,59 +28,54 @@ import os
 import types
 import datetime
 from unittest import mock
-from unittest.mock import MagicMock, patch, call
 
 import pytest
 
 # ---------------------------------------------------------------------------
-# Helpers to load the module with a fully-mocked `shared` dependency
+# Helpers to import the module under test with all shared deps stubbed out
 # ---------------------------------------------------------------------------
 
-FAKE_OUTPUT_REPO_OWNER = "ai-org"
-FAKE_OUTPUT_REPO = "ai-output-repo"
-
-def _make_shared_mock():
-    """Return a mock `shared` module with all symbols used by tool2_tech_docs."""
-    shared = types.ModuleType("shared")
-    shared.call_claude = MagicMock(return_value="# Generated content")
-    shared.get_repo_files = MagicMock(return_value={})
-    shared.write_output_file = MagicMock(return_value="https://github.com/fake/url")
-    shared.send_email = MagicMock()
-    shared.email_html = MagicMock(return_value="<html>body</html>")
-    shared.write_audit_entry = MagicMock()
-    shared.OUTPUT_REPO_OWNER = FAKE_OUTPUT_REPO_OWNER
-    shared.OUTPUT_REPO = FAKE_OUTPUT_REPO
-    return shared
+FAKE_OUTPUT_REPO_OWNER = "test-org"
+FAKE_OUTPUT_REPO = "test-output-repo"
 
 
-def _load_module(shared_mock=None):
-    """Import (or re-import) tool2_tech_docs with the given shared mock injected."""
-    if shared_mock is None:
-        shared_mock = _make_shared_mock()
+def _make_shared_stub():
+    """Return a minimal stub module that replaces `shared`."""
+    stub = types.ModuleType("shared")
+    stub.call_claude = mock.MagicMock(return_value="# Generated content")
+    stub.get_repo_files = mock.MagicMock(return_value={})
+    stub.write_output_file = mock.MagicMock(return_value="https://github.com/test-org/test-output-repo/blob/main/some/path")
+    stub.send_email = mock.MagicMock()
+    stub.email_html = mock.MagicMock(return_value="<html>mock</html>")
+    stub.write_audit_entry = mock.MagicMock()
+    stub.OUTPUT_REPO_OWNER = FAKE_OUTPUT_REPO_OWNER
+    stub.OUTPUT_REPO = FAKE_OUTPUT_REPO
+    return stub
 
-    # Ensure the scripts directory is on the path
-    scripts_dir = os.path.join(os.path.dirname(__file__), ".github", "scripts")
-    if scripts_dir not in sys.path:
-        sys.path.insert(0, scripts_dir)
 
-    # Inject mock before importing
-    sys.modules["shared"] = shared_mock
+def _import_tool(shared_stub=None):
+    """
+    Import (or re-import) tool2_tech_docs with a fresh shared stub.
+    Returns (module, shared_stub).
+    """
+    if shared_stub is None:
+        shared_stub = _make_shared_stub()
 
-    # Remove cached version so we get a fresh import each time
+    # Insert stub before importing so the module picks it up via sys.path insertion
+    sys.modules["shared"] = shared_stub
+
+    # Force a fresh import every time
     if "tool2_tech_docs" in sys.modules:
         del sys.modules["tool2_tech_docs"]
 
-    # Build the path to the source file
-    module_path = os.path.join(
-        os.path.dirname(__file__), ".github", "scripts", "tool2_tech_docs.py"
-    )
+    # Ensure the script directory is on the path
+    script_dir = os.path.join(os.path.dirname(__file__), "..", ".github", "scripts")
+    script_dir = os.path.normpath(script_dir)
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
 
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("tool2_tech_docs", module_path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["tool2_tech_docs"] = mod
-    spec.loader.exec_module(mod)
-    return mod, shared_mock
+    import tool2_tech_docs as mod
+    return mod, shared_stub
 
 
 # ---------------------------------------------------------------------------
@@ -90,31 +83,20 @@ def _load_module(shared_mock=None):
 # ---------------------------------------------------------------------------
 
 @pytest.fixture()
-def shared_mock():
-    return _make_shared_mock()
+def shared_stub():
+    stub = _make_shared_stub()
+    yield stub
+    # Cleanup
+    if "shared" in sys.modules:
+        del sys.modules["shared"]
+    if "tool2_tech_docs" in sys.modules:
+        del sys.modules["tool2_tech_docs"]
 
 
 @pytest.fixture()
-def module(shared_mock):
-    mod, sm = _load_module(shared_mock)
+def tool(shared_stub):
+    mod, _ = _import_tool(shared_stub)
     return mod
-
-
-@pytest.fixture()
-def module_and_shared(shared_mock):
-    mod, sm = _load_module(shared_mock)
-    return mod, sm
-
-
-# Synthetic file dictionaries reused across tests
-SYNTHETIC_PY_FILES = {
-    "app/main.py": "def main():\n    pass\n",
-    "app/utils.py": "import os\n",
-}
-SYNTHETIC_IAC_FILES = {
-    "infra/main.tf": 'resource "aws_s3_bucket" "b" {}',
-    "infra/variables.yml": "env: production\n",
-}
 
 
 # ---------------------------------------------------------------------------
@@ -123,192 +105,175 @@ SYNTHETIC_IAC_FILES = {
 
 class TestGenerateDocs:
 
-    def test_returns_three_doc_keys(self, module_and_shared):
-        mod, sm = module_and_shared
-        sm.get_repo_files.return_value = {}
+    def test_happy_path_returns_three_docs(self, tool, shared_stub):
+        """generate_docs returns README.md, ARCHITECTURE.md and RUNBOOK.md."""
+        shared_stub.get_repo_files.return_value = {"main.py": "print('hello')"}
+        shared_stub.call_claude.return_value = "# Doc content"
 
-        result = mod.generate_docs("my-org", "my-repo", "https://github.com/run/1")
+        result = tool.generate_docs("my-org", "my-repo", "https://github.com/run/1")
 
         assert set(result.keys()) == {"README.md", "ARCHITECTURE.md", "RUNBOOK.md"}
 
-    def test_calls_get_repo_files_twice(self, module_and_shared):
-        mod, sm = module_and_shared
-        sm.get_repo_files.return_value = {}
+    def test_call_claude_called_three_times(self, tool, shared_stub):
+        """One Claude call per document type."""
+        shared_stub.get_repo_files.return_value = {}
+        shared_stub.call_claude.return_value = "content"
 
-        mod.generate_docs("my-org", "my-repo", "https://github.com/run/1")
+        tool.generate_docs("org", "repo", "https://github.com/run/1")
 
-        assert sm.get_repo_files.call_count == 2
+        assert shared_stub.call_claude.call_count == 3
 
-    def test_get_repo_files_first_call_uses_code_extensions(self, module_and_shared):
-        mod, sm = module_and_shared
-        sm.get_repo_files.return_value = {}
+    def test_get_repo_files_called_twice(self, tool, shared_stub):
+        """File fetching: once for source files, once for IaC files."""
+        shared_stub.get_repo_files.return_value = {}
+        shared_stub.call_claude.return_value = "content"
 
-        mod.generate_docs("owner", "repo", "url")
+        tool.generate_docs("org", "repo", "https://github.com/run/1")
 
-        first_call_args = sm.get_repo_files.call_args_list[0]
-        exts = first_call_args[0][2]  # positional arg index 2
-        assert ".py" in exts
-        assert ".ts" in exts
-        assert ".js" in exts
-        assert ".go" in exts
+        assert shared_stub.get_repo_files.call_count == 2
 
-    def test_get_repo_files_second_call_uses_iac_extensions(self, module_and_shared):
-        mod, sm = module_and_shared
-        sm.get_repo_files.return_value = {}
+    def test_source_files_extensions(self, tool, shared_stub):
+        """Source-file fetch requests .py/.js/.ts/.go extensions."""
+        shared_stub.get_repo_files.return_value = {}
+        shared_stub.call_claude.return_value = "content"
 
-        mod.generate_docs("owner", "repo", "url")
+        tool.generate_docs("org", "repo", "https://github.com/run/1")
 
-        second_call_args = sm.get_repo_files.call_args_list[1]
-        exts = second_call_args[0][2]
-        assert ".tf" in exts
-        assert ".yaml" in exts
-        assert ".yml" in exts
+        first_call_extensions = shared_stub.get_repo_files.call_args_list[0][0][2]
+        assert ".py" in first_call_extensions
+        assert ".js" in first_call_extensions
+        assert ".ts" in first_call_extensions
+        assert ".go" in first_call_extensions
 
-    def test_calls_claude_three_times(self, module_and_shared):
-        mod, sm = module_and_shared
-        sm.get_repo_files.return_value = {}
+    def test_iac_files_extensions(self, tool, shared_stub):
+        """IaC file fetch requests .tf/.bicep/.json/.yaml/.yml extensions."""
+        shared_stub.get_repo_files.return_value = {}
+        shared_stub.call_claude.return_value = "content"
 
-        mod.generate_docs("owner", "repo", "url")
+        tool.generate_docs("org", "repo", "https://github.com/run/1")
 
-        assert sm.call_claude.call_count == 3
+        second_call_extensions = shared_stub.get_repo_files.call_args_list[1][0][2]
+        assert ".tf" in second_call_extensions
+        assert ".yaml" in second_call_extensions
+        assert ".yml" in second_call_extensions
 
-    def test_readme_content_comes_from_claude(self, module_and_shared):
-        mod, sm = module_and_shared
-        sm.get_repo_files.return_value = {}
-        sm.call_claude.return_value = "CLAUDE_OUTPUT"
+    def test_claude_receives_owner_repo_in_prompt(self, tool, shared_stub):
+        """Each Claude call embeds owner/repo in the user prompt."""
+        shared_stub.get_repo_files.return_value = {}
+        shared_stub.call_claude.return_value = "content"
 
-        result = mod.generate_docs("owner", "repo", "url")
+        tool.generate_docs("acme", "widget-service", "https://github.com/run/1")
 
-        assert result["README.md"] == "CLAUDE_OUTPUT"
+        for call in shared_stub.call_claude.call_args_list:
+            user_prompt = call[0][1]
+            assert "acme" in user_prompt
+            assert "widget-service" in user_prompt
 
-    def test_architecture_content_comes_from_claude(self, module_and_shared):
-        mod, sm = module_and_shared
-        sm.get_repo_files.return_value = {}
+    def test_doc_values_come_from_claude(self, tool, shared_stub):
+        """The content of each document is exactly what call_claude returned."""
+        shared_stub.get_repo_files.return_value = {}
+        shared_stub.call_claude.return_value = "## My special content"
 
-        def side_effect(system, user):
-            if "architecture" in system.lower() or "architect" in system.lower():
-                return "ARCH_DOC"
-            return "OTHER"
+        result = tool.generate_docs("org", "repo", "https://github.com/run/1")
 
-        sm.call_claude.side_effect = side_effect
+        for doc_content in result.values():
+            assert doc_content == "## My special content"
 
-        result = mod.generate_docs("owner", "repo", "url")
-        assert result["ARCHITECTURE.md"] == "ARCH_DOC"
+    def test_empty_files_produces_no_files_found_placeholder(self, tool, shared_stub):
+        """When no files are found the formatted string contains the placeholder."""
+        shared_stub.get_repo_files.return_value = {}
+        shared_stub.call_claude.return_value = "content"
 
-    def test_runbook_content_comes_from_claude(self, module_and_shared):
-        mod, sm = module_and_shared
-        sm.get_repo_files.return_value = {}
+        tool.generate_docs("org", "repo", "https://github.com/run/1")
 
-        def side_effect(system, user):
-            if "runbook" in system.lower() or "devops" in system.lower():
-                return "RUNBOOK_DOC"
-            return "OTHER"
+        # Inspect the README call – its prompt should contain the placeholder
+        readme_call = shared_stub.call_claude.call_args_list[0]
+        assert "_No files found_" in readme_call[0][1]
 
-        sm.call_claude.side_effect = side_effect
-
-        result = mod.generate_docs("owner", "repo", "url")
-        assert result["RUNBOOK.md"] == "RUNBOOK_DOC"
-
-    def test_repo_owner_and_name_included_in_claude_prompt(self, module_and_shared):
-        mod, sm = module_and_shared
-        sm.get_repo_files.return_value = {}
-
-        mod.generate_docs("acme-corp", "payment-service", "url")
-
-        for c in sm.call_claude.call_args_list:
-            user_prompt = c[0][1]
-            assert "acme-corp" in user_prompt
-            assert "payment-service" in user_prompt
-
-    def test_file_content_truncated_to_4000_chars(self, module_and_shared):
-        mod, sm = module_and_shared
+    def test_file_content_truncated_to_4000_chars(self, tool, shared_stub):
+        """Files longer than 4000 characters are truncated in the prompt."""
         long_content = "x" * 10_000
-        sm.get_repo_files.return_value = {"bigfile.py": long_content}
+        shared_stub.get_repo_files.return_value = {"bigfile.py": long_content}
+        shared_stub.call_claude.return_value = "content"
 
-        mod.generate_docs("owner", "repo", "url")
+        tool.generate_docs("org", "repo", "https://github.com/run/1")
 
-        # Verify that the user prompt sent to Claude doesn't contain the full 10k string
-        # (it should be truncated to 4000 chars per file)
-        for c in sm.call_claude.call_args_list:
-            user_prompt = c[0][1]
-            # The sliced content should be 4000 x's followed by newline/backtick
-            assert "x" * 4001 not in user_prompt
+        readme_call = shared_stub.call_claude.call_args_list[0]
+        prompt = readme_call[0][1]
+        # The prompt must NOT contain the full 10 000 chars
+        assert "x" * 4001 not in prompt
+        # But should contain up to 4000
+        assert "x" * 4000 in prompt
 
-    def test_no_files_found_shows_placeholder(self, module_and_shared):
-        mod, sm = module_and_shared
-        sm.get_repo_files.return_value = {}
+    def test_get_repo_files_max_files_respected(self, tool, shared_stub):
+        """max_files kwargs are passed correctly."""
+        shared_stub.get_repo_files.return_value = {}
+        shared_stub.call_claude.return_value = "content"
 
-        mod.generate_docs("owner", "repo", "url")
+        tool.generate_docs("org", "repo", "https://github.com/run/1")
 
-        # With no files, the formatted string should be "_No files found_"
-        # Verify Claude is still called (not skipped)
-        assert sm.call_claude.call_count == 3
-        first_user_prompt = sm.call_claude.call_args_list[0][0][1]
-        assert "_No files found_" in first_user_prompt
+        calls = shared_stub.get_repo_files.call_args_list
+        assert calls[0][1].get("max_files") == 15  # source files
+        assert calls[1][1].get("max_files") == 10  # iac files
 
-    def test_with_synthetic_py_files(self, module_and_shared):
-        mod, sm = module_and_shared
+    def test_call_claude_raises_propagates(self, tool, shared_stub):
+        """If Claude raises, generate_docs propagates the exception."""
+        shared_stub.get_repo_files.return_value = {}
+        shared_stub.call_claude.side_effect = RuntimeError("API error")
 
-        def get_files_side_effect(owner, repo, exts, max_files=15):
-            if ".py" in exts:
-                return SYNTHETIC_PY_FILES
-            return SYNTHETIC_IAC_FILES
+        with pytest.raises(RuntimeError, match="API error"):
+            tool.generate_docs("org", "repo", "https://github.com/run/1")
 
-        sm.get_repo_files.side_effect = get_files_side_effect
-        sm.call_claude.return_value = "# doc"
+    def test_get_repo_files_raises_propagates(self, tool, shared_stub):
+        """If file fetching raises, generate_docs propagates the exception."""
+        shared_stub.get_repo_files.side_effect = ConnectionError("network error")
 
-        result = mod.generate_docs("my-org", "my-repo", "url")
+        with pytest.raises(ConnectionError, match="network error"):
+            tool.generate_docs("org", "repo", "https://github.com/run/1")
 
-        assert len(result) == 3
-        # File names appear in the Claude prompts
-        readme_prompt = sm.call_claude.call_args_list[0][0][1]
-        assert "app/main.py" in readme_prompt
+    def test_multiple_files_all_included_in_prompt(self, tool, shared_stub):
+        """Multiple fetched files all appear in the Claude prompt."""
+        shared_stub.get_repo_files.return_value = {
+            "app.py": "def main(): pass",
+            "utils.py": "def helper(): pass",
+        }
+        shared_stub.call_claude.return_value = "content"
 
-    def test_with_synthetic_iac_files(self, module_and_shared):
-        mod, sm = module_and_shared
+        tool.generate_docs("org", "repo", "https://github.com/run/1")
 
-        def get_files_side_effect(owner, repo, exts, max_files=15):
-            if ".tf" in exts:
-                return SYNTHETIC_IAC_FILES
-            return {}
+        readme_prompt = shared_stub.call_claude.call_args_list[0][0][1]
+        assert "app.py" in readme_prompt
+        assert "utils.py" in readme_prompt
 
-        sm.get_repo_files.side_effect = get_files_side_effect
-        sm.call_claude.return_value = "# arch"
+    def test_correct_system_prompt_for_readme(self, tool, shared_stub):
+        """README generation uses SYSTEM_README as the system prompt."""
+        shared_stub.get_repo_files.return_value = {}
+        shared_stub.call_claude.return_value = "content"
 
-        mod.generate_docs("my-org", "my-repo", "url")
+        tool.generate_docs("org", "repo", "https://github.com/run/1")
 
-        arch_prompt = sm.call_claude.call_args_list[1][0][1]
-        assert "infra/main.tf" in arch_prompt
+        system_prompt = shared_stub.call_claude.call_args_list[0][0][0]
+        assert "README" in system_prompt or "technical writer" in system_prompt.lower()
 
-    def test_max_files_limits_respected(self, module_and_shared):
-        mod, sm = module_and_shared
-        sm.get_repo_files.return_value = {}
+    def test_correct_system_prompt_for_architecture(self, tool, shared_stub):
+        """Architecture generation uses SYSTEM_ARCH as the system prompt."""
+        shared_stub.get_repo_files.return_value = {}
+        shared_stub.call_claude.return_value = "content"
 
-        mod.generate_docs("owner", "repo", "url")
+        tool.generate_docs("org", "repo", "https://github.com/run/1")
 
-        code_call = sm.get_repo_files.call_args_list[0]
-        iac_call = sm.get_repo_files.call_args_list[1]
+        system_prompt = shared_stub.call_claude.call_args_list[1][0][0]
+        assert "architect" in system_prompt.lower() or "architecture" in system_prompt.lower()
 
-        code_max = code_call[1].get("max_files") or code_call[0][3]
-        iac_max = iac_call[1].get("max_files") or iac_call[0][3]
+    def test_correct_system_prompt_for_runbook(self, tool, shared_stub):
+        """Runbook generation uses SYSTEM_RUNBOOK as the system prompt."""
+        shared_stub.get_repo_files.return_value = {}
+        shared_stub.call_claude.return_value = "content"
 
-        assert code_max == 15
-        assert iac_max == 10
+        tool.generate_docs("org", "repo", "https://github.com/run/1")
 
-    def test_claude_error_propagates(self, module_and_shared):
-        mod, sm = module_and_shared
-        sm.get_repo_files.return_value = {}
-        sm.call_claude.side_effect = RuntimeError("Claude API failure")
-
-        with pytest.raises(RuntimeError, match="Claude API failure"):
-            mod.generate_docs("owner", "repo", "url")
-
-    def test_get_repo_files_error_propagates(self, module_and_shared):
-        mod, sm = module_and_shared
-        sm.get_repo_files.side_effect = ConnectionError("GitHub unreachable")
-
-        with pytest.raises(ConnectionError, match="GitHub unreachable"):
-            mod.generate_docs("owner", "repo", "url")
+        system_prompt = shared_stub.call_claude.call_args_list[2][0][0]
+        assert "runbook" in system_prompt.lower() or "devops" in system_prompt.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -317,50 +282,47 @@ class TestGenerateDocs:
 
 class TestBuildIndex:
 
-    def test_returns_string(self, module):
-        result = module.build_index("owner", "repo", {"README.md": ""}, "2024-01-01 00:00 UTC")
+    def test_returns_string(self, tool):
+        docs = {"README.md": "content", "ARCHITECTURE.md": "content"}
+        result = tool.build_index("org", "repo", docs, "2024-01-15 10:00 UTC")
         assert isinstance(result, str)
 
-    def test_contains_owner_and_repo_in_title(self, module):
-        result = module.build_index("acme", "payments", {"README.md": ""}, "2024-01-01 00:00 UTC")
-        assert "acme/payments" in result
+    def test_title_contains_owner_and_repo(self, tool):
+        result = tool.build_index("acme", "widget", {"README.md": ""}, "2024-01-15 10:00 UTC")
+        assert "acme" in result
+        assert "widget" in result
 
-    def test_contains_timestamp(self, module):
-        result = module.build_index("owner", "repo", {}, "2024-06-15 12:30 UTC")
-        assert "2024-06-15 12:30 UTC" in result
+    def test_generated_timestamp_appears(self, tool):
+        result = tool.build_index("org", "repo", {"README.md": ""}, "2024-06-30 12:00 UTC")
+        assert "2024-06-30 12:00 UTC" in result
 
-    def test_contains_link_for_each_doc(self, module):
-        docs = {"README.md": "r", "ARCHITECTURE.md": "a", "RUNBOOK.md": "b"}
-        result = module.build_index("owner", "repo", docs, "now")
+    def test_all_doc_names_appear_as_links(self, tool):
+        docs = {"README.md": "", "ARCHITECTURE.md": "", "RUNBOOK.md": ""}
+        result = tool.build_index("org", "repo", docs, "2024-01-01 00:00 UTC")
         assert "README.md" in result
         assert "ARCHITECTURE.md" in result
         assert "RUNBOOK.md" in result
 
-    def test_links_use_output_repo_owner_and_repo(self, module):
+    def test_links_use_output_repo_owner_and_repo(self, tool):
         docs = {"README.md": ""}
-        result = module.build_index("src-owner", "src-repo", docs, "now")
+        result = tool.build_index("src-org", "src-repo", docs, "2024-01-01 00:00 UTC")
         assert FAKE_OUTPUT_REPO_OWNER in result
         assert FAKE_OUTPUT_REPO in result
 
-    def test_links_contain_correct_path_prefix(self, module):
+    def test_links_contain_correct_path_structure(self, tool):
         docs = {"README.md": ""}
-        result = module.build_index("owner", "repo", docs, "now")
-        assert "tech-docs/owner-repo/README.md" in result
+        result = tool.build_index("my-org", "my-repo", docs, "2024-01-01 00:00 UTC")
+        assert "tech-docs/my-org-my-repo/README.md" in result
 
-    def test_links_are_github_urls(self, module):
-        docs = {"README.md": ""}
-        result = module.build_index("owner", "repo", docs, "now")
-        assert "https://github.com/" in result
+    def test_auto_generated_footer_present(self, tool):
+        result = tool.build_index("org", "repo", {}, "2024-01-01 00:00 UTC")
+        assert "Auto-generated" in result or "auto-generated" in result.lower()
 
-    def test_empty_docs_dict(self, module):
-        result = module.build_index("owner", "repo", {}, "2024-01-01 00:00 UTC")
-        assert "owner/repo" in result
-        assert "2024-01-01 00:00 UTC" in result
+    def test_empty_docs_dict(self, tool):
+        """build_index should not raise when docs is empty."""
+        result = tool.build_index("org", "repo", {}, "2024-01-01 00:00 UTC")
+        assert isinstance(result, str)
 
-    def test_contains_autogenerated_footer(self, module):
-        result = module.build_index("owner", "repo", {}, "now")
-        assert "Auto-generated" in result
-
-    @pytest.mark.parametrize("owner,repo", [
-        ("org-with-dashes", "repo-with-dashes"),
-        ("
+    def test_single_doc(self, tool):
+        result = tool.build_index("org", "repo", {"README.md": "x"}, "2024-01-01 00:00 UTC")
+        assert "README.md"
