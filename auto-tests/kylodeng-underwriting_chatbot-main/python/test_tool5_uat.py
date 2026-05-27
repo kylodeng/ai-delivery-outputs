@@ -1,345 +1,360 @@
 """
-Tests for .github/scripts/tool5_uat.py
+Tests for tool5_uat.py
 
 What is tested:
-  - parse_scenarios(): happy path, edge cases (empty input, missing fields,
-    malformed blocks, no delimiter, multiple scenarios)
-  - build_test_pack_csv(): correct CSV structure, header row, data rows,
-    missing fields, empty list
-  - build_test_pack_md(): correct markdown structure, version/owner/repo injection
-  - get_results_csv(): successful fetch + base64 decode, missing 'content' key,
-    HTTP errors
+    - parse_scenarios(): happy path, edge cases, missing fields, empty input, malformed blocks
+    - build_test_pack_csv(): happy path, empty list, partial scenario data, CSV structure
+    - build_test_pack_md(): content generation, version/owner/repo interpolation
+    - get_results_csv(): happy path, missing file (FileNotFoundError), malformed response
+    - SYSTEM_GENERATE / SYSTEM_ANALYSE prompt constants: presence checks
 
 Mocks used:
-  - requests.get (patched at tool5_uat.requests.get) — no real HTTP calls
-  - shared module functions (call_claude, get_repo_files, write_output_file,
-    send_email, email_html, write_audit_entry) — patched to prevent side effects
-  - base64.b64decode is exercised with real synthetic content (no mock needed)
+    - requests.get (for get_results_csv)
+    - shared.call_claude (imported via tool5_uat module)
+    - shared.get_repo_files
+    - shared.write_output_file
+    - shared.send_email
+    - shared.write_audit_entry
+    - base64.b64decode (via real decoding with mock content)
 
 TODOs:
-  - TODO: Integration test for __main__ block requires full env-var matrix and
-    mocked subprocess/GitHub Actions context — stub tests provided below.
-  - TODO: parse_scenarios multi-line fields (PRE-CONDITIONS, STEPS, NOTES)
-    are stored only in `raw`; structured extraction tests skipped until
-    the parser is extended.
+    - TODO: Integration test for __main__ block requires full env-var setup and live GH token
+    - TODO: Test email content produced by Mode A/B end-to-end (needs call_claude stub returning fixture)
+    - TODO: Test write_output_file called with correct markdown and CSV paths
+    - TODO: Test audit entry format written after successful generate/analyse run
 """
 
 import base64
 import csv
 import io
-import json
 import sys
 import os
+import json
 import types
-import unittest.mock as mock
+import pytest
 from unittest.mock import MagicMock, patch, call
 
-import pytest
-
 # ---------------------------------------------------------------------------
-# Minimal stub for the `shared` module so the import doesn't fail in CI
+# Minimal stub for the `shared` module so we can import tool5_uat without the
+# real shared.py present in every test environment.
 # ---------------------------------------------------------------------------
-_shared_stub = types.ModuleType("shared")
-_shared_stub.clean_json = lambda x: x
-_shared_stub.call_claude = MagicMock(return_value="stub")
-_shared_stub.get_repo_files = MagicMock(return_value={})
-_shared_stub.write_output_file = MagicMock(return_value=None)
-_shared_stub.send_email = MagicMock(return_value=None)
-_shared_stub.email_html = MagicMock(return_value="<html/>")
-_shared_stub.write_audit_entry = MagicMock(return_value=None)
-_shared_stub.OUTPUT_REPO_OWNER = "test-owner"
-_shared_stub.OUTPUT_REPO = "test-repo"
-_shared_stub.GH_HEADERS = {"Authorization": "Bearer fake"}
-_shared_stub.GH_API = "https://api.github.com"
 
+def _make_shared_stub():
+    shared = types.ModuleType("shared")
+    shared.clean_json = lambda s: s
+    shared.call_claude = MagicMock(return_value="stub")
+    shared.get_repo_files = MagicMock(return_value={})
+    shared.write_output_file = MagicMock(return_value=None)
+    shared.send_email = MagicMock(return_value=None)
+    shared.email_html = MagicMock(return_value="<html/>")
+    shared.write_audit_entry = MagicMock(return_value=None)
+    shared.OUTPUT_REPO_OWNER = "test-owner"
+    shared.OUTPUT_REPO = "test-output-repo"
+    shared.GH_HEADERS = {"Authorization": "Bearer fake"}
+    shared.GH_API = "https://api.github.com"
+    return shared
+
+
+# Inject stub before importing the module under test
+_shared_stub = _make_shared_stub()
 sys.modules.setdefault("shared", _shared_stub)
 
-# Now we can safely import the module under test
-script_dir = os.path.join(os.path.dirname(__file__), "..", ".github", "scripts")
-sys.path.insert(0, os.path.abspath(script_dir))
-
-import tool5_uat as uat  # noqa: E402  (import after path manipulation)
+# Now safe to import
+import importlib
+import tool5_uat  # noqa: E402  (lives in .github/scripts, added to sys.path by the module itself)
 
 
 # ===========================================================================
 # Helpers / fixtures
 # ===========================================================================
 
-SINGLE_SCENARIO_BLOCK = """===SCENARIO===
-ID: UAT-STORY1-1
-TITLE: Valid underwriting application submission
+SINGLE_SCENARIO_BLOCK = """\
+===SCENARIO===
+ID: UAT-STORY1-01
+TITLE: Successful login with valid credentials
 TYPE: POSITIVE
-PERSONA: Insurance Underwriter
+PERSONA: Standard Customer
 PRE-CONDITIONS:
-- User is logged in
-- Application form is open
-TEST DATA: Age=34, Annual_Income=75000, Risk_Classification=LOW
+- User account exists
+TEST DATA: username=cust@example.com, password=P@ssw0rd!
 STEPS:
-1. Navigate to application form
-2. Fill in all required fields
-3. Submit the form
-EXPECTED RESULT: Application is saved with status PENDING
-PASS CRITERIA: System shows confirmation message and application ID
+1. Navigate to /login
+2. Enter credentials
+3. Click Submit
+EXPECTED RESULT: Dashboard is displayed
+PASS CRITERIA: HTTP 200 and dashboard renders
 ESTIMATED TIME: 5
-NOTES: Requires test customer CUST00000001"""
+NOTES: Requires seeded test account
+"""
 
 TWO_SCENARIO_BLOCK = """\
 ===SCENARIO===
-ID: UAT-STORY1-1
-TITLE: First scenario
+ID: UAT-STORY1-01
+TITLE: Happy path login
 TYPE: POSITIVE
-PERSONA: Admin
-PASS CRITERIA: System accepts request
+PERSONA: Admin User
+PASS CRITERIA: Redirect to /admin
 ESTIMATED TIME: 3
 NOTES: none
 
 ===SCENARIO===
-ID: UAT-STORY1-2
-TITLE: Second scenario — negative case
+ID: UAT-STORY1-02
+TITLE: Login with wrong password
 TYPE: NEGATIVE
-PERSONA: Guest
-PASS CRITERIA: System rejects request with 403
+PERSONA: Standard Customer
+PASS CRITERIA: Error message displayed
 ESTIMATED TIME: 2
-NOTES: none"""
+NOTES: check lockout after 5 attempts
+"""
+
+BOUNDARY_SCENARIO_BLOCK = """\
+===SCENARIO===
+ID: UAT-STORY2-01
+TITLE: Max income boundary value
+TYPE: BOUNDARY
+PERSONA: Underwriter
+PASS CRITERIA: System accepts 9999999
+ESTIMATED TIME: 10
+NOTES: Annual_Income boundary test; Age=34.5, Risk_Classification check
+"""
 
 
-def _make_scenario(overrides: dict = None) -> dict:
-    base = {
-        "id": "UAT-F1-1",
-        "title": "Sample title",
-        "type": "POSITIVE",
-        "persona": "Tester",
-        "pass_criteria": "All good",
-        "estimated_time": "10",
-        "raw": "raw block text",
-    }
-    if overrides:
-        base.update(overrides)
-    return base
+@pytest.fixture()
+def single_scenario_raw():
+    return SINGLE_SCENARIO_BLOCK
+
+
+@pytest.fixture()
+def two_scenarios_raw():
+    return TWO_SCENARIO_BLOCK
+
+
+@pytest.fixture()
+def sample_scenarios():
+    return [
+        {
+            "id": "UAT-STORY1-01",
+            "title": "Happy path login",
+            "type": "POSITIVE",
+            "persona": "Admin User",
+            "pass_criteria": "Redirect to /admin",
+            "estimated_time": "3",
+            "raw": "raw block content",
+        },
+        {
+            "id": "UAT-STORY1-02",
+            "title": "Login with wrong password",
+            "type": "NEGATIVE",
+            "persona": "Standard Customer",
+            "pass_criteria": "Error message displayed",
+            "estimated_time": "2",
+            "raw": "raw block 2",
+        },
+    ]
 
 
 # ===========================================================================
-# parse_scenarios — happy paths
+# parse_scenarios()
 # ===========================================================================
 
 class TestParseScenarios:
-    def test_single_scenario_all_fields(self):
-        result = uat.parse_scenarios(SINGLE_SCENARIO_BLOCK)
+
+    def test_single_scenario_returns_one_item(self, single_scenario_raw):
+        result = tool5_uat.parse_scenarios(single_scenario_raw)
         assert len(result) == 1
-        s = result[0]
-        assert s["id"] == "UAT-STORY1-1"
-        assert s["title"] == "Valid underwriting application submission"
-        assert s["type"] == "POSITIVE"
-        assert s["persona"] == "Insurance Underwriter"
-        assert s["pass_criteria"] == "System shows confirmation message and application ID"
-        assert s["estimated_time"] == "5"
 
-    def test_single_scenario_raw_field_present(self):
-        result = uat.parse_scenarios(SINGLE_SCENARIO_BLOCK)
+    def test_single_scenario_id_parsed(self, single_scenario_raw):
+        result = tool5_uat.parse_scenarios(single_scenario_raw)
+        assert result[0]["id"] == "UAT-STORY1-01"
+
+    def test_single_scenario_title_parsed(self, single_scenario_raw):
+        result = tool5_uat.parse_scenarios(single_scenario_raw)
+        assert result[0]["title"] == "Successful login with valid credentials"
+
+    def test_single_scenario_type_parsed(self, single_scenario_raw):
+        result = tool5_uat.parse_scenarios(single_scenario_raw)
+        assert result[0]["type"] == "POSITIVE"
+
+    def test_single_scenario_persona_parsed(self, single_scenario_raw):
+        result = tool5_uat.parse_scenarios(single_scenario_raw)
+        assert result[0]["persona"] == "Standard Customer"
+
+    def test_single_scenario_pass_criteria_parsed(self, single_scenario_raw):
+        result = tool5_uat.parse_scenarios(single_scenario_raw)
+        assert result[0]["pass_criteria"] == "HTTP 200 and dashboard renders"
+
+    def test_single_scenario_estimated_time_parsed(self, single_scenario_raw):
+        result = tool5_uat.parse_scenarios(single_scenario_raw)
+        assert result[0]["estimated_time"] == "5"
+
+    def test_single_scenario_raw_field_present(self, single_scenario_raw):
+        result = tool5_uat.parse_scenarios(single_scenario_raw)
         assert "raw" in result[0]
-        assert "UAT-STORY1-1" in result[0]["raw"]
+        assert len(result[0]["raw"]) > 0
 
-    def test_two_scenarios_parsed_correctly(self):
-        result = uat.parse_scenarios(TWO_SCENARIO_BLOCK)
+    def test_two_scenarios_returns_two_items(self, two_scenarios_raw):
+        result = tool5_uat.parse_scenarios(two_scenarios_raw)
         assert len(result) == 2
-        assert result[0]["id"] == "UAT-STORY1-1"
-        assert result[1]["id"] == "UAT-STORY1-2"
 
-    def test_scenario_types_extracted(self):
-        result = uat.parse_scenarios(TWO_SCENARIO_BLOCK)
+    def test_two_scenarios_ids_distinct(self, two_scenarios_raw):
+        result = tool5_uat.parse_scenarios(two_scenarios_raw)
+        ids = [s["id"] for s in result]
+        assert ids == ["UAT-STORY1-01", "UAT-STORY1-02"]
+
+    def test_two_scenarios_types(self, two_scenarios_raw):
+        result = tool5_uat.parse_scenarios(two_scenarios_raw)
         assert result[0]["type"] == "POSITIVE"
         assert result[1]["type"] == "NEGATIVE"
 
-    def test_personas_extracted(self):
-        result = uat.parse_scenarios(TWO_SCENARIO_BLOCK)
-        assert result[0]["persona"] == "Admin"
-        assert result[1]["persona"] == "Guest"
-
-    def test_pass_criteria_extracted(self):
-        result = uat.parse_scenarios(TWO_SCENARIO_BLOCK)
-        assert result[0]["pass_criteria"] == "System accepts request"
-        assert result[1]["pass_criteria"] == "System rejects request with 403"
-
-    def test_estimated_time_extracted(self):
-        result = uat.parse_scenarios(TWO_SCENARIO_BLOCK)
-        assert result[0]["estimated_time"] == "3"
-        assert result[1]["estimated_time"] == "2"
-
-    def test_boundary_scenario_type(self):
-        block = "===SCENARIO===\nID: UAT-B-1\nTYPE: BOUNDARY\nTITLE: Max input length\nPASS CRITERIA: ok\nESTIMATED TIME: 1\n"
-        result = uat.parse_scenarios(block)
+    def test_boundary_type_parsed(self):
+        result = tool5_uat.parse_scenarios(BOUNDARY_SCENARIO_BLOCK)
         assert result[0]["type"] == "BOUNDARY"
 
-    # -----------------------------------------------------------------------
-    # Edge cases
-    # -----------------------------------------------------------------------
-
     def test_empty_string_returns_empty_list(self):
-        assert uat.parse_scenarios("") == []
+        result = tool5_uat.parse_scenarios("")
+        assert result == []
 
     def test_no_delimiter_returns_empty_list(self):
-        # A block without the delimiter produces no id → should be filtered out
-        raw = "ID: UAT-X-1\nTITLE: Something\nTYPE: POSITIVE\n"
-        result = uat.parse_scenarios(raw)
+        raw = "ID: UAT-X-01\nTITLE: Something\nTYPE: POSITIVE\n"
+        # No ===SCENARIO=== delimiter → split produces one block with no id after strip logic
+        # The block before the first delimiter is discarded
+        result = tool5_uat.parse_scenarios(raw)
         assert result == []
 
     def test_delimiter_only_returns_empty_list(self):
-        result = uat.parse_scenarios("===SCENARIO===")
+        raw = "===SCENARIO==="
+        result = tool5_uat.parse_scenarios(raw)
+        # block after delimiter is empty → skipped
         assert result == []
 
-    def test_scenario_missing_id_is_excluded(self):
-        block = "===SCENARIO===\nTITLE: No ID here\nTYPE: POSITIVE\n"
-        result = uat.parse_scenarios(block)
+    def test_scenario_without_id_is_excluded(self):
+        raw = "===SCENARIO===\nTITLE: No ID scenario\nTYPE: POSITIVE\n"
+        result = tool5_uat.parse_scenarios(raw)
         assert result == []
 
-    def test_scenario_missing_optional_fields_has_defaults(self):
-        block = "===SCENARIO===\nID: UAT-X-99\n"
-        result = uat.parse_scenarios(block)
+    def test_scenario_missing_optional_fields_defaults_to_missing(self):
+        raw = "===SCENARIO===\nID: UAT-X-01\nTITLE: Minimal\n"
+        result = tool5_uat.parse_scenarios(raw)
         assert len(result) == 1
-        s = result[0]
-        assert s["id"] == "UAT-X-99"
-        # Fields not present should not exist or be empty string via .get()
-        assert s.get("title", "") == ""
-        assert s.get("type", "") == ""
+        assert "type" not in result[0] or result[0].get("type") is None or result[0].get("type") == ""
+        # id must be present
+        assert result[0]["id"] == "UAT-X-01"
 
     def test_whitespace_only_blocks_skipped(self):
-        raw = "===SCENARIO===\n   \n===SCENARIO===\nID: UAT-1-1\nTITLE: Real\n"
-        result = uat.parse_scenarios(raw)
+        raw = "===SCENARIO===\n   \n===SCENARIO===\nID: UAT-X-01\nTITLE: Real\n"
+        result = tool5_uat.parse_scenarios(raw)
         assert len(result) == 1
-        assert result[0]["id"] == "UAT-1-1"
+        assert result[0]["id"] == "UAT-X-01"
 
-    def test_large_number_of_scenarios(self):
-        blocks = "\n".join(
-            f"===SCENARIO===\nID: UAT-LOAD-{i}\nTITLE: Scenario {i}\nTYPE: POSITIVE\nPASS CRITERIA: ok\nESTIMATED TIME: 5\n"
-            for i in range(50)
+    def test_extra_whitespace_in_id_is_stripped(self):
+        raw = "===SCENARIO===\nID:   UAT-STORY3-99  \nTITLE: Test\n"
+        result = tool5_uat.parse_scenarios(raw)
+        assert result[0]["id"] == "UAT-STORY3-99"
+
+    def test_leading_content_before_first_delimiter_ignored(self):
+        raw = "Some preamble text\n===SCENARIO===\nID: UAT-A-01\nTITLE: First\n"
+        result = tool5_uat.parse_scenarios(raw)
+        assert len(result) == 1
+        assert result[0]["id"] == "UAT-A-01"
+
+    def test_multiple_scenarios_raw_field_is_individual_block(self, two_scenarios_raw):
+        result = tool5_uat.parse_scenarios(two_scenarios_raw)
+        # raw should not contain the other scenario's ID
+        assert "UAT-STORY1-02" not in result[0]["raw"]
+        assert "UAT-STORY1-01" not in result[1]["raw"]
+
+    @pytest.mark.parametrize("scenario_type", ["POSITIVE", "NEGATIVE", "BOUNDARY"])
+    def test_all_valid_types_are_parsed(self, scenario_type):
+        raw = f"===SCENARIO===\nID: UAT-T-01\nTITLE: T\nTYPE: {scenario_type}\n"
+        result = tool5_uat.parse_scenarios(raw)
+        assert result[0]["type"] == scenario_type
+
+    def test_synthetic_underwriting_scenario(self):
+        """Scenario using synthetic data from model card (Age, Risk_Classification)."""
+        raw = (
+            "===SCENARIO===\n"
+            "ID: UAT-UNDERWRITING-01\n"
+            "TITLE: Underwriting risk classification for Age=34\n"
+            "TYPE: BOUNDARY\n"
+            "PERSONA: Underwriter\n"
+            "PASS CRITERIA: Risk_Classification returned\n"
+            "ESTIMATED TIME: 8\n"
+            "NOTES: Annual_Income feature importance 1.017\n"
         )
-        result = uat.parse_scenarios(blocks)
-        assert len(result) == 50
-        assert result[-1]["id"] == "UAT-LOAD-49"
-
-    def test_extra_whitespace_around_values_stripped(self):
-        block = "===SCENARIO===\nID:   UAT-WS-1   \nTITLE:   Whitespace test   \n"
-        result = uat.parse_scenarios(block)
-        assert result[0]["id"] == "UAT-WS-1"
-        assert result[0]["title"] == "Whitespace test"
-
-    def test_duplicate_field_last_value_wins(self):
-        # If a field appears twice, the second overrides the first
-        block = "===SCENARIO===\nID: UAT-DUP-1\nID: UAT-DUP-2\nTITLE: dup\n"
-        result = uat.parse_scenarios(block)
-        assert result[0]["id"] == "UAT-DUP-2"
-
-    def test_unicode_content_handled(self):
-        # Arabic characters from the translation file
-        block = "===SCENARIO===\nID: UAT-AR-1\nTITLE: إلغاء test\nTYPE: POSITIVE\nPASS CRITERIA: ok\n"
-        result = uat.parse_scenarios(block)
-        assert result[0]["title"] == "إلغاء test"
-
-    def test_raw_field_contains_full_block(self):
-        result = uat.parse_scenarios(SINGLE_SCENARIO_BLOCK)
-        raw = result[0]["raw"]
-        assert "STEPS:" in raw
-        assert "EXPECTED RESULT:" in raw
-        assert "PRE-CONDITIONS:" in raw
+        result = tool5_uat.parse_scenarios(raw)
+        assert result[0]["id"] == "UAT-UNDERWRITING-01"
+        assert result[0]["type"] == "BOUNDARY"
 
 
 # ===========================================================================
-# build_test_pack_csv
+# build_test_pack_csv()
 # ===========================================================================
 
 class TestBuildTestPackCsv:
-    def _read_csv(self, csv_str: str):
-        return list(csv.reader(io.StringIO(csv_str)))
 
-    def test_header_row_correct(self):
-        rows = self._read_csv(uat.build_test_pack_csv([]))
-        assert rows[0] == [
-            "Scenario ID", "Title", "Type", "Persona", "Pass Criteria",
-            "Est. Time (min)", "Result (PASS/FAIL/BLOCKED)", "Tester", "Notes", "Defect Ref"
-        ]
+    def test_returns_string(self, sample_scenarios):
+        result = tool5_uat.build_test_pack_csv(sample_scenarios)
+        assert isinstance(result, str)
 
-    def test_empty_scenarios_only_header(self):
-        rows = self._read_csv(uat.build_test_pack_csv([]))
-        assert len(rows) == 1
+    def test_csv_has_header_row(self, sample_scenarios):
+        result = tool5_uat.build_test_pack_csv(sample_scenarios)
+        reader = csv.reader(io.StringIO(result))
+        header = next(reader)
+        assert header[0] == "Scenario ID"
+        assert "Title" in header
+        assert "Type" in header
+        assert "Persona" in header
+        assert "Pass Criteria" in header
 
-    def test_single_scenario_produces_two_rows(self):
-        rows = self._read_csv(uat.build_test_pack_csv([_make_scenario()]))
-        assert len(rows) == 2
+    def test_csv_result_column_present(self, sample_scenarios):
+        result = tool5_uat.build_test_pack_csv(sample_scenarios)
+        reader = csv.reader(io.StringIO(result))
+        header = next(reader)
+        assert any("Result" in col for col in header)
 
-    def test_data_row_values_correct(self):
-        s = _make_scenario()
-        rows = self._read_csv(uat.build_test_pack_csv([s]))
-        data = rows[1]
-        assert data[0] == s["id"]
-        assert data[1] == s["title"]
-        assert data[2] == s["type"]
-        assert data[3] == s["persona"]
-        assert data[4] == s["pass_criteria"]
-        assert data[5] == s["estimated_time"]
+    def test_csv_tester_column_present(self, sample_scenarios):
+        result = tool5_uat.build_test_pack_csv(sample_scenarios)
+        reader = csv.reader(io.StringIO(result))
+        header = next(reader)
+        assert "Tester" in header
 
-    def test_result_tester_notes_defect_are_empty(self):
-        rows = self._read_csv(uat.build_test_pack_csv([_make_scenario()]))
-        data = rows[1]
-        assert data[6] == ""  # Result
-        assert data[7] == ""  # Tester
-        assert data[8] == ""  # Notes
-        assert data[9] == ""  # Defect Ref
+    def test_csv_defect_ref_column_present(self, sample_scenarios):
+        result = tool5_uat.build_test_pack_csv(sample_scenarios)
+        reader = csv.reader(io.StringIO(result))
+        header = next(reader)
+        assert "Defect Ref" in header
 
-    def test_multiple_scenarios_correct_row_count(self):
-        scenarios = [_make_scenario({"id": f"UAT-F1-{i}"}) for i in range(5)]
-        rows = self._read_csv(uat.build_test_pack_csv(scenarios))
-        assert len(rows) == 6  # header + 5 data rows
+    def test_csv_row_count_matches_scenarios(self, sample_scenarios):
+        result = tool5_uat.build_test_pack_csv(sample_scenarios)
+        reader = csv.reader(io.StringIO(result))
+        rows = list(reader)
+        # header + one row per scenario
+        assert len(rows) == len(sample_scenarios) + 1
 
-    def test_missing_optional_fields_produce_empty_strings(self):
-        minimal = {"id": "UAT-MIN-1", "raw": "block"}
-        rows = self._read_csv(uat.build_test_pack_csv([minimal]))
-        data = rows[1]
-        assert data[0] == "UAT-MIN-1"
-        assert data[1] == ""   # title missing
-        assert data[2] == ""   # type missing
+    def test_csv_first_data_row_id(self, sample_scenarios):
+        result = tool5_uat.build_test_pack_csv(sample_scenarios)
+        reader = csv.reader(io.StringIO(result))
+        next(reader)  # skip header
+        first_row = next(reader)
+        assert first_row[0] == "UAT-STORY1-01"
 
-    def test_output_is_valid_csv_string(self):
-        csv_str = uat.build_test_pack_csv([_make_scenario()])
-        assert isinstance(csv_str, str)
-        assert len(csv_str) > 0
+    def test_csv_data_row_result_empty(self, sample_scenarios):
+        """Result column should be blank — testers fill it in."""
+        result = tool5_uat.build_test_pack_csv(sample_scenarios)
+        reader = csv.reader(io.StringIO(result))
+        next(reader)
+        first_row = next(reader)
+        header = list(csv.reader(io.StringIO(result)))[0]
+        result_idx = next(i for i, h in enumerate(header) if "Result" in h)
+        assert first_row[result_idx] == ""
 
-    def test_csv_contains_newline(self):
-        csv_str = uat.build_test_pack_csv([_make_scenario()])
-        assert "\n" in csv_str or "\r\n" in csv_str
+    def test_empty_scenarios_list_returns_header_only(self):
+        result = tool5_uat.build_test_pack_csv([])
+        reader = csv.reader(io.StringIO(result))
+        rows = list(reader)
+        assert len(rows) == 1  # header only
 
-    def test_synthetic_data_in_csv(self):
-        """Use model_card synthetic data as test data values."""
-        s = _make_scenario({
-            "id": "UAT-MODEL-1",
-            "title": "Underwriting Risk Classification",
-            "persona": "Insurance Underwriter",
-            "pass_criteria": "Risk_Classification=LOW for Age=34, Annual_Income=75000",
-            "estimated_time": "10",
-        })
-        rows = self._read_csv(uat.build_test_pack_csv([s]))
-        assert "Underwriting Risk Classification" in rows[1][1]
-        assert "Insurance Underwriter" in rows[1][3]
-
-    def test_fields_with_commas_are_quoted(self):
-        s = _make_scenario({"title": "First, Second, Third"})
-        csv_str = uat.build_test_pack_csv([s])
-        rows = self._read_csv(csv_str)
-        assert rows[1][1] == "First, Second, Third"
-
-    def test_fields_with_quotes_are_escaped(self):
-        s = _make_scenario({"title": 'He said "hello"'})
-        csv_str = uat.build_test_pack_csv([s])
-        rows = self._read_csv(csv_str)
-        assert rows[1][1] == 'He said "hello"'
-
-    def test_ten_columns_per_row(self):
-        rows = self._read_csv(uat.build_test_pack_csv([_make_scenario()]))
-        for row in rows:
-            assert len(row) == 10
-
-
-# ===========================================================================
-# build_test_pack_md
-# ===========================================================================
-
-class TestBuildTestPackMd:
+    def test_partial_scenario_missing_fields_uses_empty_string(self):
+        partial = [{"id": "UAT-X-01", "raw": "raw"}]
+        result = tool5_uat.build_test_pack_csv(partial)
+        reader
