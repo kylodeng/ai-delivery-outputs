@@ -4,7 +4,7 @@
 
 ## 1. Overview
 
-The Insurance Training Bot is a RAG-powered AI training platform designed to help new insurance agents learn product knowledge and sales techniques for a Hong Kong insurance context (Sun Life products). It consists of a FastAPI backend that exposes a LangGraph agent (teacher mode and assessor/roleplay mode), a frontend application, and a vector-store-backed retrieval system ingested from real insurance PDF product brochures. Users interact via a chat interface; the agent retrieves relevant insurance product details in real time, cites sources, and can assess trainees after roleplay sessions. A suite of five AI-augmented GitHub Actions CI/CD tools (code review, tech docs, business docs, auto-testing, and UAT) are also embedded in the repository to support the development lifecycle.
+The Insurance Training Bot is a RAG-powered (Retrieval-Augmented Generation) conversational AI system designed to train insurance sales agents. It ingests Sun Life Hong Kong insurance product PDFs into a vector store, then exposes two AI agent modes: a **Teacher agent** (ongoing interactive chat that teaches product knowledge, sales techniques, and discovery questioning) and an **Assessor agent** (one-shot post-roleplay scoring of a trainee's accuracy and technique). A customer **Roleplay mode** lets trainees practice sales conversations against an AI-simulated customer profile. The system is built with a FastAPI backend and (inferred) a separate frontend, both deployed to Azure App Service via GitHub Actions CI/CD. An LLM-powered annotation and chunking pipeline pre-processes PDFs into a vector store (supporting ChromaDB, FAISS, or Pinecone) to ground agent responses in verified product documentation.
 
 ---
 
@@ -12,57 +12,94 @@ The Insurance Training Bot is a RAG-powered AI training platform designed to hel
 
 | Resource | Type | Cloud Provider | Purpose |
 |---|---|---|---|
-| `training-bot-api` | Azure App Service (Web App) | Azure | Hosts the FastAPI backend / LangGraph agent |
-| `training-bot-frontend` | Azure App Service (Web App) | Azure | Hosts the frontend chat UI |
-| Vector Store (ChromaDB / FAISS / Pinecone) | Embedded or managed vector DB | Azure / Local / Pinecone | Stores and retrieves insurance PDF chunks for RAG |
-| GitHub Actions Runners | CI/CD compute (ubuntu-latest) | GitHub (Microsoft) | Test, build, and deploy workflows |
-| `ai-delivery-outputs` | GitHub Repository | GitHub | Stores AI-generated docs, review reports, test files, UAT packs |
-| OpenRouter / LLM endpoint | External API | OpenRouter.ai | Serves LLM inference for the training agent (GPT-class models) |
-| Anthropic Claude API | External API | Anthropic | Powers code review, tech docs, business docs, auto-testing, and UAT workflows |
-| SendGrid | External Email API | Twilio/SendGrid | Sends notification emails for AI workflow outputs |
-| Voyage AI (embedding) | External API | Voyage AI | Embeds PDF chunks during ingestion (referenced in `ingest.py` rate-limit comment) |
-| PDF data files | Static file store | Azure App Service file system | Insurance brochures served over `/docs/` HTTP path |
-| `sessions.json` | Local file | Azure App Service file system | Persists multi-turn conversation sessions across restarts |
+| `training-bot-api` | App Service (Web App) | Azure | Hosts the FastAPI backend (chat, ingest, session management) |
+| `training-bot-frontend` | App Service (Web App) | Azure | Hosts the frontend UI (Chainlit or Vite-based) |
+| Vector Store (ChromaDB / FAISS / Pinecone) | Persistent storage / SaaS | Azure (local disk) / Pinecone SaaS | Stores document embeddings for RAG retrieval |
+| Sessions File (`data/sessions.json`) | File-based persistence | Azure (local App Service storage) | Persists multi-turn conversation sessions across restarts |
+| Static file mount (`/docs`) | StaticFiles endpoint | Azure (via FastAPI) | Serves raw PDFs and data files over HTTP for citation links |
+| GitHub Actions Runners | CI/CD compute | GitHub (ubuntu-latest) | Test, build, and deploy pipelines |
+| `ai-delivery-outputs` | GitHub Repository | GitHub | Output sink for AI-generated code review reports, tech docs, UAT packs |
+| Anthropic Claude API (`claude-sonnet-4-6`) | External LLM API | Anthropic | Powers AI delivery tooling (code review, tech docs, business docs, UAT) |
+| OpenRouter / Custom OpenAI-compatible endpoint | External LLM API | OpenRouter (or configurable) | Powers teacher agent, assessor agent, and roleplay customer simulation |
+| Voyage AI (inferred) | Embedding API | Voyage AI (SaaS) | Generates embeddings for PDF chunks during ingestion |
+| SendGrid | Email API | Twilio/SendGrid SaaS | Sends notification emails after AI tooling workflow runs |
 
 ---
 
 ## 3. Data Flow
 
-1. **Ingestion (offline / admin-triggered):** An operator calls `POST /ingest` on the FastAPI backend. `core/ingest.py` walks the `data/Insurance-product-info/` directory, reads each PDF with `pdfplumber`, and passes pages to `core/annotator.py`, which calls the configured LLM (Anthropic via OpenRouter) to extract product metadata and page relevance annotations. Results are cached as `.annot.json` sidecar files alongside each PDF.
-2. **Chunking:** Relevant pages are passed through `core/chunker.py`, which heuristically splits text into semantic units (headings, bullets, paragraphs) capped at `max_words` (default 280).
-3. **Embedding:** `core/ingest.py::embed_chunks()` batches chunks and sends them to Voyage AI (or the configured embedding provider) to generate dense vectors, which are stored in the vector store (Chroma, FAISS, or Pinecone). The index is persisted to disk via `store.save()`.
-4. **Application startup:** On FastAPI startup (`lifespan()`), `get_vector_store()` loads the persisted index and `make_rag_tools()` wraps it in LangChain tool objects. `load_sessions()` hydrates in-memory session state from `sessions.json`.
-5. **User sends a chat message:** The frontend POSTs a message to the FastAPI backend (`/chat` or similar streaming endpoint). The backend resolves the session, selects teacher or roleplay mode, and invokes the appropriate LangGraph agent.
-6. **Teacher agent — tool calls:** The LangGraph teacher agent calls one or more RAG tools (`search_product`, `search_all`, `compare_plans`, etc.). Each tool queries the vector store, retrieves ranked chunks, and appends source metadata to a per-request `contextvars` list (`_sources_ctx`).
-7. **Teacher agent — LLM inference:** Retrieved chunks and the conversation history are sent to OpenRouter (GPT-class model) for response generation. The agent streams tokens back to the FastAPI handler.
-8. **Streaming response:** FastAPI uses `StreamingResponse` to push SSE/token chunks to the frontend in real time. After streaming, collected source citations are sent as a final structured payload.
-9. **Roleplay / assessment mode:** The user selects roleplay mode; the backend generates a random `CustomerProfile` (from `api/sessions.py`), instantiates a roleplay system prompt, and runs a customer-persona LLM. When the session ends, the assessor agent is invoked via `ainvoke`, uses the same RAG tools to verify factual claims, and returns a scored assessment JSON.
-10. **Session persistence:** After each turn, session state (messages, profile, mode) is written back to `data/sessions.json`.
-11. **CI/CD tools (parallel flow):** On PR or push to `main`, GitHub Actions workflows invoke Python scripts (`.github/scripts/tool1–5`), which call the Anthropic Claude API, write outputs to the `ai-delivery-outputs` repo via GitHub API, post PR comments, and send notification emails via SendGrid.
+### 3a. Document Ingestion (One-time / On-demand)
+
+1. An operator calls `POST /ingest` (or runs `core/ingest.py` directly) pointing at the `data/Insurance-product-info/` directory.
+2. `ingest_directory()` walks all PDFs recursively; for each PDF it calls `load_or_create_annotations()`.
+3. If no `.annot.json` sidecar exists, the annotator calls the configured LLM (Claude via OpenRouter) to produce document-level metadata (product name, type, summary) and per-page relevance flags; results are cached to `<pdf>.annot.json`.
+4. Relevant pages are passed to `extract_chunks_from_pdf()`, which uses `pdfplumber` to extract text, cleans it, splits into semantic units (headings, bullets, paragraphs), and emits chunk dicts with metadata (product name, page numbers, section title, file URI).
+5. `embed_chunks()` sends chunk batches to the embedding model (Voyage AI inferred from batch rate-limit comments) and writes vectors + metadata into the selected vector store (ChromaDB, FAISS, or Pinecone).
+6. The vector store index is persisted to disk via `store.save()`.
+
+### 3b. Teacher Mode — Chat Request
+
+1. A user sends a chat message via the frontend to `POST /chat` (or equivalent streaming endpoint) on the FastAPI backend.
+2. The backend retrieves or creates a `Session` object (from in-memory dict backed by `data/sessions.json`).
+3. `make_teacher_agent()` constructs a LangGraph agent with the shared LLM and the eight RAG tools.
+4. `reset_sources()` initialises a fresh per-request source tracking context variable.
+5. The agent streams events via `astream_events`; for each tool call, the appropriate RAG tool (e.g. `search_product`, `compare_plans`) queries the vector store, collects source metadata via `_collect_sources()`, and returns ranked text chunks with source IDs (`[S1]`, `[S2]`, …).
+6. The agent's LLM synthesises a response, inserting inline citation markers (`[[S1]]`) for facts drawn from retrieved chunks.
+7. The FastAPI backend streams the response back to the frontend as Server-Sent Events; source metadata is appended after the stream for the UI to render as citation links pointing to `/docs/<path>/<file>.pdf`.
+
+### 3c. Roleplay Mode
+
+1. The user requests a new roleplay session; the backend calls `generate_profile()` which randomly assembles a `CustomerProfile` from Hong Kong–contextualised demographic pools.
+2. The frontend receives the profile summary; subsequent user messages are sent to a roleplay endpoint.
+3. The backend invokes the roleplay system prompt (embedding the customer profile) against the LLM without RAG tools — the LLM simulates the customer persona.
+4. On session end, the frontend triggers assessment mode.
+
+### 3d. Assessment Mode
+
+1. The full roleplay conversation history and customer profile are passed to `make_assessor_agent()`.
+2. The assessor agent invokes the same eight RAG tools to fact-check every product claim the trainee made against the vector store.
+3. A structured scorecard is returned (five dimensions) and stored on the session object; the session is persisted to `data/sessions.json`.
+
+### 3e. CI/CD Pipeline (Push to `main`)
+
+1. Developer pushes to `main`; GitHub Actions triggers `deploy.yml`.
+2. `test` job runs `pytest tests/` with Python 3.13 + `uv`.
+3. On test pass, `deploy-api` and `deploy-frontend` jobs run in parallel; `uv export` generates `requirements.txt`; `azure/webapps-deploy@v3` deploys each App Service using publish profiles stored as GitHub Secrets.
+
+### 3f. AI Delivery Tooling (Auxiliary Workflows)
+
+1. On PR open/sync, `tool1_code_review.yml` fetches the PR diff, sends it to Claude (`claude-sonnet-4-6`), parses a structured JSON review, posts a PR comment, writes a JSON report to `ai-delivery-outputs`, and emails the result via SendGrid.
+2. On merge to `main`, `tool2_tech_docs.yml` fetches all source and IaC files, generates README, architecture doc, and runbook via Claude, and commits them to `ai-delivery-outputs`.
+3. On version tag push, `tool3_business_docs.yml` generates a Solution Overview Document and gap questionnaire via Claude.
+4. On PR open/sync affecting `src/**`, `tool4_auto_testing.yml` generates or gap-analyses test files via Claude.
+5. On `release/*` branch creation, `tool5_uat.yml` generates a UAT test pack (CSV + markdown) or analyses completed test results via Claude.
 
 ---
 
 ## 4. Security Posture
 
-### What is secured
+### ✅ What is secured
 
-- **Secrets management:** All sensitive keys (`AZURE_WEBAPP_PUBLISH_PROFILE_API`, `AZURE_WEBAPP_PUBLISH_PROFILE_FRONTEND`, `ANTHROPIC_API_KEY`, `GH_TOKEN`, `SENDGRID_API_KEY`) are stored as GitHub Actions encrypted secrets and injected as environment variables at runtime — not hardcoded in source.
-- **CORS policy:** The FastAPI app restricts CORS to explicit origins (`localhost:5173`, `localhost:8000`) for local development. [TODO: Verify production CORS origins are restricted to the Azure App Service URL and not left as localhost-only or wildcard in production config.]
-- **Session isolation:** Sessions are keyed by UUID; there is no evidence of session fixation vulnerabilities in the session management code.
-- **Dependency management:** `uv` is used for reproducible dependency resolution, and `requirements.txt` is generated from the lockfile before deployment.
+- **GitHub Secrets** are used for all credentials (`AZURE_WEBAPP_PUBLISH_PROFILE_API`, `AZURE_WEBAPP_PUBLISH_PROFILE_FRONTEND`, `ANTHROPIC_API_KEY`, `GH_TOKEN`, `SENDGRID_API_KEY`) — secrets are not hardcoded in workflow files.
+- **CI gate**: Deployments require passing `pytest` tests before any deployment job runs.
+- **Deployment-only on `main`**: The `deploy-api` and `deploy-frontend` jobs are guarded by `github.ref == 'refs/heads/main' && github.event_name == 'push'`.
+- **CORS restriction**: The backend explicitly allows only `localhost:5173`, `localhost:8000`, and their `127.0.0.1` equivalents — not a wildcard `*` in the allow-origins list.
+- **API key via environment variable** (`API_KEY`) for the LLM backend rather than hardcoded.
+- **`SecretStr` wrapping** of the API key in `ChatOpenAI` instantiation prevents accidental logging.
 
-### What is NOT secured — gaps and risks
+### ❌ Gaps and explicit security concerns
 
-- ⚠️ **TLS/SSL verification disabled:** `httpx.Client(verify=False)` and `httpx.AsyncClient(verify=False)` are used for all LLM API calls in `api/main.py` and `core/ingest.py`. This disables certificate validation and exposes the system to man-in-the-middle attacks against the LLM provider endpoints. **This must be fixed before production use.**
-- ⚠️ **No authentication or authorisation on the API:** There is no evidence of any auth middleware (API key gate, OAuth, JWT) on the FastAPI endpoints. Any user who can reach the App Service URL can invoke the agent, trigger ingestion, and access session data.
-- ⚠️ **`sessions.json` stored on App Service local filesystem:** Azure App Service local disk is ephemeral and not replicated. Session data will be lost on restart, slot swap, or scale-out. There is no Azure Blob or database-backed session store.
-- ⚠️ **PDF data files served unauthenticated over HTTP (`/docs/`):** All insurance product PDFs (including potentially proprietary Sun Life brochures) are mounted as a public static file endpoint with no access control.
-- ⚠️ **`API_KEY` defaults to empty string:** `_API_KEY = os.getenv("API_KEY", "")` means if the env var is missing, requests to OpenRouter will be sent with an empty key — likely a silent failure or hitting a public/unauthenticated tier.
-- ⚠️ **CORS allows all methods and headers:** `allow_methods=["*"]` and `allow_headers=["*"]` is broader than necessary.
-- ⚠️ **No encryption at rest specified for the vector store:** The ChromaDB/FAISS index files are written to disk with no explicit encryption configuration. If the App Service file system or any local disk is compromised, all embedded document content is exposed.
-- ⚠️ **`GH_TOKEN` secret has unknown scope:** The `GH_TOKEN` is used to write to `ai-delivery-outputs` repo and post PR comments. The required scope is not documented. If over-provisioned (e.g., full repo write across org), this is a significant blast-radius risk. [TODO: Document minimum required GitHub token scopes and enforce least-privilege.]
-- ⚠️ **No WAF or network-level protection documented** in front of the Azure App Service instances.
-- ⚠️ **No secrets rotation policy** is evident for any of the API keys.
+- **TLS verification is disabled**: `httpx.Client(verify=False)` and `httpx.AsyncClient(verify=False)` are used for all LLM API calls. This disables SSL certificate verification, opening the application to man-in-the-middle attacks on all outbound LLM traffic. **This must be fixed before production use.**
+- **No authentication on FastAPI endpoints**: There is no API key, JWT, OAuth, or any other authentication middleware visible on the FastAPI app. Any caller who can reach `training-bot-api` can invoke chat, ingest, and session management endpoints.
+- **Sessions persisted to a plain JSON file** (`data/sessions.json`) on local App Service disk — no encryption at rest. Conversation history (potentially containing PII from roleplay customer profiles) is stored unencrypted.
+- **PDF/data files served unauthenticated** via `app.mount("/docs", StaticFiles(...))` — all ingested insurance documents are publicly accessible to anyone who can reach the API host.
+- **No HTTPS enforcement** configured at the application layer (may be handled by Azure App Service, but not explicit in IaC — [TODO: confirm Azure App Service HTTPS-only flag is enabled]).
+- **No secrets management service**: Secrets are stored only as GitHub Secrets and (at runtime) environment variables. There is no Azure Key Vault integration.
+- **`GH_TOKEN` scope is unknown**: The `GH_TOKEN` used by AI tooling workflows can write to `ai-delivery-outputs` and post PR comments — [TODO: confirm this is a fine-grained PAT scoped to minimum necessary repos/permissions, not a classic full-scope token].
+- **No rate limiting or input validation** on the chat/ingest endpoints — vulnerable to prompt injection and resource exhaustion.
+- **CORS allows `allow_methods=["*"]` and `allow_headers=["*"]`** — overly broad; should be restricted to the specific HTTP methods and headers the frontend uses.
+- **No WAF or DDoS protection** configured (not visible in IaC).
+- **Ingestion LLM configured with `verify=False`**: Same SSL bypass issue as above in `_build_ingest_llm()`.
 
 ---
 
@@ -70,21 +107,19 @@ The Insurance Training Bot is a RAG-powered AI training platform designed to hel
 
 | Name | Required | Sensitivity | Where set |
 |---|---|---|---|
-| `API_KEY` | Yes | 🔴 High — LLM API key (OpenRouter) | App Service env / `.env` file locally |
-| `OPENAI_URL_BASE` | No | Low | App Service env / `.env` (defaults to `https://openrouter.ai/api/v1`) |
-| `OPENAI_MODEL` | No | Low | App Service env / `.env` (defaults to `openai/gpt-oss-20b:free`) |
-| `SHOW_TOOL_CALLS` | No | Low | App Service env / `.env` |
-| `ANTHROPIC_API_KEY` | Yes (CI tools) | 🔴 High — Anthropic API key | GitHub Actions secret |
-| `GH_TOKEN` | Yes (CI tools) | 🔴 High — GitHub PAT | GitHub Actions secret |
-| `SENDGRID_API_KEY` | Yes (CI tools) | 🔴 High — SendGrid API key | GitHub Actions secret |
-| `AZURE_WEBAPP_PUBLISH_PROFILE_API` | Yes (deploy) | 🔴 High — Azure deployment credential | GitHub Actions secret |
-| `AZURE_WEBAPP_PUBLISH_PROFILE_FRONTEND` | Yes (deploy) | 🔴 High — Azure deployment credential | GitHub Actions secret |
-| `OUTPUT_REPO` | No (CI tools) | Low | GitHub Actions env (defaults to `ai-delivery-outputs`) |
-| `OUTPUT_REPO_OWNER` | No (CI tools) | Low | GitHub Actions env (defaults to repo owner) |
-| `NOTIFY_EMAIL` | No (CI tools) | Low | GitHub Actions env (hardcoded to `kylo.deng@capco.com`) |
-| `SENDER_EMAIL` | No (CI tools) | Low | GitHub Actions env (hardcoded to `noreply@ai-delivery.capco.com`) |
-
-> ⚠️ **Note:** `NOTIFY_EMAIL` and `SENDER_EMAIL` are hardcoded directly in workflow YAML files (not secrets). While not sensitive, they reduce portability and should be parameterised.
+| `API_KEY` | Yes | **High** — LLM API key | App Service environment variable / `.env` locally |
+| `OPENAI_URL_BASE` | No | Low | App Service environment variable / `.env` (defaults to `https://openrouter.ai/api/v1`) |
+| `OPENAI_MODEL` | No | Low | App Service environment variable / `.env` (defaults to `openai/gpt-oss-20b:free`) |
+| `SHOW_TOOL_CALLS` | No | Low | App Service environment variable / `.env` (defaults to `true`) |
+| `ANTHROPIC_API_KEY` | Yes (AI tooling workflows) | **High** — Anthropic API key | GitHub Secret |
+| `GH_TOKEN` | Yes (AI tooling workflows) | **High** — GitHub PAT | GitHub Secret |
+| `SENDGRID_API_KEY` | Yes (AI tooling workflows) | **High** — SendGrid API key | GitHub Secret |
+| `AZURE_WEBAPP_PUBLISH_PROFILE_API` | Yes (deploy workflow) | **High** — Azure deployment credential | GitHub Secret |
+| `AZURE_WEBAPP_PUBLISH_PROFILE_FRONTEND` | Yes (deploy workflow) | **High** — Azure deployment credential | GitHub Secret |
+| `OUTPUT_REPO` | No | Low | Workflow env (defaults to `ai-delivery-outputs`) |
+| `OUTPUT_REPO_OWNER` | No | Low | Workflow env (derived from `github.repository_owner`) |
+| `NOTIFY_EMAIL` | No | Low | Workflow env (hardcoded to `kylo.deng@capco.com`) |
+| `SENDER_EMAIL` | No | Low | Workflow env (hardcoded to `noreply@ai-delivery.capco.com`) |
 
 ---
 
@@ -92,97 +127,76 @@ The Insurance Training Bot is a RAG-powered AI training platform designed to hel
 
 | Dependency | Type | Purpose | Notes |
 |---|---|---|---|
-| OpenRouter (`https://openrouter.ai/api/v1`) | External API | LLM inference for training agent (teacher + roleplay + assessor) | Proxies multiple LLM providers; default model `openai/gpt-oss-20b:free` |
-| Anthropic Claude API | External API | LLM for CI/CD AI tools (code review, docs, testing, UAT) | Model `claude-sonnet-4-6` hardcoded in `shared.py` |
-| Voyage AI | External API | Text embedding for PDF chunks during ingestion | Rate-limit comments suggest free tier (3 RPM) is the baseline |
-| Pinecone | External API (optional) | Managed vector store backend | Optional; `PineconeStore` implemented in `core/vector_store.py` |
-| SendGrid | External API | Email notifications for CI tool outputs | Requires valid sending domain (`ai-delivery.capco.com`) |
-| GitHub API (`https://api.github.com`) | External API | Reading source repos, posting PR comments, writing output repo files | Used by all 5 CI scripts via `shared.py` |
-| `ai-delivery-outputs` (GitHub repo) | External repo | Stores all AI-generated documentation, test files, review reports | Must exist under the same GitHub org/owner |
-| Azure App Service | Cloud platform | Hosting API and frontend | App names: `training-bot-api`, `training-bot-frontend` |
-| LangChain / LangGraph | Python library | Agent orchestration, tool binding, streaming | Core agent framework |
-| `pdfplumber` | Python library | PDF text extraction for ingestion | |
-| ChromaDB / FAISS | Python library | Local vector store backends | |
-| `uv` | Build tool | Python dependency management and lockfile | |
-| `httpx` | Python library | HTTP client for LLM API calls | **SSL verification disabled — see security section** |
+| **Anthropic Claude API** (`claude-sonnet-4-6`) | External SaaS API | AI delivery tooling (code review, doc gen, UAT) | Requires `ANTHROPIC_API_KEY` |
+| **OpenRouter** (or compatible OpenAI endpoint) | External SaaS API | Teacher agent, assessor agent, roleplay LLM, ingestion annotation LLM | Configurable via `OPENAI_URL_BASE`; SSL verification disabled |
+| **Voyage AI** (inferred) | External SaaS API | Document chunk embedding | Inferred from batch rate-limit comments (3 RPM free tier); [TODO: confirm embedding provider] |
+| **Pinecone** (optional) | External SaaS | Vector store backend (alternative to local FAISS/Chroma) | Only used if `PineconeStore` is selected |
+| **SendGrid** | External SaaS API | Email notifications from AI tooling workflows | Requires `SENDGRID_API_KEY` |
+| **Azure App Service** | Cloud PaaS | Runtime hosting for API and frontend | Requires publish profiles |
+| **GitHub** (`ai-delivery-outputs` repo) | External repo | Output sink for AI-generated reports and documentation | Requires `GH_TOKEN` with write access |
+| **pdfplumber** | Python library | PDF text extraction during ingestion | Local dependency |
+| **LangChain / LangGraph** | Python library | Agent orchestration, tool wiring, RAG pipeline | Core framework |
+| **FastAPI** | Python library | HTTP API framework | Core framework |
+| **ChromaDB / FAISS** | Python library | Local vector store backends | Used when Pinecone not configured |
+| **httpx** | Python library | HTTP client for LLM calls | SSL verification currently disabled |
+| **`uv`** | Build tool | Python dependency management and packaging | Used in CI/CD |
 
 ---
 
 ## 7. Deployment Instructions
 
 ### Prerequisites
+- Azure App Services `training-bot-api` and `training-bot-frontend` already provisioned.
+- GitHub Secrets configured: `AZURE_WEBAPP_PUBLISH_PROFILE_API`, `AZURE_WEBAPP_PUBLISH_PROFILE_FRONTEND`, `ANTHROPIC_API_KEY`, `GH_TOKEN`, `SENDGRID_API_KEY`.
+- App Service environment variables set: `API_KEY`, `OPENAI_URL_BASE`, `OPENAI_MODEL`.
 
-- Azure App Services `training-bot-api` and `training-bot-frontend` must be pre-created in Azure.
-- GitHub secrets must be configured (see Section 5).
-- The `ai-delivery-outputs` repository must exist under the same GitHub owner.
-
-### Automated deployment (via GitHub Actions)
-
+### Automatic Deployment (via GitHub Actions)
 ```bash
-# Deployment is triggered automatically on push to main branch.
-# Ensure all required secrets are set in: Settings → Secrets and variables → Actions
-
+# Push to main branch — triggers test + deploy pipeline automatically
 git push origin main
-# GitHub Actions will:
-# 1. Run: uv run pytest tests/ -v
-# 2. On success: deploy API to training-bot-api (Azure App Service)
-# 3. On success: deploy Frontend to training-bot-frontend (Azure App Service)
 ```
 
-### Manual local setup
-
+### Manual Local Setup
 ```bash
-# 1. Clone the repository
-git clone https://github.com/kylodeng/Insurance-Training-Bot-main.git
-cd Insurance-Training-Bot-main
+# 1. Install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# 2. Install uv (if not already installed)
-curl -Lf https://astral.sh/uv/install.sh | sh
-
-# 3. Install dependencies
+# 2. Install dependencies
 uv sync
 
-# 4. Configure environment variables
-cp .env.example .env   # [TODO: confirm .env.example exists]
-# Edit .env and set:
-#   API_KEY=<your OpenRouter or LLM API key>
-#   OPENAI_URL_BASE=https://openrouter.ai/api/v1
-#   OPENAI_MODEL=<model name>
+# 3. Copy and configure environment
+cp .env.example .env
+# Edit .env: set API_KEY, OPENAI_URL_BASE, OPENAI_MODEL
 
-# 5. Ingest PDF documents into the vector store
-uv run python -m core.ingest --pdf-dir data/Insurance-product-info --verbose
+# 4. Ingest PDFs into vector store (one-time)
+uv run python -m core.ingest --pdf-dir data/Insurance-product-info/
 
-# 6. Start the FastAPI backend
-uv run uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+# 5. Run the API server locally
+uv run uvicorn api.main:app --reload --port 8000
 
-# 7. Run tests
+# 6. Run tests
 uv run pytest tests/ -v
 ```
 
-### Generate and export requirements (for Azure deployment)
-
+### Manual Azure Deployment (without GitHub Actions)
 ```bash
+# 1. Generate requirements.txt
 uv export --no-dev --format requirements-txt -o requirements.txt
+
+# 2. Deploy API using Azure CLI
+az webapp deploy --resource-group <rg-name> \
+  --name training-bot-api \
+  --src-path . \
+  --type zip
+
+# 3. Deploy frontend
+az webapp deploy --resource-group <rg-name> \
+  --name training-bot-frontend \
+  --src-path . \
+  --type zip
 ```
 
----
-
-## 8. Risks and TODOs
-
-### Critical risks
-
-| Risk | Severity | Detail |
-|---|---|---|
-| SSL verification disabled | 🔴 Critical | `httpx.Client(verify=False)` in `api/main.py` and `core/ingest.py` — MITM vulnerability against all LLM API traffic |
-| No API authentication | 🔴 Critical | FastAPI backend has no auth layer; any internet user reaching the App Service URL can use the bot and trigger ingestion |
-| PDF files served publicly | 🔴 High | `/docs/` static mount serves all insurance PDFs without access control; proprietary Sun Life documents may be exposed |
-| Session data on ephemeral disk | 🔴 High | `sessions.json` will be lost on App Service restart, scale-out, or slot swap |
-| Empty API_KEY default | 🟠 High | `os.getenv("API_KEY", "")` silently allows deployment with no LLM key |
-
-### Missing operational capabilities
-
-- **No disaster recovery (DR):** Single-region Azure deployment with no documented failover, backup, or geo-redundancy strategy.
-- **No monitoring or alerting:** No Application Insights, health check endpoints, or alerting configuration is present. [TODO: Add Azure Monitor / Application Insights to both App Services.]
-- **No logging aggregation:** `logging.basicConfig(level=logging.INFO)` logs to stdout only; no structured logging sink (e.g., Azure Log Analytics) is configured.
-- **No rate limiting:** The API has no rate limiting or throttling to prevent abuse or runaway LLM costs.
-- **No vector store backup:** The Chroma/FAISS
+### Triggering AI Tooling Workflows Manually
+```bash
+# Code review on a specific PR
+gh workflow run tool1_code_review.yml \
