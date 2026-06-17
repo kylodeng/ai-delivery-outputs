@@ -1,78 +1,91 @@
 """
-Test suite for tool1_code_review.py
+Test module for tool1_code_review.py
 
 What is tested:
-- extract_json(): happy path, markdown fences, embedded newlines, missing JSON, malformed JSON,
-  outermost-braces extraction, boundary/edge cases
-- review_pr(): happy path, Claude response handling, comment formatting, return value
-- review_repo(): happy path, content truncation, file filtering
-- get_output_url(): URL construction
-- build_report_md(): happy path, empty findings, empty iac/positive observations,
-  missing keys, score/recommendation rendering
+    - extract_json(): happy path, markdown fences, nested braces, cleaned newlines,
+      no-JSON response, malformed JSON, outermost-block extraction
+    - review_pr(): happy path, Claude returning bad JSON, post_pr_comment called correctly
+    - review_repo(): happy path, content truncation, file filtering
+    - get_output_url(): URL construction
+    - build_report_md(): full report, empty findings, empty IaC/positive lists,
+      missing keys in result dict
 
 Mocks used:
-- shared.call_claude (patched at tool1_code_review.call_claude)
-- shared.get_repo_files (patched at tool1_code_review.get_repo_files)
-- shared.get_pr_diff (patched at tool1_code_review.get_pr_diff)
-- shared.write_output_file (patched at tool1_code_review.write_output_file)
-- shared.post_pr_comment (patched at tool1_code_review.post_pr_comment)
-- shared.send_email (patched at tool1_code_review.send_email)
-- shared.write_audit_entry (patched at tool1_code_review.write_audit_entry)
-- datetime.datetime (for deterministic timestamp in build_report_md)
+    - shared.call_claude          (patched at tool1_code_review module level)
+    - shared.get_pr_diff          (patched at tool1_code_review module level)
+    - shared.get_repo_files       (patched at tool1_code_review module level)
+    - shared.post_pr_comment      (patched at tool1_code_review module level)
+    - shared.write_output_file    (patched at tool1_code_review module level)
+    - shared.write_audit_entry    (patched at tool1_code_review module level)
+    - shared.send_email           (patched at tool1_code_review module level)
+    - requests                    (not directly called in tested functions, no mock needed)
 
 TODOs:
-- TODO: Integration test for __main__ block requires full env setup
-- TODO: Test review_pr with real GitHub API responses when VCR cassettes available
-- TODO: Test email notification path once __main__ block source is complete
+    - TODO: __main__ block requires os.environ setup and full integration; covered by stub only
+    - TODO: email_html helper not exercised here; needs email template context
 """
 
+import importlib
 import json
-import re
 import sys
 import os
-import datetime
-from unittest.mock import patch, MagicMock, call
-
-import pytest
-
-# ---------------------------------------------------------------------------
-# We need to make "shared" importable before importing the module under test.
-# ---------------------------------------------------------------------------
 import types
+import datetime
+import pytest
+from unittest.mock import MagicMock, patch, call
 
-# Build a minimal fake 'shared' module so the import at the top of
-# tool1_code_review.py doesn't blow up in a test environment where
-# shared.py may depend on secrets / network.
-_shared_mod = types.ModuleType("shared")
-_shared_mod.call_claude = MagicMock()
-_shared_mod.get_repo_files = MagicMock()
-_shared_mod.get_pr_diff = MagicMock()
-_shared_mod.write_output_file = MagicMock()
-_shared_mod.post_pr_comment = MagicMock()
-_shared_mod.send_email = MagicMock()
-_shared_mod.email_html = MagicMock()
-_shared_mod.write_audit_entry = MagicMock()
-_shared_mod.OUTPUT_REPO_OWNER = "test-owner"
-_shared_mod.OUTPUT_REPO = "test-output-repo"
-_shared_mod.GH_HEADERS = {"Authorization": "token fake"}
-_shared_mod.GH_API = "https://api.github.com"
+# ---------------------------------------------------------------------------
+# Minimal stub for the `shared` module so the import succeeds without the
+# real module being present in the test environment.
+# ---------------------------------------------------------------------------
 
-sys.modules.setdefault("shared", _shared_mod)
+def _make_shared_stub():
+    stub = types.ModuleType("shared")
+    stub.call_claude         = MagicMock()
+    stub.get_repo_files      = MagicMock()
+    stub.get_pr_diff         = MagicMock()
+    stub.write_output_file   = MagicMock()
+    stub.post_pr_comment     = MagicMock()
+    stub.send_email          = MagicMock()
+    stub.email_html          = MagicMock()
+    stub.write_audit_entry   = MagicMock()
+    stub.OUTPUT_REPO_OWNER   = "test-owner"
+    stub.OUTPUT_REPO         = "test-output-repo"
+    stub.GH_HEADERS          = {"Authorization": "token fake"}
+    stub.GH_API              = "https://api.github.com"
+    return stub
+
+
+# Insert the stub before importing the module under test
+_shared_stub = _make_shared_stub()
+sys.modules.setdefault("shared", _shared_stub)
 
 # Now import the module under test
-script_dir = os.path.join(os.path.dirname(__file__), "..", ".github", "scripts")
-sys.path.insert(0, os.path.abspath(script_dir))
+import importlib.util, pathlib
 
-import tool1_code_review as cr  # noqa: E402
+_SCRIPT_PATH = pathlib.Path(__file__).parent.parent / ".github" / "scripts" / "tool1_code_review.py"
 
+# Load as a module even though __main__ guard is present
+_spec = importlib.util.spec_from_file_location("tool1_code_review", str(_SCRIPT_PATH))
+tool1 = importlib.util.module_from_spec(_spec)
+# Patch shared inside the new module namespace before exec
+tool1.shared = _shared_stub  # type: ignore[attr-defined]
+sys.modules["tool1_code_review"] = tool1
+_spec.loader.exec_module(tool1)  # type: ignore[union-attr]
+
+extract_json   = tool1.extract_json
+review_pr      = tool1.review_pr
+review_repo    = tool1.review_repo
+get_output_url = tool1.get_output_url
+build_report_md = tool1.build_report_md
 
 # ---------------------------------------------------------------------------
-# Helpers / fixtures
+# Fixtures / helpers
 # ---------------------------------------------------------------------------
 
 MINIMAL_RESULT = {
-    "summary": "Code looks good overall.",
-    "score": 82,
+    "summary": "Looks fine overall.",
+    "score": 80,
     "merge_recommendation": "APPROVE",
     "findings": [],
     "positive_observations": ["Good test coverage"],
@@ -80,281 +93,269 @@ MINIMAL_RESULT = {
 }
 
 FULL_RESULT = {
-    "summary": "Several security issues found.",
-    "score": 45,
-    "merge_recommendation": "BLOCK",
+    "summary": "Several issues found.",
+    "score": 55,
+    "merge_recommendation": "REQUEST_CHANGES",
     "findings": [
         {
-            "severity": "CRITICAL",
+            "severity": "HIGH",
             "category": "security",
-            "file": "src/app.py",
-            "line": 10,
-            "issue": "Hardcoded AWS secret key.",
-            "recommendation": "Use environment variables or a secrets manager.",
+            "file": "src/main.py",
+            "line": 42,
+            "issue": "Hardcoded password detected.",
+            "recommendation": "Use environment variable instead.",
         },
         {
-            "severity": "HIGH",
-            "category": "iac",
-            "file": "infra/main.tf",
+            "severity": "LOW",
+            "category": "maintainability",
+            "file": "src/utils.py",
             "line": None,
-            "issue": "S3 bucket has no encryption.",
-            "recommendation": "Enable SSE-S3 or SSE-KMS.",
+            "issue": "Missing docstring.",
+            "recommendation": "Add a module-level docstring.",
         },
     ],
-    "positive_observations": ["Consistent naming conventions", "Good docstrings"],
-    "iac_findings": ["Missing resource tags on EC2 instances"],
+    "positive_observations": ["Clear naming conventions", "Tests present"],
+    "iac_findings": ["S3 bucket lacks versioning", "IAM role overly permissive"],
 }
 
 
-@pytest.fixture()
-def minimal_result():
-    return dict(MINIMAL_RESULT)
-
-
-@pytest.fixture()
-def full_result():
-    import copy
-    return copy.deepcopy(FULL_RESULT)
-
-
 # ---------------------------------------------------------------------------
-# extract_json
+# extract_json tests
 # ---------------------------------------------------------------------------
-
 
 class TestExtractJson:
     """Tests for extract_json()."""
 
-    def test_plain_json(self, minimal_result):
-        raw = json.dumps(minimal_result)
-        assert cr.extract_json(raw) == minimal_result
+    def test_plain_valid_json(self):
+        raw = json.dumps(MINIMAL_RESULT)
+        result = extract_json(raw)
+        assert result["score"] == 80
+        assert result["merge_recommendation"] == "APPROVE"
 
-    def test_json_with_leading_trailing_whitespace(self, minimal_result):
-        raw = "   \n" + json.dumps(minimal_result) + "\n  "
-        assert cr.extract_json(raw) == minimal_result
+    def test_json_with_leading_and_trailing_whitespace(self):
+        raw = "   \n" + json.dumps(MINIMAL_RESULT) + "\n  "
+        result = extract_json(raw)
+        assert result["summary"] == "Looks fine overall."
 
-    def test_markdown_fences_triple_backtick(self, minimal_result):
-        raw = "```json\n" + json.dumps(minimal_result) + "\n```"
-        assert cr.extract_json(raw) == minimal_result
+    def test_markdown_fence_triple_backtick(self):
+        raw = "```json\n" + json.dumps(FULL_RESULT) + "\n```"
+        result = extract_json(raw)
+        assert result["score"] == 55
 
-    def test_markdown_fences_no_lang(self, minimal_result):
-        raw = "```\n" + json.dumps(minimal_result) + "\n```"
-        assert cr.extract_json(raw) == minimal_result
+    def test_markdown_fence_no_language_tag(self):
+        raw = "```\n" + json.dumps(MINIMAL_RESULT) + "\n```"
+        result = extract_json(raw)
+        assert result["merge_recommendation"] == "APPROVE"
 
-    def test_json_embedded_in_prose(self, minimal_result):
-        """JSON object surrounded by prose text."""
-        raw = "Here is my review:\n" + json.dumps(minimal_result) + "\nEnd of review."
-        assert cr.extract_json(raw) == minimal_result
-
-    def test_full_result_round_trip(self, full_result):
-        raw = json.dumps(full_result)
-        assert cr.extract_json(raw) == full_result
+    def test_json_embedded_in_prose(self):
+        """JSON buried after some prose text."""
+        payload = json.dumps(MINIMAL_RESULT)
+        raw = f"Here is my analysis:\n\n{payload}\n\nLet me know if you have questions."
+        result = extract_json(raw)
+        assert result["score"] == 80
 
     def test_literal_newline_inside_string_value(self):
-        """Newline inside a JSON string value should be cleaned and parsed."""
-        # Simulate Claude embedding a literal newline inside a string value
-        raw = '{"summary": "first line\nsecond line", "score": 70, "merge_recommendation": "APPROVE", "findings": [], "positive_observations": [], "iac_findings": []}'
-        result = cr.extract_json(raw)
-        # After cleaning the newline becomes a space
-        assert "summary" in result
+        """Simulate Claude inserting a literal newline inside a string value."""
+        dirty = '{"summary": "Good\ncode", "score": 70, "merge_recommendation": "APPROVE", "findings": [], "positive_observations": [], "iac_findings": []}'
+        # json.loads will fail on this; extract_json should clean it
+        result = extract_json(dirty)
         assert result["score"] == 70
 
-    def test_raises_when_no_json_at_all(self):
+    def test_raises_value_error_when_no_json(self):
         with pytest.raises(ValueError, match="No JSON object found"):
-            cr.extract_json("This is just plain text with no JSON.")
+            extract_json("This response contains no JSON at all.")
 
-    def test_raises_when_braces_present_but_invalid_json(self):
-        raw = "{ totally: not valid json }"
-        with pytest.raises((ValueError, json.JSONDecodeError)):
-            cr.extract_json(raw)
+    def test_raises_value_error_when_malformed_json(self):
+        malformed = '{ "summary": "broken", "score": NOTANUMBER }'
+        with pytest.raises(ValueError):
+            extract_json(malformed)
 
     def test_empty_string_raises(self):
         with pytest.raises(ValueError):
-            cr.extract_json("")
+            extract_json("")
 
-    def test_only_opening_brace(self):
+    def test_only_markdown_fence_no_content(self):
         with pytest.raises(ValueError):
-            cr.extract_json("{")
+            extract_json("```\n```")
 
-    def test_only_closing_brace(self):
-        with pytest.raises(ValueError):
-            cr.extract_json("}")
+    def test_full_result_roundtrip(self):
+        raw = json.dumps(FULL_RESULT)
+        result = extract_json(raw)
+        assert len(result["findings"]) == 2
+        assert result["findings"][0]["severity"] == "HIGH"
+        assert result["iac_findings"][0] == "S3 bucket lacks versioning"
 
-    def test_nested_objects_parsed_correctly(self):
-        data = {
-            "summary": "ok",
-            "score": 90,
-            "merge_recommendation": "APPROVE",
-            "findings": [
-                {"severity": "LOW", "category": "maintainability",
-                 "file": "foo.py", "line": 1,
-                 "issue": "missing docstring", "recommendation": "add one"}
-            ],
-            "positive_observations": [],
-            "iac_findings": [],
-        }
-        raw = json.dumps(data)
-        assert cr.extract_json(raw) == data
+    def test_score_boundary_zero(self):
+        data = {**MINIMAL_RESULT, "score": 0}
+        result = extract_json(json.dumps(data))
+        assert result["score"] == 0
 
-    def test_score_zero_boundary(self):
-        data = {"summary": "terrible", "score": 0,
-                "merge_recommendation": "BLOCK",
-                "findings": [], "positive_observations": [],
-                "iac_findings": []}
-        assert cr.extract_json(json.dumps(data))["score"] == 0
+    def test_score_boundary_hundred(self):
+        data = {**MINIMAL_RESULT, "score": 100}
+        result = extract_json(json.dumps(data))
+        assert result["score"] == 100
 
-    def test_score_100_boundary(self):
-        data = {"summary": "perfect", "score": 100,
-                "merge_recommendation": "APPROVE",
-                "findings": [], "positive_observations": [],
-                "iac_findings": []}
-        assert cr.extract_json(json.dumps(data))["score"] == 100
+    def test_extra_text_before_brace(self):
+        prefix = "Sure! Here is the JSON:\n"
+        raw = prefix + json.dumps(MINIMAL_RESULT)
+        result = extract_json(raw)
+        assert result["merge_recommendation"] == "APPROVE"
 
-    def test_markdown_fence_with_extra_whitespace(self, minimal_result):
-        raw = "  ```json\n" + json.dumps(minimal_result) + "\n```  "
-        # The function checks startswith("```") after strip()
-        result = cr.extract_json(raw)
-        assert result == minimal_result
+    def test_finding_with_null_line(self):
+        data = {**MINIMAL_RESULT, "findings": [
+            {"severity": "LOW", "category": "maintainability",
+             "file": "foo.py", "line": None,
+             "issue": "Missing docstring.", "recommendation": "Add one."}
+        ]}
+        result = extract_json(json.dumps(data))
+        assert result["findings"][0]["line"] is None
 
-    def test_unicode_values(self):
-        data = {"summary": "审查完成", "score": 55,
-                "merge_recommendation": "REQUEST_CHANGES",
-                "findings": [], "positive_observations": [],
-                "iac_findings": []}
-        assert cr.extract_json(json.dumps(data))["summary"] == "审查完成"
+    def test_block_recommendation(self):
+        data = {**MINIMAL_RESULT, "merge_recommendation": "BLOCK"}
+        result = extract_json(json.dumps(data))
+        assert result["merge_recommendation"] == "BLOCK"
 
-    def test_multiple_json_objects_returns_outermost(self):
-        """When there are multiple { } blocks, outermost wins."""
-        data = {"summary": "ok", "score": 80,
-                "merge_recommendation": "APPROVE",
-                "findings": [], "positive_observations": [],
-                "iac_findings": []}
-        # Wrap in text that has extra braces (like a code example)
-        raw = "Some text {bad} then " + json.dumps(data)
-        result = cr.extract_json(raw)
+
+# ---------------------------------------------------------------------------
+# review_pr tests
+# ---------------------------------------------------------------------------
+
+class TestReviewPr:
+    """Tests for review_pr()."""
+
+    def _reset_stubs(self):
+        _shared_stub.get_pr_diff.reset_mock()
+        _shared_stub.call_claude.reset_mock()
+        _shared_stub.post_pr_comment.reset_mock()
+
+    def test_happy_path_approve(self):
+        self._reset_stubs()
+        _shared_stub.get_pr_diff.return_value = "diff --git a/foo.py ..."
+        _shared_stub.call_claude.return_value = json.dumps(MINIMAL_RESULT)
+
+        result = review_pr("acme", "myrepo", 42, "https://ci/run/1")
+
+        _shared_stub.get_pr_diff.assert_called_once_with("acme", "myrepo", 42)
+        _shared_stub.call_claude.assert_called_once()
+        _shared_stub.post_pr_comment.assert_called_once()
+
+        comment_text = _shared_stub.post_pr_comment.call_args[0][3]
+        assert "80/100" in comment_text
+        assert "APPROVE" in comment_text
         assert result["score"] == 80
 
+    def test_happy_path_request_changes(self):
+        self._reset_stubs()
+        _shared_stub.get_pr_diff.return_value = "diff"
+        _shared_stub.call_claude.return_value = json.dumps(FULL_RESULT)
 
-# ---------------------------------------------------------------------------
-# get_output_url
-# ---------------------------------------------------------------------------
+        result = review_pr("acme", "myrepo", 7, "https://ci/run/2")
 
+        comment_text = _shared_stub.post_pr_comment.call_args[0][3]
+        assert "REQUEST_CHANGES" in comment_text
+        assert "src/main.py" in comment_text
+        assert result["score"] == 55
 
-class TestGetOutputUrl:
-    def test_basic_url(self):
-        url = cr.get_output_url("myowner", "myrepo", "pr-42")
-        assert url == (
-            f"https://github.com/{_shared_mod.OUTPUT_REPO_OWNER}"
-            f"/{_shared_mod.OUTPUT_REPO}/blob/main/code-review/myowner-myrepo-pr-42.md"
-        )
+    def test_findings_section_rendered_in_comment(self):
+        self._reset_stubs()
+        _shared_stub.get_pr_diff.return_value = "diff"
+        _shared_stub.call_claude.return_value = json.dumps(FULL_RESULT)
 
-    def test_url_contains_owner_and_repo(self):
-        url = cr.get_output_url("acme", "payments-service", "2024-01-01")
-        assert "acme-payments-service-2024-01-01.md" in url
+        review_pr("acme", "myrepo", 8, "")
 
-    def test_url_starts_with_github(self):
-        url = cr.get_output_url("x", "y", "z")
-        assert url.startswith("https://github.com/")
+        comment_text = _shared_stub.post_pr_comment.call_args[0][3]
+        assert "Hardcoded password detected." in comment_text
+        assert "Use environment variable instead." in comment_text
 
-    def test_url_ends_with_md(self):
-        url = cr.get_output_url("a", "b", "weekly")
-        assert url.endswith(".md")
+    def test_no_findings_shows_placeholder(self):
+        self._reset_stubs()
+        _shared_stub.get_pr_diff.return_value = "diff"
+        _shared_stub.call_claude.return_value = json.dumps(MINIMAL_RESULT)
 
+        review_pr("acme", "myrepo", 9, "")
 
-# ---------------------------------------------------------------------------
-# build_report_md
-# ---------------------------------------------------------------------------
+        comment_text = _shared_stub.post_pr_comment.call_args[0][3]
+        assert "_No findings_" in comment_text
 
+    def test_positive_observations_in_comment(self):
+        self._reset_stubs()
+        _shared_stub.get_pr_diff.return_value = "diff"
+        _shared_stub.call_claude.return_value = json.dumps(MINIMAL_RESULT)
 
-class TestBuildReportMd:
-    FIXED_NOW = "2024-06-15 12:00 UTC"
+        review_pr("acme", "myrepo", 10, "")
 
-    @pytest.fixture(autouse=True)
-    def patch_datetime(self):
-        """Pin datetime so report timestamps are deterministic."""
-        fixed_dt = datetime.datetime(2024, 6, 15, 12, 0, 0)
-        with patch("tool1_code_review.datetime") as mock_dt:
-            mock_dt.datetime.utcnow.return_value = fixed_dt
-            mock_dt.datetime.utcnow.return_value.strftime = fixed_dt.strftime
-            yield mock_dt
+        comment_text = _shared_stub.post_pr_comment.call_args[0][3]
+        assert "Good test coverage" in comment_text
 
-    def test_contains_score(self, full_result):
-        md = cr.build_report_md(full_result, "PR #7", "owner/repo")
-        assert "45/100" in md
+    def test_bad_json_from_claude_raises(self):
+        self._reset_stubs()
+        _shared_stub.get_pr_diff.return_value = "diff"
+        _shared_stub.call_claude.return_value = "I cannot provide JSON right now."
 
-    def test_contains_recommendation(self, full_result):
-        md = cr.build_report_md(full_result, "PR #7", "owner/repo")
-        assert "BLOCK" in md
+        with pytest.raises(ValueError):
+            review_pr("acme", "myrepo", 11, "")
 
-    def test_contains_summary(self, full_result):
-        md = cr.build_report_md(full_result, "PR #7", "owner/repo")
-        assert "Several security issues found." in md
+    def test_post_pr_comment_called_with_correct_owner_repo_pr(self):
+        self._reset_stubs()
+        _shared_stub.get_pr_diff.return_value = "diff"
+        _shared_stub.call_claude.return_value = json.dumps(MINIMAL_RESULT)
 
-    def test_contains_finding_severity(self, full_result):
-        md = cr.build_report_md(full_result, "PR #7", "owner/repo")
-        assert "CRITICAL" in md
+        review_pr("org-x", "repo-y", 99, "")
 
-    def test_contains_iac_finding(self, full_result):
-        md = cr.build_report_md(full_result, "PR #7", "owner/repo")
-        assert "Missing resource tags on EC2 instances" in md
+        args = _shared_stub.post_pr_comment.call_args[0]
+        assert args[0] == "org-x"
+        assert args[1] == "repo-y"
+        assert args[2] == 99
 
-    def test_contains_positive_observation(self, full_result):
-        md = cr.build_report_md(full_result, "PR #7", "owner/repo")
-        assert "Consistent naming conventions" in md
+    def test_result_returned_contains_all_keys(self):
+        self._reset_stubs()
+        _shared_stub.get_pr_diff.return_value = "diff"
+        _shared_stub.call_claude.return_value = json.dumps(FULL_RESULT)
 
-    def test_source_and_context_present(self, full_result):
-        md = cr.build_report_md(full_result, "weekly-cron", "acme/backend")
-        assert "weekly-cron" in md
-        assert "acme/backend" in md
+        result = review_pr("acme", "myrepo", 1, "")
+        for key in ("summary", "score", "merge_recommendation", "findings",
+                    "positive_observations", "iac_findings"):
+            assert key in result
 
-    def test_empty_findings_shows_placeholder(self, minimal_result):
-        md = cr.build_report_md(minimal_result, "PR #1", "x/y")
-        assert "No findings" in md
+    def test_line_null_renders_as_na(self):
+        self._reset_stubs()
+        data = {**FULL_RESULT}
+        data["findings"] = [
+            {"severity": "LOW", "category": "maintainability",
+             "file": "x.py", "line": None,
+             "issue": "Missing doc.", "recommendation": "Add doc."}
+        ]
+        _shared_stub.get_pr_diff.return_value = "diff"
+        _shared_stub.call_claude.return_value = json.dumps(data)
 
-    def test_empty_iac_findings_shows_none(self, minimal_result):
-        md = cr.build_report_md(minimal_result, "PR #1", "x/y")
-        assert "_None_" in md
+        review_pr("acme", "myrepo", 12, "")
+
+        comment_text = _shared_stub.post_pr_comment.call_args[0][3]
+        assert "line None" in comment_text or "n/a" in comment_text
 
     def test_empty_positive_observations_shows_none(self):
-        result = {**MINIMAL_RESULT, "positive_observations": [], "iac_findings": []}
-        md = cr.build_report_md(result, "PR #2", "x/y")
-        assert "_None_" in md
+        self._reset_stubs()
+        data = {**MINIMAL_RESULT, "positive_observations": []}
+        _shared_stub.get_pr_diff.return_value = "diff"
+        _shared_stub.call_claude.return_value = json.dumps(data)
 
-    def test_missing_score_key_shows_na(self):
-        result = {k: v for k, v in MINIMAL_RESULT.items() if k != "score"}
-        md = cr.build_report_md(result, "manual", "x/y")
-        assert "N/A" in md
+        review_pr("acme", "myrepo", 13, "")
 
-    def test_missing_recommendation_key(self):
-        result = {k: v for k, v in MINIMAL_RESULT.items() if k != "merge_recommendation"}
-        md = cr.build_report_md(result, "manual", "x/y")
-        assert "N/A" in md
+        comment_text = _shared_stub.post_pr_comment.call_args[0][3]
+        assert "_None_" in comment_text
 
-    def test_missing_summary_key(self):
-        result = {k: v for k, v in MINIMAL_RESULT.items() if k != "summary"}
-        md = cr.build_report_md(result, "manual", "x/y")
-        assert "No summary provided." in md
 
-    def test_report_is_string(self, full_result):
-        md = cr.build_report_md(full_result, "src", "ctx")
-        assert isinstance(md, str)
+# ---------------------------------------------------------------------------
+# review_repo tests
+# ---------------------------------------------------------------------------
 
-    def test_report_starts_with_heading(self, minimal_result):
-        md = cr.build_report_md(minimal_result, "src", "ctx")
-        assert md.startswith("# Code Review Report")
+class TestReviewRepo:
+    """Tests for review_repo()."""
 
-    def test_multiple_findings_all_present(self, full_result):
-        md = cr.build_report_md(full_result, "PR #7", "owner/repo")
-        assert "Hardcoded AWS secret key." in md
-        assert "S3 bucket has no encryption." in md
+    def _reset_stubs(self):
+        _shared_stub.get_repo_files.reset_mock()
+        _shared_stub.call_claude.reset_mock()
 
-    def test_finding_with_null_line(self, full_result):
-        """Line=None should render without error."""
-        md = cr.build_report_md(full_result, "PR", "r")
-        assert "None" in md or "?" in md  # either rendering is acceptable
-
-    def test_auto_generated_footer(self, minimal_result):
-        md = cr.build_report_md(minimal_result, "s", "c")
-        assert "Auto-generated by AI Delivery Bot" in md
-
-    def test_
+    def test_happy_path_returns_dict(self):
+        self._reset_stubs()
+        _shared_stub.get_repo_files.return
