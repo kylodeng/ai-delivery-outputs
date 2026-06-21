@@ -1,5 +1,5 @@
 # Tech Documentation Index — kylodeng/Insurance-Training-Bot-main
-**Generated:** 2026-06-14 09:50 UTC
+**Generated:** 2026-06-21 10:01 UTC
 
 ## Documents
 - [README.md](https://github.com/kylodeng/ai-delivery-outputs/blob/main/tech-docs/kylodeng-Insurance-Training-Bot-main/README.md)
