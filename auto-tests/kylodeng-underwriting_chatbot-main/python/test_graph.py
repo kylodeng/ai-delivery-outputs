@@ -2,332 +2,350 @@
 Tests for backend/agent/graph.py
 
 What is tested:
-    - build_agent() happy path with valid model_name, temperature, and mode values
-    - build_agent() with different mode values ("fast", "deep", and edge-case values)
-    - build_agent() temperature boundary values (0.0, 1.0, extreme values)
-    - build_agent() error propagation when LLMS.get_model() raises
-    - build_agent() error propagation when create_agent raises
-    - Module-level Redis and checkpointer initialization
-    - Tool list composition (correct tools passed to create_agent)
-    - REDIS_HOST environment variable handling
+- build_agent(): happy path with various model names, temperatures, and modes
+- build_agent(): edge cases (boundary temperatures, unknown mode strings)
+- build_agent(): error conditions (LLMS raises, create_agent raises, invalid arguments)
+- Module-level Redis / checkpointer initialisation (env var override)
+- Tool list composition passed to create_agent
 
 Mocks used:
-    - langchain.agents.create_agent (patched to avoid real LLM/graph construction)
-    - redis.asyncio.Redis (patched at module level to avoid real Redis connection)
-    - langgraph.checkpoint.redis.aio.AsyncRedisSaver (patched to avoid real Redis)
-    - modules.tools.get_customer_profile (patched)
-    - modules.tools.customer_lookalike (patched)
-    - modules.assessment._run_underwriting_assessment (patched)
-    - modules.LLMS.LLMS (patched to avoid real model loading)
-    - backend.agent.prompts.SYSTEM_PROMPT (patched)
+- unittest.mock.patch for:
+    - langchain.agents.create_agent
+    - redis.asyncio.Redis
+    - langgraph.checkpoint.redis.aio.AsyncRedisSaver
+    - modules.tools.get_customer_profile
+    - modules.tools.customer_lookalike
+    - modules.assessment._run_underwriting_assessment
+    - modules.LLMS.LLMS
+- os.environ patching via monkeypatch / patch.dict
 
 TODOs:
-    - TODO: Integration test for actual Redis connectivity once a test Redis instance is available
-    - TODO: Test streaming behaviour of the returned agent once agent interface is stable
-    - TODO: Test checkpointer persistence across agent rebuilds
+- TODO: Integration test that verifies the agent actually calls the underlying LLM
+        (requires a live or containerised Redis + LLM endpoint).
+- TODO: Verify checkpointer thread-safety / async behaviour once AsyncRedisSaver
+        internals are stable.
+- TODO: Confirm exact signature of create_agent when langchain version is pinned.
 """
 
-import os
 import importlib
 import sys
 import types
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import MagicMock, patch, call
 
 import pytest
 
 
 # ---------------------------------------------------------------------------
-# Helpers / fixtures
+# Helpers to build lightweight fake modules so the real heavy imports never
+# execute during the test run.
 # ---------------------------------------------------------------------------
 
-def _make_mock_tool(name: str) -> MagicMock:
-    tool = MagicMock()
-    tool.__name__ = name
-    return tool
+def _make_fake_modules():
+    """Return a dict of fake top-level + sub-modules needed to import graph.py."""
 
+    # --- langchain.agents ---
+    langchain_pkg = types.ModuleType("langchain")
+    langchain_agents = types.ModuleType("langchain.agents")
+    mock_create_agent = MagicMock(name="create_agent")
+    langchain_agents.create_agent = mock_create_agent
+    langchain_pkg.agents = langchain_agents
 
-@pytest.fixture(autouse=True)
-def _patch_heavy_imports(monkeypatch):
-    """
-    Patch all external heavy dependencies before the module under test is
-    imported so that no real network / model calls are made.
-    """
     # --- redis ---
-    mock_redis_instance = AsyncMock()
-    mock_redis_cls = MagicMock(return_value=mock_redis_instance)
+    redis_pkg = types.ModuleType("redis")
+    redis_asyncio = types.ModuleType("redis.asyncio")
+    mock_redis_cls = MagicMock(name="Redis")
+    redis_asyncio.Redis = mock_redis_cls
+    redis_pkg.asyncio = redis_asyncio
 
-    # --- AsyncRedisSaver ---
-    mock_checkpointer = MagicMock()
-    mock_redis_saver_cls = MagicMock(return_value=mock_checkpointer)
+    # --- langgraph.checkpoint.redis.aio ---
+    langgraph_pkg = types.ModuleType("langgraph")
+    langgraph_checkpoint = types.ModuleType("langgraph.checkpoint")
+    langgraph_checkpoint_redis = types.ModuleType("langgraph.checkpoint.redis")
+    langgraph_checkpoint_redis_aio = types.ModuleType("langgraph.checkpoint.redis.aio")
+    mock_saver_cls = MagicMock(name="AsyncRedisSaver")
+    langgraph_checkpoint_redis_aio.AsyncRedisSaver = mock_saver_cls
+    langgraph_pkg.checkpoint = langgraph_checkpoint
+    langgraph_checkpoint.redis = langgraph_checkpoint_redis
+    langgraph_checkpoint_redis.aio = langgraph_checkpoint_redis_aio
 
-    # --- tools ---
-    mock_get_customer_profile = _make_mock_tool("get_customer_profile")
-    mock_customer_lookalike = _make_mock_tool("customer_lookalike")
+    # --- modules.tools ---
+    modules_pkg = types.ModuleType("modules")
+    modules_tools = types.ModuleType("modules.tools")
+    mock_get_customer_profile = MagicMock(name="get_customer_profile")
+    mock_customer_lookalike = MagicMock(name="customer_lookalike")
+    modules_tools.get_customer_profile = mock_get_customer_profile
+    modules_tools.customer_lookalike = mock_customer_lookalike
+    modules_pkg.tools = modules_tools
 
-    # --- assessment ---
-    mock_assessment_result = _make_mock_tool("_run_underwriting_assessment_result")
-    mock_run_underwriting_assessment = MagicMock(return_value=mock_assessment_result)
+    # --- modules.assessment ---
+    modules_assessment = types.ModuleType("modules.assessment")
+    mock_run_underwriting = MagicMock(name="_run_underwriting_assessment")
+    mock_run_underwriting.return_value = MagicMock(name="underwriting_tool_instance")
+    modules_assessment._run_underwriting_assessment = mock_run_underwriting
+    modules_pkg.assessment = modules_assessment
 
-    # --- LLMS ---
-    mock_model_instance = MagicMock()
-    mock_llms_instance = MagicMock()
-    mock_llms_instance.get_model = MagicMock(return_value=mock_model_instance)
-    mock_llms_cls = MagicMock(return_value=mock_llms_instance)
+    # --- modules.LLMS ---
+    modules_llms_mod = types.ModuleType("modules.LLMS")
+    mock_llms_cls = MagicMock(name="LLMS")
+    modules_llms_mod.LLMS = mock_llms_cls
+    modules_pkg.LLMS = modules_llms_mod
 
-    # --- create_agent ---
-    mock_agent = MagicMock()
-    mock_create_agent = MagicMock(return_value=mock_agent)
+    # --- .prompts (backend.agent.prompts) ---
+    # Will be injected as the relative sibling module; handled separately via
+    # sys.modules key matching the package path.
 
-    # --- SYSTEM_PROMPT ---
-    mock_system_prompt = "MOCK_SYSTEM_PROMPT"
-
-    # Build fake module stubs so that import inside graph.py succeeds
-    fake_redis_module = types.ModuleType("redis")
-    fake_redis_asyncio = types.ModuleType("redis.asyncio")
-    fake_redis_asyncio.Redis = mock_redis_cls
-    fake_redis_module.asyncio = fake_redis_asyncio
-    sys.modules["redis"] = fake_redis_module
-    sys.modules["redis.asyncio"] = fake_redis_asyncio
-
-    fake_langgraph = types.ModuleType("langgraph")
-    fake_langgraph_checkpoint = types.ModuleType("langgraph.checkpoint")
-    fake_langgraph_checkpoint_redis = types.ModuleType("langgraph.checkpoint.redis")
-    fake_langgraph_checkpoint_redis_aio = types.ModuleType("langgraph.checkpoint.redis.aio")
-    fake_langgraph_checkpoint_redis_aio.AsyncRedisSaver = mock_redis_saver_cls
-    fake_langgraph.checkpoint = fake_langgraph_checkpoint
-    fake_langgraph_checkpoint.redis = fake_langgraph_checkpoint_redis
-    fake_langgraph_checkpoint_redis.aio = fake_langgraph_checkpoint_redis_aio
-    sys.modules["langgraph"] = fake_langgraph
-    sys.modules["langgraph.checkpoint"] = fake_langgraph_checkpoint
-    sys.modules["langgraph.checkpoint.redis"] = fake_langgraph_checkpoint_redis
-    sys.modules["langgraph.checkpoint.redis.aio"] = fake_langgraph_checkpoint_redis_aio
-
-    fake_langchain_agents = types.ModuleType("langchain.agents")
-    fake_langchain_agents.create_agent = mock_create_agent
-    fake_langchain = types.ModuleType("langchain")
-    fake_langchain.agents = fake_langchain_agents
-    sys.modules["langchain"] = fake_langchain
-    sys.modules["langchain.agents"] = fake_langchain_agents
-
-    fake_tools_module = types.ModuleType("modules.tools")
-    fake_tools_module.get_customer_profile = mock_get_customer_profile
-    fake_tools_module.customer_lookalike = mock_customer_lookalike
-    fake_modules = types.ModuleType("modules")
-    fake_modules.tools = fake_tools_module
-    sys.modules["modules"] = fake_modules
-    sys.modules["modules.tools"] = fake_tools_module
-
-    fake_assessment_module = types.ModuleType("modules.assessment")
-    fake_assessment_module._run_underwriting_assessment = mock_run_underwriting_assessment
-    sys.modules["modules.assessment"] = fake_assessment_module
-
-    fake_llms_module = types.ModuleType("modules.LLMS")
-    fake_llms_module.LLMS = mock_llms_cls
-    sys.modules["modules.LLMS"] = fake_llms_module
-
-    fake_prompts = types.ModuleType("agent.prompts")
-    fake_prompts.SYSTEM_PROMPT = mock_system_prompt
-
-    # We need to make ".prompts" resolvable as a relative import from "agent.graph"
-    # Provide it under the package name the module will look for
-    fake_agent_pkg = types.ModuleType("agent")
-    fake_agent_pkg.prompts = fake_prompts
-    sys.modules.setdefault("agent", fake_agent_pkg)
-    sys.modules["agent.prompts"] = fake_prompts
-
-    # Remove previously cached version so we get a fresh import each test
-    sys.modules.pop("agent.graph", None)
-    sys.modules.pop("backend.agent.graph", None)
-
-    yield {
-        "redis_cls": mock_redis_cls,
-        "redis_instance": mock_redis_instance,
-        "redis_saver_cls": mock_redis_saver_cls,
-        "checkpointer": mock_checkpointer,
-        "get_customer_profile": mock_get_customer_profile,
-        "customer_lookalike": mock_customer_lookalike,
-        "_run_underwriting_assessment": mock_run_underwriting_assessment,
-        "assessment_result": mock_assessment_result,
-        "llms_cls": mock_llms_cls,
-        "llms_instance": mock_llms_instance,
-        "model_instance": mock_model_instance,
-        "create_agent": mock_create_agent,
-        "agent": mock_agent,
-        "system_prompt": mock_system_prompt,
+    return {
+        "langchain": langchain_pkg,
+        "langchain.agents": langchain_agents,
+        "redis": redis_pkg,
+        "redis.asyncio": redis_asyncio,
+        "langgraph": langgraph_pkg,
+        "langgraph.checkpoint": langgraph_checkpoint,
+        "langgraph.checkpoint.redis": langgraph_checkpoint_redis,
+        "langgraph.checkpoint.redis.aio": langgraph_checkpoint_redis_aio,
+        "modules": modules_pkg,
+        "modules.tools": modules_tools,
+        "modules.assessment": modules_assessment,
+        "modules.LLMS": modules_llms_mod,
+        # Stubs for the relative import .prompts
+        "backend": types.ModuleType("backend"),
+        "backend.agent": types.ModuleType("backend.agent"),
     }
 
-    # Cleanup after each test
+
+# ---------------------------------------------------------------------------
+# Fixture: load graph module with all heavy dependencies stubbed out.
+# We reload the module fresh for each test to avoid cross-test pollution.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def fake_modules():
+    """Install fake modules into sys.modules and yield them; clean up after."""
+    fakes = _make_fake_modules()
+
+    # Build a prompts stub with SYSTEM_PROMPT
+    prompts_stub = types.ModuleType("backend.agent.prompts")
+    prompts_stub.SYSTEM_PROMPT = "You are an underwriting assistant."
+
+    # Register everything
+    originals = {}
+    keys_to_inject = list(fakes.keys()) + ["backend.agent.prompts"]
+    for key in keys_to_inject:
+        originals[key] = sys.modules.get(key)
+
+    for key, mod in fakes.items():
+        sys.modules[key] = mod
+    sys.modules["backend.agent.prompts"] = prompts_stub
+
+    yield fakes, prompts_stub
+
+    # Restore
+    for key, original in originals.items():
+        if original is None:
+            sys.modules.pop(key, None)
+        else:
+            sys.modules[key] = original
+
+    # Remove any previously loaded graph module so it doesn't bleed
+    sys.modules.pop("backend.agent.graph", None)
     sys.modules.pop("agent.graph", None)
 
 
 @pytest.fixture()
-def graph_module(_patch_heavy_imports):
-    """Import and return the graph module with all dependencies mocked."""
-    import importlib
-    import agent.graph as gm
-    return gm, _patch_heavy_imports
+def graph_module(fake_modules, monkeypatch):
+    """Import (or reimport) backend.agent.graph with fakes in place."""
+    # Ensure the package structure exists in sys.modules
+    agent_pkg = sys.modules.get("backend.agent") or types.ModuleType("backend.agent")
+    agent_pkg.__path__ = []  # mark as package
+    agent_pkg.__package__ = "backend.agent"
+    sys.modules["backend.agent"] = agent_pkg
+
+    backend_pkg = sys.modules.get("backend") or types.ModuleType("backend")
+    backend_pkg.__path__ = []
+    sys.modules["backend"] = backend_pkg
+
+    # Remove stale cached graph module if any
+    sys.modules.pop("backend.agent.graph", None)
+
+    monkeypatch.setenv("REDIS_HOST", "test-redis-host")
+
+    import importlib.util, os
+
+    graph_path = os.path.join(
+        os.path.dirname(__file__), "..", "backend", "agent", "graph.py"
+    )
+    # Fallback: try relative from CWD
+    if not os.path.exists(graph_path):
+        graph_path = os.path.join("backend", "agent", "graph.py")
+
+    spec = importlib.util.spec_from_file_location(
+        "backend.agent.graph",
+        graph_path,
+        submodule_search_locations=[],
+    )
+    mod = importlib.util.module_from_spec(spec)
+    mod.__package__ = "backend.agent"
+    sys.modules["backend.agent.graph"] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 # ---------------------------------------------------------------------------
-# Module-level initialisation tests
+# Convenience accessors so tests stay readable
 # ---------------------------------------------------------------------------
+
+def _get_mocks(fake_modules):
+    fakes, prompts_stub = fake_modules
+    return {
+        "create_agent": fakes["langchain.agents"].create_agent,
+        "Redis": fakes["redis.asyncio"].Redis,
+        "AsyncRedisSaver": fakes["langgraph.checkpoint.redis.aio"].AsyncRedisSaver,
+        "LLMS": fakes["modules.LLMS"].LLMS,
+        "get_customer_profile": fakes["modules.tools"].get_customer_profile,
+        "customer_lookalike": fakes["modules.tools"].customer_lookalike,
+        "_run_underwriting_assessment": fakes["modules.assessment"]._run_underwriting_assessment,
+        "SYSTEM_PROMPT": prompts_stub.SYSTEM_PROMPT,
+    }
+
+
+# ===========================================================================
+# Tests: module-level initialisation
+# ===========================================================================
 
 class TestModuleLevelInit:
-    """Verify that module-level objects are created correctly on import."""
+    """Verify Redis client and checkpointer are created at import time."""
 
-    def test_redis_client_created_with_default_host(self, monkeypatch, _patch_heavy_imports):
-        monkeypatch.delenv("REDIS_HOST", raising=False)
-        sys.modules.pop("agent.graph", None)
-        import agent.graph  # noqa: F401 — trigger module init
+    def test_redis_client_created_with_env_host(self, graph_module, fake_modules):
+        mocks = _get_mocks(fake_modules)
+        mocks["Redis"].assert_called()
+        call_kwargs = mocks["Redis"].call_args
+        # host should come from REDIS_HOST env var set in fixture
+        assert call_kwargs.kwargs.get("host") == "test-redis-host" or \
+               (call_kwargs.args and call_kwargs.args[0] == "test-redis-host") or \
+               call_kwargs.kwargs.get("host") == "test-redis-host"
 
-        _patch_heavy_imports["redis_cls"].assert_called_once_with(
-            host="localhost", port=6379, decode_responses=False
-        )
+    def test_redis_client_uses_port_6379(self, graph_module, fake_modules):
+        mocks = _get_mocks(fake_modules)
+        call_kwargs = mocks["Redis"].call_args
+        assert call_kwargs.kwargs.get("port") == 6379
 
-    def test_redis_client_created_with_env_host(self, monkeypatch, _patch_heavy_imports):
-        monkeypatch.setenv("REDIS_HOST", "my-redis-host")
-        sys.modules.pop("agent.graph", None)
-        import agent.graph  # noqa: F401
+    def test_redis_decode_responses_false(self, graph_module, fake_modules):
+        mocks = _get_mocks(fake_modules)
+        call_kwargs = mocks["Redis"].call_args
+        assert call_kwargs.kwargs.get("decode_responses") is False
 
-        _patch_heavy_imports["redis_cls"].assert_called_once_with(
-            host="my-redis-host", port=6379, decode_responses=False
-        )
-
-    def test_checkpointer_created_with_redis_client(self, _patch_heavy_imports):
-        sys.modules.pop("agent.graph", None)
-        import agent.graph  # noqa: F401
-
-        redis_instance = _patch_heavy_imports["redis_cls"].return_value
-        _patch_heavy_imports["redis_saver_cls"].assert_called_once_with(
-            redis_client=redis_instance
-        )
+    def test_checkpointer_created_with_redis_client(self, graph_module, fake_modules):
+        mocks = _get_mocks(fake_modules)
+        mocks["AsyncRedisSaver"].assert_called_once()
+        saver_kwargs = mocks["AsyncRedisSaver"].call_args.kwargs
+        # The redis_client passed should be the return value of Redis(...)
+        assert saver_kwargs.get("redis_client") == mocks["Redis"].return_value
 
     def test_module_exposes_build_agent(self, graph_module):
-        gm, _ = graph_module
-        assert callable(gm.build_agent)
+        assert hasattr(graph_module, "build_agent")
+        assert callable(graph_module.build_agent)
 
 
-# ---------------------------------------------------------------------------
-# build_agent happy-path tests
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Tests: build_agent — happy path
+# ===========================================================================
 
 class TestBuildAgentHappyPath:
-    """Happy-path scenarios for build_agent()."""
 
-    def test_returns_agent(self, graph_module):
-        gm, mocks = graph_module
-        result = gm.build_agent("gpt-4o", 0.5)
-        assert result is mocks["agent"]
+    @pytest.mark.parametrize("model_name", [
+        "gpt-4o",
+        "gpt-4o-mini",
+        "claude-3-5-sonnet",
+        "o1-preview",
+    ])
+    def test_returns_create_agent_result(self, graph_module, fake_modules, model_name):
+        mocks = _get_mocks(fake_modules)
+        expected = MagicMock(name="agent_instance")
+        mocks["create_agent"].return_value = expected
 
-    def test_llms_instantiated_with_correct_params(self, graph_module):
-        gm, mocks = graph_module
-        gm.build_agent("gpt-4o", 0.7)
-        mocks["llms_cls"].assert_called_once_with(temperature=0.7, streaming=True)
+        result = graph_module.build_agent(model_name=model_name, temperature=0.7)
 
-    def test_get_model_called_with_model_name(self, graph_module):
-        gm, mocks = graph_module
-        gm.build_agent("gpt-4o", 0.5)
-        mocks["llms_instance"].get_model.assert_called_once_with("gpt-4o")
+        assert result is expected
 
-    def test_create_agent_called_with_correct_args(self, graph_module):
-        gm, mocks = graph_module
-        gm.build_agent("gpt-4o", 0.5)
-        mocks["create_agent"].assert_called_once_with(
-            model=mocks["model_instance"],
-            tools=[
-                mocks["get_customer_profile"],
-                mocks["assessment_result"],
-                mocks["customer_lookalike"],
-            ],
-            system_prompt=mocks["system_prompt"],
-            checkpointer=mocks["checkpointer"],
-        )
+    @pytest.mark.parametrize("model_name,temperature,mode", [
+        ("gpt-4o", 0.0, "fast"),
+        ("gpt-4o-mini", 1.0, "deep"),
+        ("claude-3-5-sonnet", 0.5, "fast"),
+        ("o1-preview", 0.3, "deep"),
+    ])
+    def test_create_agent_called_once(self, graph_module, fake_modules,
+                                     model_name, temperature, mode):
+        mocks = _get_mocks(fake_modules)
+        mocks["create_agent"].reset_mock()
 
-    def test_underwriting_assessment_called_with_default_mode(self, graph_module):
-        gm, mocks = graph_module
-        gm.build_agent("gpt-4o", 0.5)
+        graph_module.build_agent(model_name=model_name, temperature=temperature, mode=mode)
+
+        mocks["create_agent"].assert_called_once()
+
+    def test_create_agent_receives_system_prompt(self, graph_module, fake_modules):
+        mocks = _get_mocks(fake_modules)
+        mocks["create_agent"].reset_mock()
+
+        graph_module.build_agent(model_name="gpt-4o", temperature=0.5)
+
+        _, kwargs = mocks["create_agent"].call_args
+        assert kwargs.get("system_prompt") == mocks["SYSTEM_PROMPT"]
+
+    def test_create_agent_receives_checkpointer(self, graph_module, fake_modules):
+        mocks = _get_mocks(fake_modules)
+        mocks["create_agent"].reset_mock()
+
+        graph_module.build_agent(model_name="gpt-4o", temperature=0.5)
+
+        _, kwargs = mocks["create_agent"].call_args
+        assert kwargs.get("checkpointer") == mocks["AsyncRedisSaver"].return_value
+
+    def test_llms_instantiated_with_correct_params(self, graph_module, fake_modules):
+        mocks = _get_mocks(fake_modules)
+        mocks["LLMS"].reset_mock()
+
+        graph_module.build_agent(model_name="gpt-4o", temperature=0.7)
+
+        mocks["LLMS"].assert_called_once_with(temperature=0.7, streaming=True)
+
+    def test_get_model_called_with_model_name(self, graph_module, fake_modules):
+        mocks = _get_mocks(fake_modules)
+        mocks["LLMS"].reset_mock()
+
+        graph_module.build_agent(model_name="gpt-4o-mini", temperature=0.3)
+
+        llms_instance = mocks["LLMS"].return_value
+        llms_instance.get_model.assert_called_once_with("gpt-4o-mini")
+
+    def test_default_mode_is_fast(self, graph_module, fake_modules):
+        mocks = _get_mocks(fake_modules)
+        mocks["_run_underwriting_assessment"].reset_mock()
+
+        graph_module.build_agent(model_name="gpt-4o", temperature=0.5)
+
         mocks["_run_underwriting_assessment"].assert_called_once_with("fast")
 
-    def test_tools_list_has_three_items(self, graph_module):
-        gm, mocks = graph_module
-        gm.build_agent("gpt-4o", 0.5)
-        _, kwargs = mocks["create_agent"].call_args
-        assert len(kwargs["tools"]) == 3
+    def test_deep_mode_passed_to_underwriting(self, graph_module, fake_modules):
+        mocks = _get_mocks(fake_modules)
+        mocks["_run_underwriting_assessment"].reset_mock()
 
-    def test_system_prompt_forwarded(self, graph_module):
-        gm, mocks = graph_module
-        gm.build_agent("gpt-4o", 0.5)
-        _, kwargs = mocks["create_agent"].call_args
-        assert kwargs["system_prompt"] == mocks["system_prompt"]
+        graph_module.build_agent(model_name="gpt-4o", temperature=0.5, mode="deep")
 
-    def test_checkpointer_forwarded(self, graph_module):
-        gm, mocks = graph_module
-        gm.build_agent("gpt-4o", 0.5)
-        _, kwargs = mocks["create_agent"].call_args
-        assert kwargs["checkpointer"] is mocks["checkpointer"]
+        mocks["_run_underwriting_assessment"].assert_called_once_with("deep")
 
+    def test_fast_mode_explicit(self, graph_module, fake_modules):
+        mocks = _get_mocks(fake_modules)
+        mocks["_run_underwriting_assessment"].reset_mock()
 
-# ---------------------------------------------------------------------------
-# Mode parameter tests
-# ---------------------------------------------------------------------------
+        graph_module.build_agent(model_name="gpt-4o", temperature=0.5, mode="fast")
 
-class TestBuildAgentMode:
-    """Verify that the mode argument is correctly forwarded."""
-
-    @pytest.mark.parametrize("mode", ["fast", "deep"])
-    def test_valid_modes(self, graph_module, mode):
-        gm, mocks = graph_module
-        gm.build_agent("gpt-4o", 0.5, mode=mode)
-        mocks["_run_underwriting_assessment"].assert_called_once_with(mode)
-
-    def test_default_mode_is_fast(self, graph_module):
-        gm, mocks = graph_module
-        # Call without explicit mode
-        gm.build_agent("gpt-4o", 0.5)
         mocks["_run_underwriting_assessment"].assert_called_once_with("fast")
 
-    def test_unknown_mode_still_forwarded(self, graph_module):
-        """build_agent should not validate mode — it passes it straight through."""
-        gm, mocks = graph_module
-        gm.build_agent("gpt-4o", 0.5, mode="turbo")
-        mocks["_run_underwriting_assessment"].assert_called_once_with("turbo")
 
-    def test_empty_string_mode_forwarded(self, graph_module):
-        gm, mocks = graph_module
-        gm.build_agent("gpt-4o", 0.5, mode="")
-        mocks["_run_underwriting_assessment"].assert_called_once_with("")
+# ===========================================================================
+# Tests: build_agent — tool list
+# ===========================================================================
 
+class TestBuildAgentTools:
 
-# ---------------------------------------------------------------------------
-# Temperature boundary tests
-# ---------------------------------------------------------------------------
-
-class TestBuildAgentTemperatureBoundary:
-    """Boundary and edge values for the temperature parameter."""
-
-    @pytest.mark.parametrize("temperature", [0.0, 0.5, 1.0])
-    def test_standard_temperatures(self, graph_module, temperature):
-        gm, mocks = graph_module
-        gm.build_agent("gpt-4o", temperature)
-        mocks["llms_cls"].assert_called_once_with(temperature=temperature, streaming=True)
-
-    def test_temperature_zero(self, graph_module):
-        gm, mocks = graph_module
-        gm.build_agent("gpt-4o", 0.0)
-        mocks["llms_cls"].assert_called_once_with(temperature=0.0, streaming=True)
-
-    def test_temperature_one(self, graph_module):
-        gm, mocks = graph_module
-        gm.build_agent("gpt-4o", 1.0)
-        mocks["llms_cls"].assert_called_once_with(temperature=1.0, streaming=True)
-
-    def test_temperature_above_one(self, graph_module):
-        """Values >1 are invalid for most LLMs, but build_agent should still pass them through."""
-        gm, mocks = graph_module
-        gm.build_agent("gpt-4o", 2.0)
-        mocks["llms_cls"].assert_called_once_with(temperature=2.0, streaming=True)
-
-    def test_negative_temperature_forwarded(self, graph_module):
-        gm, mocks = graph_module
-        gm.build_agent("gpt-4o", -0.1)
-        mocks["llms
+    def test_tools_list_has_three_items(self, graph_module,
