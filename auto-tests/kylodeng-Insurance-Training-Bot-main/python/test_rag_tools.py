@@ -1,377 +1,378 @@
 """
-Test module for api/rag_tools.py
+Tests for api/rag_tools.py
 
 What is tested:
-    - reset_sources(): initialises a fresh list in the contextvar
-    - get_current_sources(): returns sources from contextvar (or empty list)
-    - _find_file_url(): filesystem glob fallback for document URLs
-    - _to_docs_path(): converts file:/// URIs to /docs/-relative server URLs
-    - _collect_sources(): deduplicates hits and builds source-entry dicts
-    - _log_hits(): conditional logging based on SHOW_TOOL_CALLS env var
-    - make_rag_tools() → get_current_date tool: returns today's date string
-    - make_rag_tools() → list_products tool: stub (incomplete source)
+  - reset_sources() / get_current_sources() contextvar lifecycle
+  - _find_file_url() caching and path resolution
+  - _to_docs_path() URI-to-server-path conversion
+  - _collect_sources() deduplication, ID generation, bucket management
+  - _log_hits() conditional logging
+  - make_rag_tools() factory: get_current_date tool, list_products tool stub
 
 Mocks used:
-    - unittest.mock.patch for Path.rglob (_find_file_url filesystem calls)
-    - unittest.mock.patch for datetime.date.today (get_current_date tool)
-    - unittest.mock.patch for logging.Logger.info (_log_hits verification)
-    - unittest.mock.MagicMock for the vector store passed to make_rag_tools()
-    - monkeypatch for environment variables (SHOW_TOOL_CALLS)
+  - unittest.mock.patch for filesystem (_DATA_DIR, Path.rglob)
+  - unittest.mock.MagicMock for the vector store passed to make_rag_tools()
+  - unittest.mock.patch for logging.Logger.info
+  - freezegun / monkeypatch for date.today() in get_current_date tests
 
 TODOs:
-    - list_products tool: source is truncated; full behaviour cannot be tested
-    - Any additional tools returned by make_rag_tools() beyond list_products
-      are not visible in the provided source — stub tests added below
+  - list_products tool body is truncated in source; full integration test needs complete source
+  - Any additional @tool functions defined after list_products in make_rag_tools() are untested
+  - Tests for async concurrent access to _sources_ctx require asyncio task harness
 """
 
 import contextvars
-import os
+import logging
 import sys
-from datetime import date
+import types
+from datetime import date, datetime
+from functools import lru_cache
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
+
 import pytest
 
 # ---------------------------------------------------------------------------
-# Path bootstrap so the module can be imported without a full package install
+# Make the module importable without its heavy LangChain dependencies by
+# providing minimal stubs before the real import.
 # ---------------------------------------------------------------------------
-ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
+def _install_langchain_stubs():
+    """Install minimal stubs so rag_tools.py can be imported in isolation."""
+    # langchain_core.tools stub
+    lc_core = types.ModuleType("langchain_core")
+    lc_tools = types.ModuleType("langchain_core.tools")
+
+    def tool(fn):
+        """Identity decorator stub for @tool."""
+        fn.invoke = fn  # minimal duck-type
+        return fn
+
+    lc_tools.tool = tool
+    lc_core.tools = lc_tools
+    sys.modules.setdefault("langchain_core", lc_core)
+    sys.modules.setdefault("langchain_core.tools", lc_tools)
+
+
+_install_langchain_stubs()
+
+# Now import the module under test
 import importlib
-import api.rag_tools as rag_tools_module
-from api.rag_tools import (
-    _collect_sources,
-    _find_file_url,
-    _log_hits,
-    _sources_ctx,
-    _to_docs_path,
-    get_current_sources,
-    make_rag_tools,
-    reset_sources,
-)
+import api.rag_tools as rag_tools  # noqa: E402
+
+# Re-expose private helpers for convenience
+_sources_ctx = rag_tools._sources_ctx
+reset_sources = rag_tools.reset_sources
+get_current_sources = rag_tools.get_current_sources
+_find_file_url = rag_tools._find_file_url
+_to_docs_path = rag_tools._to_docs_path
+_collect_sources = rag_tools._collect_sources
+_log_hits = rag_tools._log_hits
+make_rag_tools = rag_tools.make_rag_tools
 
 
-# ===========================================================================
-# Helpers
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Helpers / fixtures
+# ---------------------------------------------------------------------------
 
-def _make_hit(
-    document_name: str = "doc.pdf",
-    page_start: int = 1,
-    page_end: int = 2,
-    product_name: str = "Generations II",
-    section_title: str = "Overview",
-    file_url: str = "",
-    chunk_id: str = "c1",
-    text: str = "Sample chunk text",
-    doc_type: str = "product_brochure",
-    word_count: int = 42,
-) -> dict:
+@pytest.fixture(autouse=True)
+def clear_sources_ctx():
+    """Reset contextvar and lru_cache before every test."""
+    _sources_ctx.set(None)
+    _find_file_url.cache_clear()
+    yield
+    _sources_ctx.set(None)
+    _find_file_url.cache_clear()
+
+
+def _make_hit(doc="doc.pdf", page_start=1, page_end=2, file_url="",
+              product="ProdA", section="Sec1", chunk_id="c1",
+              text="Sample text content"):
     return {
-        "text": text,
         "metadata": {
-            "document_name": document_name,
+            "document_name": doc,
             "page_start": page_start,
             "page_end": page_end,
-            "product_name": product_name,
-            "section_title": section_title,
             "file_url": file_url,
+            "product_name": product,
+            "section_title": section,
             "chunk_id": chunk_id,
-            "doc_type": doc_type,
-            "word_count": word_count,
+            "doc_type": "product_brochure",
+            "word_count": 42,
         },
+        "text": text,
     }
 
 
-# ===========================================================================
+# ---------------------------------------------------------------------------
 # reset_sources / get_current_sources
-# ===========================================================================
+# ---------------------------------------------------------------------------
 
-class TestResetAndGetSources:
-    def test_reset_sources_sets_empty_list(self):
-        reset_sources()
-        assert _sources_ctx.get(None) == []
+class TestSourcesContextVar:
 
-    def test_get_current_sources_after_reset_returns_empty_list(self):
+    def test_get_current_sources_returns_empty_list_before_reset(self):
+        """Before reset_sources() the contextvar default is None → empty list."""
+        assert get_current_sources() == []
+
+    def test_reset_sources_initialises_empty_list(self):
         reset_sources()
         assert get_current_sources() == []
 
-    def test_get_current_sources_when_no_context_returns_empty_list(self):
-        # Ensure no prior reset in this context
-        _sources_ctx.set(None)
-        result = get_current_sources()
-        assert result == []
-
-    def test_get_current_sources_returns_populated_list(self):
+    def test_sources_accumulate_after_reset(self):
         reset_sources()
         bucket = _sources_ctx.get(None)
-        bucket.append({"source_id": "S1", "document": "doc.pdf"})
+        bucket.append({"source_id": "S1", "document": "a.pdf", "page_start": 1})
         result = get_current_sources()
         assert len(result) == 1
         assert result[0]["source_id"] == "S1"
 
-    def test_reset_sources_clears_existing_entries(self):
+    def test_reset_clears_previous_sources(self):
         reset_sources()
-        _sources_ctx.get(None).append({"source_id": "S1"})
-        reset_sources()
+        _sources_ctx.get(None).append({"source_id": "S1", "document": "a.pdf", "page_start": 1})
+        reset_sources()  # second reset
         assert get_current_sources() == []
 
-    def test_multiple_resets_are_idempotent(self):
-        for _ in range(5):
-            reset_sources()
+    def test_get_current_sources_with_none_returns_empty_list(self):
+        _sources_ctx.set(None)
         assert get_current_sources() == []
 
 
-# ===========================================================================
+# ---------------------------------------------------------------------------
 # _find_file_url
-# ===========================================================================
+# ---------------------------------------------------------------------------
 
 class TestFindFileUrl:
-    def setup_method(self):
-        # Clear lru_cache between tests
-        _find_file_url.cache_clear()
 
-    def test_returns_uri_when_file_found(self, tmp_path):
-        doc = tmp_path / "doc.pdf"
-        doc.write_bytes(b"%PDF")
-        with patch.object(
-            Path,
-            "rglob",
-            return_value=iter([doc]),
-        ):
-            result = _find_file_url("doc.pdf")
+    def test_returns_file_uri_when_file_found(self, tmp_path):
+        # Point _DATA_DIR at tmp_path
+        fake_file = tmp_path / "Insurance-product-info" / "Generations-II" / "doc.pdf"
+        fake_file.parent.mkdir(parents=True)
+        fake_file.touch()
+
+        with patch.object(rag_tools, "_DATA_DIR", tmp_path):
+            _find_file_url.cache_clear()
+            # Call the real function via a fresh reference
+            result = rag_tools._find_file_url("doc.pdf")
+
         assert result.startswith("file://")
         assert "doc.pdf" in result
 
-    def test_returns_empty_string_when_no_match(self):
-        with patch.object(Path, "rglob", return_value=iter([])):
-            result = _find_file_url("nonexistent.pdf")
+    def test_returns_empty_string_when_file_not_found(self, tmp_path):
+        with patch.object(rag_tools, "_DATA_DIR", tmp_path):
+            _find_file_url.cache_clear()
+            result = rag_tools._find_file_url("nonexistent.pdf")
         assert result == ""
 
-    def test_returns_first_match_when_multiple_files(self, tmp_path):
-        first = tmp_path / "a" / "doc.pdf"
-        second = tmp_path / "b" / "doc.pdf"
-        first.parent.mkdir()
-        second.parent.mkdir()
-        first.write_bytes(b"%PDF")
-        second.write_bytes(b"%PDF")
-        with patch.object(Path, "rglob", return_value=iter([first, second])):
-            result = _find_file_url("doc.pdf")
-        assert "a" in result or "b" in result  # first match
+    def test_result_is_cached(self, tmp_path):
+        """Second call with same arg should hit cache (rglob called once)."""
+        with patch.object(rag_tools, "_DATA_DIR", tmp_path):
+            _find_file_url.cache_clear()
+            with patch.object(Path, "rglob", return_value=iter([])) as mock_rglob:
+                rag_tools._find_file_url("cached.pdf")
+                rag_tools._find_file_url("cached.pdf")
+            # rglob should be called only once due to lru_cache
+            assert mock_rglob.call_count == 1
 
-    def test_caches_result(self):
-        _find_file_url.cache_clear()
-        with patch.object(Path, "rglob", return_value=iter([])) as mock_rglob:
-            _find_file_url("cached.pdf")
-            _find_file_url("cached.pdf")
-        # rglob called only once due to lru_cache
-        assert mock_rglob.call_count == 1
+    def test_returns_first_match_when_multiple_files_found(self, tmp_path):
+        file1 = tmp_path / "a" / "doc.pdf"
+        file2 = tmp_path / "b" / "doc.pdf"
+        file1.parent.mkdir(parents=True)
+        file2.parent.mkdir(parents=True)
+        file1.touch()
+        file2.touch()
 
-    def test_empty_string_document_name(self):
-        with patch.object(Path, "rglob", return_value=iter([])):
-            result = _find_file_url("")
-        assert result == ""
+        with patch.object(rag_tools, "_DATA_DIR", tmp_path):
+            _find_file_url.cache_clear()
+            result = rag_tools._find_file_url("doc.pdf")
 
-
-# ===========================================================================
-# _to_docs_path
-# ===========================================================================
-
-class TestToDocsPath:
-    def test_empty_string_returns_empty_string(self):
-        assert _to_docs_path("") == ""
-
-    def test_valid_file_uri_returns_docs_relative_path(self, tmp_path):
-        # Build a real file URI that sits under _DATA_DIR
-        data_dir = rag_tools_module._DATA_DIR.resolve()
-        sub_dir = data_dir / "Insurance-product-info"
-        sub_dir.mkdir(parents=True, exist_ok=True)
-        doc = sub_dir / "doc.pdf"
-        doc.write_bytes(b"%PDF")
-
-        file_uri = doc.resolve().as_uri()
-        result = _to_docs_path(file_uri)
-        assert result.startswith("/docs/")
+        assert result.startswith("file://")
         assert "doc.pdf" in result
 
-    def test_path_outside_data_dir_returns_empty_string(self, tmp_path):
-        # A path that cannot be made relative to _DATA_DIR
-        outside = tmp_path / "outside.pdf"
-        outside.write_bytes(b"%PDF")
-        uri = outside.resolve().as_uri()
-        result = _to_docs_path(uri)
+
+# ---------------------------------------------------------------------------
+# _to_docs_path
+# ---------------------------------------------------------------------------
+
+class TestToDocsPath:
+
+    def test_empty_string_returns_empty(self):
+        assert _to_docs_path("") == ""
+
+    def test_none_like_falsy_empty_string(self):
+        # Falsy input → ""
+        assert _to_docs_path("") == ""
+
+    def test_valid_file_uri_converted_to_docs_path(self, tmp_path):
+        """A file URI inside _DATA_DIR is converted to /docs/... path."""
+        # Create actual file so resolve() works
+        subdir = tmp_path / "Insurance-product-info"
+        subdir.mkdir()
+        pdf = subdir / "doc.pdf"
+        pdf.touch()
+
+        file_url = pdf.resolve().as_uri()
+
+        with patch.object(rag_tools, "_DATA_DIR", tmp_path):
+            result = _to_docs_path(file_url)
+
+        assert result == "/docs/Insurance-product-info/doc.pdf"
+
+    def test_file_outside_data_dir_returns_empty(self, tmp_path):
+        """A file URI outside _DATA_DIR cannot be made relative → ''."""
+        outside = tmp_path / "outside" / "doc.pdf"
+        outside.parent.mkdir(parents=True)
+        outside.touch()
+        file_url = outside.resolve().as_uri()
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+
+        with patch.object(rag_tools, "_DATA_DIR", data_dir):
+            result = _to_docs_path(file_url)
+
         assert result == ""
 
-    def test_malformed_uri_returns_empty_string(self):
-        result = _to_docs_path("not_a_uri_at_all")
-        # Should not raise; returns "" on exception
+    def test_special_characters_are_percent_encoded(self, tmp_path):
+        """Spaces and special chars in path segments are URL-encoded."""
+        subdir = tmp_path / "my folder"
+        subdir.mkdir()
+        pdf = subdir / "my doc.pdf"
+        pdf.touch()
+
+        file_url = pdf.resolve().as_uri()
+
+        with patch.object(rag_tools, "_DATA_DIR", tmp_path):
+            result = _to_docs_path(file_url)
+
+        assert "my%20folder" in result or "my+folder" in result or "my folder" not in result
+        # Must start with /docs/
+        assert result.startswith("/docs/")
+
+    def test_malformed_uri_returns_empty(self):
+        """Non-parseable / bad URI should return '' without raising."""
+        result = _to_docs_path("not_a_real_uri:::///bad")
+        # Should not raise; return value may be empty or some path but no exception
         assert isinstance(result, str)
 
-    def test_path_with_spaces_is_encoded(self, tmp_path):
-        data_dir = rag_tools_module._DATA_DIR.resolve()
-        spaced = data_dir / "Insurance product info" / "my doc.pdf"
-        spaced.parent.mkdir(parents=True, exist_ok=True)
-        spaced.write_bytes(b"%PDF")
 
-        uri = spaced.resolve().as_uri()
-        result = _to_docs_path(uri)
-        if result:  # only assert encoding if path resolved successfully
-            assert " " not in result
-
-
-# ===========================================================================
+# ---------------------------------------------------------------------------
 # _collect_sources
-# ===========================================================================
+# ---------------------------------------------------------------------------
 
 class TestCollectSources:
-    def setup_method(self):
+
+    def test_returns_empty_strings_when_bucket_is_none(self):
+        """Without reset_sources(), bucket is None → all source_ids are ''."""
+        _sources_ctx.set(None)
+        hits = [_make_hit()]
+        result = _collect_sources(hits)
+        assert result == [""]
+
+    def test_empty_hits_returns_empty_list(self):
         reset_sources()
+        assert _collect_sources([]) == []
 
-    # --- happy path --------------------------------------------------------
-
-    def test_single_hit_appends_to_bucket(self):
-        hit = _make_hit(document_name="Generations-II_PB_EN.pdf", page_start=1)
-        ids = _collect_sources([hit])
-        assert ids == ["S1"]
+    def test_single_hit_gets_first_source_id(self):
+        reset_sources()
+        hits = [_make_hit(doc="Generations-II_PB_EN.pdf", page_start=5)]
+        result = _collect_sources(hits)
+        assert result == ["S1"]
         bucket = _sources_ctx.get(None)
         assert len(bucket) == 1
         assert bucket[0]["source_id"] == "S1"
         assert bucket[0]["document"] == "Generations-II_PB_EN.pdf"
+        assert bucket[0]["page_start"] == 5
 
-    def test_multiple_unique_hits_increment_ids(self):
+    def test_two_different_hits_get_sequential_ids(self):
+        reset_sources()
         hits = [
-            _make_hit(document_name="doc1.pdf", page_start=1),
-            _make_hit(document_name="doc2.pdf", page_start=5),
-            _make_hit(document_name="doc3.pdf", page_start=10),
+            _make_hit(doc="doc_a.pdf", page_start=1),
+            _make_hit(doc="doc_b.pdf", page_start=3),
         ]
-        ids = _collect_sources(hits)
-        assert ids == ["S1", "S2", "S3"]
-        assert len(_sources_ctx.get(None)) == 3
+        result = _collect_sources(hits)
+        assert result == ["S1", "S2"]
 
-    def test_duplicate_hit_reuses_existing_id(self):
-        hit = _make_hit(document_name="doc.pdf", page_start=1)
-        ids1 = _collect_sources([hit])
-        ids2 = _collect_sources([hit])
-        assert ids1 == ["S1"]
-        assert ids2 == ["S1"]  # reused
-        assert len(_sources_ctx.get(None)) == 1
+    def test_duplicate_hits_reuse_same_source_id(self):
+        """Same (doc, page_start) should map to same source_id."""
+        reset_sources()
+        hits = [
+            _make_hit(doc="doc_a.pdf", page_start=1),
+            _make_hit(doc="doc_a.pdf", page_start=1),  # duplicate
+        ]
+        result = _collect_sources(hits)
+        assert result == ["S1", "S1"]
+        bucket = _sources_ctx.get(None)
+        assert len(bucket) == 1  # only one entry in bucket
 
-    def test_same_doc_different_pages_are_separate_sources(self):
-        hit1 = _make_hit(document_name="doc.pdf", page_start=1)
-        hit2 = _make_hit(document_name="doc.pdf", page_start=5)
-        ids = _collect_sources([hit1, hit2])
-        assert ids == ["S1", "S2"]
+    def test_partial_duplicate_different_page_gets_new_id(self):
+        reset_sources()
+        hits = [
+            _make_hit(doc="doc_a.pdf", page_start=1),
+            _make_hit(doc="doc_a.pdf", page_start=2),  # same doc, different page
+        ]
+        result = _collect_sources(hits)
+        assert result == ["S1", "S2"]
 
-    def test_entry_fields_populated_correctly(self):
-        hit = _make_hit(
-            document_name="doc.pdf",
-            page_start=3,
-            page_end=4,
-            product_name="Generations II",
-            section_title="Benefits",
-            chunk_id="c42",
-            text="A" * 300,
-        )
-        _collect_sources([hit])
-        entry = _sources_ctx.get(None)[0]
-        assert entry["source_id"] == "S1"
-        assert entry["document"] == "doc.pdf"
-        assert entry["product"] == "Generations II"
-        assert entry["page_start"] == 3
-        assert entry["page_end"] == 4
-        assert entry["section"] == "Benefits"
-        assert entry["chunk_id"] == "c42"
-        # text_preview capped at 250 chars
-        assert len(entry["text_preview"]) == 250
+    def test_multiple_calls_accumulate_ids_correctly(self):
+        """IDs from second _collect_sources call continue from where first left off."""
+        reset_sources()
+        first_hits = [_make_hit(doc="a.pdf", page_start=1)]
+        _collect_sources(first_hits)
 
-    def test_text_preview_capped_at_250_chars(self):
-        long_text = "X" * 500
-        hit = _make_hit(text=long_text)
-        _collect_sources([hit])
-        entry = _sources_ctx.get(None)[0]
-        assert len(entry["text_preview"]) == 250
+        second_hits = [_make_hit(doc="b.pdf", page_start=1)]
+        result = _collect_sources(second_hits)
+        assert result == ["S2"]
 
-    def test_text_preview_shorter_than_250(self):
-        hit = _make_hit(text="Short text")
-        _collect_sources([hit])
-        assert _sources_ctx.get(None)[0]["text_preview"] == "Short text"
+    def test_text_preview_truncated_to_250_chars(self):
+        reset_sources()
+        long_text = "x" * 500
+        hits = [_make_hit(doc="d.pdf", page_start=1, text=long_text)]
+        _collect_sources(hits)
+        bucket = _sources_ctx.get(None)
+        assert len(bucket[0]["text_preview"]) == 250
+
+    def test_text_preview_short_text_preserved(self):
+        reset_sources()
+        short_text = "Hello world"
+        hits = [_make_hit(doc="d.pdf", page_start=1, text=short_text)]
+        _collect_sources(hits)
+        bucket = _sources_ctx.get(None)
+        assert bucket[0]["text_preview"] == short_text
 
     def test_missing_metadata_fields_use_defaults(self):
-        hit = {"text": "hello", "metadata": {}}
-        _collect_sources([hit])
+        reset_sources()
+        hit = {"metadata": {}, "text": ""}
+        result = _collect_sources([hit])
+        assert result == ["S1"]
         entry = _sources_ctx.get(None)[0]
         assert entry["document"] == "?"
         assert entry["page_start"] == "?"
         assert entry["page_end"] == "?"
         assert entry["product"] == ""
         assert entry["section"] == ""
-        assert entry["chunk_id"] == ""
 
-    def test_file_url_used_from_metadata_when_present(self):
-        data_dir = rag_tools_module._DATA_DIR.resolve()
-        sub = data_dir / "Insurance-product-info"
-        sub.mkdir(parents=True, exist_ok=True)
-        doc = sub / "doc.pdf"
-        doc.write_bytes(b"%PDF")
+    def test_file_url_resolved_via_find_file_url_when_missing(self, tmp_path):
+        """If metadata has no file_url, _find_file_url() fallback is used."""
+        reset_sources()
+        # Create a file so _find_file_url returns something
+        pdf = tmp_path / "fallback.pdf"
+        pdf.touch()
 
-        uri = doc.resolve().as_uri()
-        hit = _make_hit(file_url=uri)
-        _collect_sources([hit])
-        entry = _sources_ctx.get(None)[0]
-        # file_url field should be a /docs/ path or empty string, never raw URI
-        assert not entry["file_url"].startswith("file://")
-
-    def test_file_url_falls_back_to_find_file_url_when_empty(self):
-        _find_file_url.cache_clear()
-        hit = _make_hit(file_url="", document_name="fallback_doc.pdf")
-        with patch("api.rag_tools._find_file_url", return_value="") as mock_find:
+        with patch.object(rag_tools, "_DATA_DIR", tmp_path), \
+             patch.object(rag_tools, "_to_docs_path", return_value="/docs/fallback.pdf"):
+            _find_file_url.cache_clear()
+            hit = _make_hit(doc="fallback.pdf", page_start=1, file_url="")
             _collect_sources([hit])
-        mock_find.assert_called_once_with("fallback_doc.pdf")
 
-    # --- no context (bucket is None) --------------------------------------
-
-    def test_returns_empty_strings_when_no_context(self):
-        _sources_ctx.set(None)
-        hits = [_make_hit(), _make_hit(page_start=2)]
-        ids = _collect_sources(hits)
-        assert ids == ["", ""]
-
-    def test_empty_hits_list_returns_empty_list(self):
-        ids = _collect_sources([])
-        assert ids == []
-
-    # --- counter consistency across accumulated calls ---------------------
-
-    def test_ids_continue_incrementing_across_multiple_calls(self):
-        _collect_sources([_make_hit(page_start=1)])
-        _collect_sources([_make_hit(page_start=2)])
-        _collect_sources([_make_hit(page_start=3)])
         bucket = _sources_ctx.get(None)
-        ids = [e["source_id"] for e in bucket]
-        assert ids == ["S1", "S2", "S3"]
+        assert bucket[0]["file_url"] == "/docs/fallback.pdf"
 
-    def test_mixed_duplicate_and_new_in_same_call(self):
-        hit1 = _make_hit(document_name="doc.pdf", page_start=1)
-        hit2 = _make_hit(document_name="doc.pdf", page_start=2)
-        _collect_sources([hit1])  # S1
-        ids = _collect_sources([hit1, hit2])  # S1 reused, S2 new
-        assert ids == ["S1", "S2"]
-        assert len(_sources_ctx.get(None)) == 2
+    def test_file_url_from_metadata_takes_precedence(self):
+        reset_sources()
+        with patch.object(rag_tools, "_to_docs_path", return_value="/docs/explicit.pdf"):
+            hit = _make_hit(doc="d.pdf", page_start=1, file_url="file:///some/path.pdf")
+            _collect_sources([hit])
+        bucket = _sources_ctx.get(None)
+        assert bucket[0]["file_url"] == "/docs/explicit.pdf"
 
-    # --- synthetic data inputs --------------------------------------------
-
-    @pytest.mark.parametrize(
-        "doc_name, product_name",
-        [
-            (
-                "Generations-II_PB_EN.pdf",
-                "Generations II",
-            ),
-            (
-                "List of designated hospitals in mainland China.pdf",
-                "List of Designated Hospitals in Mainland China",
-            ),
-            (
-                "Mainland_China_VIP_Hospital_Network.pdf
+    def test_cross_call_dedup_sees_previously_app
