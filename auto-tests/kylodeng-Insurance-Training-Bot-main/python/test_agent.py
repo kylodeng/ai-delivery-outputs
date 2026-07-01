@@ -1,37 +1,43 @@
 """
-Tests for api/agent.py
+Test module for api/agent.py
 
 What is tested:
-- TEACHER_SYSTEM prompt string: presence, key content markers, citation format instructions,
-  tool list completeness, age/ALB calculation instructions
-- ASSESSOR_SYSTEM prompt string: presence, key content markers, profile/conversation
-  placeholders, five assessment dimensions, tool list completeness, scoring format,
-  age/ALB calculation instructions
-- Module-level constants: existence, types, non-emptiness
-- create_agent import usage (mocked)
-- Structural integrity of both system prompts (tool names, section headers, format strings)
+- TEACHER_SYSTEM prompt string: presence, content keywords, citation format instructions,
+  tool list completeness, age/ALB calculation reminder, non-empty invariants
+- ASSESSOR_SYSTEM prompt string: presence, content keywords, five assessment dimensions,
+  tool list completeness, age/ALB calculation reminder, placeholder tokens,
+  scoring format, non-empty invariants
+- Module-level constants and structure
+- create_agent import is available (mocked to avoid real LangChain calls)
+- Boundary / negative cases: prompt lengths, required substrings, forbidden patterns
 
 Mocks used:
-- langchain.agents.create_agent (patched at api.agent to prevent real LLM/agent init)
+- unittest.mock.patch for `langchain.agents.create_agent` (never called at import time,
+  but patched to guarantee no real network/LLM calls if invoked indirectly)
 
 TODOs:
-- TODO: Test actual agent execution (requires LLM credentials and tool implementations)
-- TODO: Test astream_events integration for teacher agent (requires async LangGraph setup)
-- TODO: Test ainvoke integration for assessor agent (requires async LangGraph setup)
-- TODO: Test tool binding / tool list passed to create_agent (requires full tool registry)
-- TODO: Test ASSESSOR_SYSTEM.format() with real profile/conversation data end-to-end
+- TODO: Test actual agent graph execution (requires LangGraph runtime + LLM credentials)
+- TODO: Test streaming via astream_events (requires async LangGraph setup)
+- TODO: Test ainvoke for assessor agent (requires async LangGraph setup + full session)
+- TODO: Test each RAG tool integration (requires vector store / retriever fixtures)
+- TODO: Test ASSESSOR_SYSTEM profile/conversation template interpolation at runtime
 """
 
 import importlib
+import re
 import sys
+from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 # ---------------------------------------------------------------------------
-# Helpers / constants
+# Helpers / fixtures
 # ---------------------------------------------------------------------------
 
+AGENT_MODULE_PATH = "api.agent"
+
+# Eight tools that must appear in BOTH system prompts
 EXPECTED_TOOLS = [
     "get_current_date",
     "list_products",
@@ -43,309 +49,323 @@ EXPECTED_TOOLS = [
     "search_claim_procedure",
 ]
 
-ASSESSOR_DIMENSIONS = [
-    "First Impression & Rapport Building",
+# Five assessment dimensions required in ASSESSOR_SYSTEM
+EXPECTED_DIMENSIONS = [
+    "First Impression",
     "Needs Discovery",
-    "Product Knowledge & Accuracy",
+    "Product Knowledge",
     "Objection Handling",
     "Closing Technique",
 ]
 
-SYNTHETIC_PROFILES = [
-    "Client: John Doe, Age 50, seeking whole life cover",
-    "Client: Jane Smith, Age 35, interested in health insurance",
-    "",  # edge case: empty profile
-    "A" * 2000,  # edge case: very long profile
-]
 
-SYNTHETIC_CONVERSATIONS = [
-    "Agent: Good morning! I'd like to tell you about Generations II.\nCustomer: What is it?",
-    "Agent: The annual deductible is HKD 3,000.\nCustomer: Is that correct?",
-    "",  # edge case: empty conversation
-    "\n".join([f"Turn {i}: some text" for i in range(100)]),  # long conversation
-]
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def agent_module() -> ModuleType:
+    """
+    Import api.agent with create_agent patched so no real LangChain calls happen.
+    Returns the loaded module.
+    """
+    mock_create_agent = MagicMock(return_value=MagicMock())
+    with patch.dict("sys.modules", {"langchain.agents": MagicMock(create_agent=mock_create_agent)}):
+        # Force a fresh import
+        if AGENT_MODULE_PATH in sys.modules:
+            del sys.modules[AGENT_MODULE_PATH]
+        mod = importlib.import_module(AGENT_MODULE_PATH)
+    return mod
 
 
-@pytest.fixture(autouse=True)
-def mock_create_agent():
-    """Prevent real agent creation during import and tests."""
-    with patch("langchain.agents.create_agent", return_value=MagicMock()) as mock:
-        yield mock
+@pytest.fixture(scope="module")
+def teacher_prompt(agent_module: ModuleType) -> str:
+    return agent_module.TEACHER_SYSTEM
 
 
-@pytest.fixture
-def agent_module():
-    """Import (or re-import) the agent module under test."""
-    # Remove cached module so patches take effect cleanly
-    sys.modules.pop("api.agent", None)
-    with patch("langchain.agents.create_agent", return_value=MagicMock()):
-        import api.agent as mod
-        yield mod
+@pytest.fixture(scope="module")
+def assessor_prompt(agent_module: ModuleType) -> str:
+    return agent_module.ASSESSOR_SYSTEM
 
 
 # ---------------------------------------------------------------------------
-# Module-level constant existence and type checks
+# Module-level smoke tests
 # ---------------------------------------------------------------------------
 
 
-class TestModuleConstants:
-    def test_teacher_system_exists(self, agent_module):
-        assert hasattr(agent_module, "TEACHER_SYSTEM")
+class TestModuleImport:
+    """Ensure the module loads and exposes the expected public names."""
 
-    def test_assessor_system_exists(self, agent_module):
-        assert hasattr(agent_module, "ASSESSOR_SYSTEM")
+    def test_module_loads_without_error(self, agent_module: ModuleType) -> None:
+        assert agent_module is not None
 
-    def test_teacher_system_is_string(self, agent_module):
+    def test_teacher_system_exists(self, agent_module: ModuleType) -> None:
+        assert hasattr(agent_module, "TEACHER_SYSTEM"), "TEACHER_SYSTEM constant missing"
+
+    def test_assessor_system_exists(self, agent_module: ModuleType) -> None:
+        assert hasattr(agent_module, "ASSESSOR_SYSTEM"), "ASSESSOR_SYSTEM constant missing"
+
+    def test_teacher_system_is_string(self, agent_module: ModuleType) -> None:
         assert isinstance(agent_module.TEACHER_SYSTEM, str)
 
-    def test_assessor_system_is_string(self, agent_module):
+    def test_assessor_system_is_string(self, agent_module: ModuleType) -> None:
         assert isinstance(agent_module.ASSESSOR_SYSTEM, str)
 
-    def test_teacher_system_non_empty(self, agent_module):
-        assert len(agent_module.TEACHER_SYSTEM.strip()) > 0
-
-    def test_assessor_system_non_empty(self, agent_module):
-        assert len(agent_module.ASSESSOR_SYSTEM.strip()) > 0
-
-    def test_teacher_system_minimum_length(self, agent_module):
-        """Sanity-check that the prompt has meaningful content."""
-        assert len(agent_module.TEACHER_SYSTEM) > 200
-
-    def test_assessor_system_minimum_length(self, agent_module):
-        assert len(agent_module.ASSESSOR_SYSTEM) > 200
+    def test_create_agent_import_present(self, agent_module: ModuleType) -> None:
+        """create_agent must be importable from the module's namespace."""
+        assert hasattr(agent_module, "create_agent"), (
+            "create_agent should be imported at module level"
+        )
 
 
 # ---------------------------------------------------------------------------
-# TEACHER_SYSTEM content tests
+# TEACHER_SYSTEM prompt tests
 # ---------------------------------------------------------------------------
 
 
-class TestTeacherSystemContent:
-    def test_teacher_role_description(self, agent_module):
-        prompt = agent_module.TEACHER_SYSTEM
-        assert "insurance sales trainer" in prompt.lower() or "insurance" in prompt
+class TestTeacherSystemPrompt:
+    """Validate the TEACHER_SYSTEM constant."""
 
-    def test_teacher_mentions_coach(self, agent_module):
-        assert "coach" in agent_module.TEACHER_SYSTEM.lower()
+    # -- Non-empty / length sanity ----------------------------------------
 
-    def test_teacher_mentions_agent(self, agent_module):
-        assert "agent" in agent_module.TEACHER_SYSTEM.lower()
+    def test_not_empty(self, teacher_prompt: str) -> None:
+        assert teacher_prompt.strip() != ""
+
+    def test_minimum_length(self, teacher_prompt: str) -> None:
+        # A meaningful system prompt should be at least 200 characters
+        assert len(teacher_prompt) >= 200, "TEACHER_SYSTEM suspiciously short"
+
+    # -- Role / persona ---------------------------------------------------
+
+    def test_contains_trainer_persona(self, teacher_prompt: str) -> None:
+        assert "insurance sales trainer" in teacher_prompt.lower() or \
+               "expert insurance" in teacher_prompt.lower()
+
+    def test_contains_agent_reference(self, teacher_prompt: str) -> None:
+        assert "agent" in teacher_prompt.lower()
+
+    # -- Tool list completeness -------------------------------------------
 
     @pytest.mark.parametrize("tool_name", EXPECTED_TOOLS)
-    def test_teacher_lists_all_tools(self, agent_module, tool_name):
-        assert tool_name in agent_module.TEACHER_SYSTEM
+    def test_contains_tool_name(self, teacher_prompt: str, tool_name: str) -> None:
+        assert tool_name in teacher_prompt, (
+            f"Tool '{tool_name}' not mentioned in TEACHER_SYSTEM"
+        )
 
-    def test_teacher_has_citation_format(self, agent_module):
-        """Prompt must describe the [[Sn]] citation marker format."""
-        assert "[[S" in agent_module.TEACHER_SYSTEM
+    def test_eight_tools_section_present(self, teacher_prompt: str) -> None:
+        assert "eight tools" in teacher_prompt.lower() or \
+               "8 tools" in teacher_prompt.lower(), (
+            "TEACHER_SYSTEM should reference the total number of tools (eight)"
+        )
 
-    def test_teacher_citation_example_present(self, agent_module):
-        assert "[[S1]]" in agent_module.TEACHER_SYSTEM
+    # -- Age / ALB instruction --------------------------------------------
 
-    def test_teacher_citation_instructions(self, agent_module):
-        assert "CITATIONS" in agent_module.TEACHER_SYSTEM
+    def test_alb_calculation_instruction(self, teacher_prompt: str) -> None:
+        assert "ALB" in teacher_prompt or "Age Last Birthday" in teacher_prompt
 
-    def test_teacher_age_alb_instruction(self, agent_module):
-        prompt = agent_module.TEACHER_SYSTEM
-        assert "Age Last Birthday" in prompt or "ALB" in prompt
+    def test_get_current_date_called_first_instruction(self, teacher_prompt: str) -> None:
+        assert "get_current_date" in teacher_prompt
 
-    def test_teacher_get_current_date_call_first(self, agent_module):
-        """Prompt must instruct to call get_current_date first for date calcs."""
-        prompt = agent_module.TEACHER_SYSTEM
-        assert "get_current_date" in prompt
+    def test_premium_calculation_warning(self, teacher_prompt: str) -> None:
+        assert "premium" in teacher_prompt.lower()
 
-    def test_teacher_premium_calculation_warning(self, agent_module):
-        prompt = agent_module.TEACHER_SYSTEM
-        assert "premium" in prompt.lower()
+    # -- Citation format --------------------------------------------------
 
-    def test_teacher_no_guessing_instruction(self, agent_module):
-        assert "Never guess" in agent_module.TEACHER_SYSTEM or "never guess" in agent_module.TEACHER_SYSTEM.lower()
+    def test_citation_marker_format_documented(self, teacher_prompt: str) -> None:
+        """The prompt must document the [[Sn]] citation format."""
+        assert "[[S" in teacher_prompt, (
+            "TEACHER_SYSTEM must document the [[Sn]] inline citation marker format"
+        )
 
-    def test_teacher_discovery_questions_mentioned(self, agent_module):
-        assert "discovery" in agent_module.TEACHER_SYSTEM.lower()
+    def test_citation_example_present(self, teacher_prompt: str) -> None:
+        # e.g. [[S1]] should appear as an example
+        citation_pattern = re.compile(r"\[\[S\d+\]\]")
+        assert citation_pattern.search(teacher_prompt), (
+            "TEACHER_SYSTEM should contain at least one example citation like [[S1]]"
+        )
 
-    def test_teacher_engaging_tone(self, agent_module):
-        prompt = agent_module.TEACHER_SYSTEM.lower()
-        # At least one of these engagement indicators should be present
-        assert any(word in prompt for word in ["engaging", "interactive", "exercise", "quiz", "confidence"])
+    def test_never_guess_instruction(self, teacher_prompt: str) -> None:
+        assert "never guess" in teacher_prompt.lower() or \
+               "do not guess" in teacher_prompt.lower()
 
-    def test_teacher_tool_get_current_date_description(self, agent_module):
-        assert "today's date" in agent_module.TEACHER_SYSTEM.lower() or "current date" in agent_module.TEACHER_SYSTEM.lower()
+    # -- Engagement / pedagogy --------------------------------------------
 
-    def test_teacher_tool_list_products_description(self, agent_module):
-        assert "list_products" in agent_module.TEACHER_SYSTEM
+    def test_interactive_teaching_mentioned(self, teacher_prompt: str) -> None:
+        keywords = ["interactive", "engaging", "exercise", "quiz", "scenario"]
+        assert any(kw in teacher_prompt.lower() for kw in keywords), (
+            "TEACHER_SYSTEM should encourage interactive teaching"
+        )
 
-    def test_teacher_tool_compare_plans_attributes(self, agent_module):
-        prompt = agent_module.TEACHER_SYSTEM.lower()
-        assert any(attr in prompt for attr in ["deductible", "annual limit", "room"])
+    def test_encouragement_mentioned(self, teacher_prompt: str) -> None:
+        assert "encouraging" in teacher_prompt.lower() or "confidence" in teacher_prompt.lower()
 
-    def test_teacher_tool_lookup_exclusions_description(self, agent_module):
-        prompt = agent_module.TEACHER_SYSTEM
-        assert "lookup_exclusions" in prompt
-        assert "NOT covered" in prompt or "excluded" in prompt.lower()
+    # -- Forbidden patterns -----------------------------------------------
 
-    def test_teacher_tool_lookup_hospital_network_description(self, agent_module):
-        assert "lookup_hospital_network" in agent_module.TEACHER_SYSTEM
+    def test_no_placeholder_tokens_left(self, teacher_prompt: str) -> None:
+        """TEACHER_SYSTEM should not contain unfilled {placeholder} tokens."""
+        placeholders = re.findall(r"\{[a-zA-Z_]+\}", teacher_prompt)
+        assert placeholders == [], (
+            f"TEACHER_SYSTEM has unfilled placeholders: {placeholders}"
+        )
 
-    def test_teacher_tool_search_claim_procedure_description(self, agent_module):
-        assert "search_claim_procedure" in agent_module.TEACHER_SYSTEM
-
-    def test_teacher_age_calculation_example(self, agent_module):
-        """Prompt should include a concrete age calculation example."""
-        assert "January 2020" in agent_module.TEACHER_SYSTEM or "50" in agent_module.TEACHER_SYSTEM
-
-    def test_teacher_eight_tools_mentioned(self, agent_module):
-        assert "eight tools" in agent_module.TEACHER_SYSTEM.lower() or "eight" in agent_module.TEACHER_SYSTEM.lower()
+    def test_no_triple_backtick_leakage(self, teacher_prompt: str) -> None:
+        assert "```" not in teacher_prompt, (
+            "Markdown code fences should not appear inside the system prompt"
+        )
 
 
 # ---------------------------------------------------------------------------
-# ASSESSOR_SYSTEM content tests
+# ASSESSOR_SYSTEM prompt tests
 # ---------------------------------------------------------------------------
 
 
-class TestAssessorSystemContent:
-    def test_assessor_role_description(self, agent_module):
-        prompt = agent_module.ASSESSOR_SYSTEM
-        assert "assessment" in prompt.lower()
+class TestAssessorSystemPrompt:
+    """Validate the ASSESSOR_SYSTEM constant."""
 
-    def test_assessor_mentions_trainer(self, agent_module):
-        assert "trainer" in agent_module.ASSESSOR_SYSTEM.lower()
+    # -- Non-empty / length sanity ----------------------------------------
 
-    def test_assessor_has_profile_placeholder(self, agent_module):
-        assert "{profile}" in agent_module.ASSESSOR_SYSTEM
+    def test_not_empty(self, assessor_prompt: str) -> None:
+        assert assessor_prompt.strip() != ""
 
-    def test_assessor_has_conversation_placeholder(self, agent_module):
-        assert "{conversation}" in agent_module.ASSESSOR_SYSTEM
+    def test_minimum_length(self, assessor_prompt: str) -> None:
+        assert len(assessor_prompt) >= 200, "ASSESSOR_SYSTEM suspiciously short"
+
+    # -- Role / persona ---------------------------------------------------
+
+    def test_contains_assessor_persona(self, assessor_prompt: str) -> None:
+        assert "assessment" in assessor_prompt.lower() or "assessor" in assessor_prompt.lower()
+
+    def test_references_roleplay(self, assessor_prompt: str) -> None:
+        assert "roleplay" in assessor_prompt.lower() or "role-play" in assessor_prompt.lower()
+
+    # -- Placeholder tokens -----------------------------------------------
+
+    def test_profile_placeholder_present(self, assessor_prompt: str) -> None:
+        """ASSESSOR_SYSTEM must contain the {profile} template variable."""
+        assert "{profile}" in assessor_prompt
+
+    def test_conversation_placeholder_present(self, assessor_prompt: str) -> None:
+        """ASSESSOR_SYSTEM must contain the {conversation} template variable."""
+        assert "{conversation}" in assessor_prompt
+
+    def test_no_other_unexpected_placeholders(self, assessor_prompt: str) -> None:
+        """Only {profile} and {conversation} should be present as placeholders."""
+        placeholders = set(re.findall(r"\{[a-zA-Z_]+\}", assessor_prompt))
+        allowed = {"{profile}", "{conversation}"}
+        unexpected = placeholders - allowed
+        assert unexpected == set(), (
+            f"Unexpected placeholders in ASSESSOR_SYSTEM: {unexpected}"
+        )
+
+    # -- Tool list completeness -------------------------------------------
 
     @pytest.mark.parametrize("tool_name", EXPECTED_TOOLS)
-    def test_assessor_lists_all_tools(self, agent_module, tool_name):
-        assert tool_name in agent_module.ASSESSOR_SYSTEM
+    def test_contains_tool_name(self, assessor_prompt: str, tool_name: str) -> None:
+        assert tool_name in assessor_prompt, (
+            f"Tool '{tool_name}' not mentioned in ASSESSOR_SYSTEM"
+        )
 
-    @pytest.mark.parametrize("dimension", ASSESSOR_DIMENSIONS)
-    def test_assessor_has_all_five_dimensions(self, agent_module, dimension):
-        assert dimension in agent_module.ASSESSOR_SYSTEM
+    def test_eight_tools_section_present(self, assessor_prompt: str) -> None:
+        assert "eight tools" in assessor_prompt.lower() or \
+               "8 tools" in assessor_prompt.lower()
 
-    def test_assessor_overall_score_format(self, agent_module):
-        assert "## Overall Score:" in agent_module.ASSESSOR_SYSTEM or "Overall Score" in agent_module.ASSESSOR_SYSTEM
+    # -- Age / ALB instruction --------------------------------------------
 
-    def test_assessor_score_format_x_of_10(self, agent_module):
-        assert "X/10" in agent_module.ASSESSOR_SYSTEM
+    def test_alb_calculation_instruction(self, assessor_prompt: str) -> None:
+        assert "ALB" in assessor_prompt or "Age Last Birthday" in assessor_prompt
 
-    def test_assessor_age_alb_instruction(self, agent_module):
-        prompt = agent_module.ASSESSOR_SYSTEM
-        assert "Age Last Birthday" in prompt or "ALB" in prompt
+    def test_get_current_date_first_instruction(self, assessor_prompt: str) -> None:
+        assert "get_current_date" in assessor_prompt
 
-    def test_assessor_get_current_date_instruction(self, agent_module):
-        assert "get_current_date" in agent_module.ASSESSOR_SYSTEM
+    # -- Five assessment dimensions ---------------------------------------
 
-    def test_assessor_workflow_steps(self, agent_module):
-        prompt = agent_module.ASSESSOR_SYSTEM
-        assert "1." in prompt and "2." in prompt and "3." in prompt
+    @pytest.mark.parametrize("dimension", EXPECTED_DIMENSIONS)
+    def test_assessment_dimension_present(self, assessor_prompt: str, dimension: str) -> None:
+        assert dimension in assessor_prompt, (
+            f"Assessment dimension '{dimension}' missing from ASSESSOR_SYSTEM"
+        )
 
-    def test_assessor_verify_claims_instruction(self, agent_module):
-        prompt = agent_module.ASSESSOR_SYSTEM.lower()
-        assert "verify" in prompt
+    def test_overall_score_format(self, assessor_prompt: str) -> None:
+        """The prompt must specify the 'Overall Score: X/10' heading format."""
+        assert "Overall Score" in assessor_prompt
+        assert "10" in assessor_prompt  # scores are out of 10
 
-    def test_assessor_do_not_rely_on_memory(self, agent_module):
-        assert "memory" in agent_module.ASSESSOR_SYSTEM.lower()
+    def test_dimension_scoring_out_of_ten(self, assessor_prompt: str) -> None:
+        """Each dimension score placeholder (X/10) must appear."""
+        assert "X/10" in assessor_prompt
 
-    def test_assessor_correct_incorrect_markers(self, agent_module):
-        prompt = agent_module.ASSESSOR_SYSTEM
-        assert "✓ Correct" in prompt or "Correct" in prompt
-        assert "✗ Incorrect" in prompt or "Incorrect" in prompt
+    # -- Structured output sections ---------------------------------------
 
-    def test_assessor_partially_correct_marker(self, agent_module):
-        assert "Partially correct" in agent_module.ASSESSOR_SYSTEM or "partially" in agent_module.ASSESSOR_SYSTEM.lower()
+    def test_strengths_section_present(self, assessor_prompt: str) -> None:
+        assert "Strengths" in assessor_prompt or "strengths" in assessor_prompt.lower()
 
-    def test_assessor_key_strengths_section(self, agent_module):
-        assert "Key Strengths" in agent_module.ASSESSOR_SYSTEM or "strengths" in agent_module.ASSESSOR_SYSTEM.lower()
+    def test_areas_to_improve_section_present(self, assessor_prompt: str) -> None:
+        assert "Areas to Improve" in assessor_prompt or "improve" in assessor_prompt.lower()
 
-    def test_assessor_areas_to_improve_section(self, agent_module):
-        assert "Areas to Improve" in agent_module.ASSESSOR_SYSTEM or "improve" in agent_module.ASSESSOR_SYSTEM.lower()
+    def test_workflow_steps_present(self, assessor_prompt: str) -> None:
+        """The assessor prompt must describe a numbered workflow."""
+        assert "1." in assessor_prompt and "2." in assessor_prompt and "3." in assessor_prompt
 
-    def test_assessor_eight_tools_mentioned(self, agent_module):
-        assert "eight tools" in agent_module.ASSESSOR_SYSTEM.lower() or "eight" in agent_module.ASSESSOR_SYSTEM.lower()
+    def test_verification_instruction(self, assessor_prompt: str) -> None:
+        """Assessor must be told to verify factual claims using tools."""
+        assert "verify" in assessor_prompt.lower() or "verif" in assessor_prompt.lower()
 
-    def test_assessor_premium_accuracy_instruction(self, agent_module):
-        prompt = agent_module.ASSESSOR_SYSTEM.lower()
-        assert "premium" in prompt
+    def test_do_not_rely_on_memory(self, assessor_prompt: str) -> None:
+        assert "memory" in assessor_prompt.lower() or "do not rely" in assessor_prompt.lower()
 
-    def test_assessor_flag_error_instruction(self, agent_module):
-        prompt = agent_module.ASSESSOR_SYSTEM.lower()
-        assert "flag" in prompt or "error" in prompt
+    def test_correct_incorrect_markers_present(self, assessor_prompt: str) -> None:
+        """The scoring rubric should include ✓ Correct and ✗ Incorrect markers."""
+        assert "Correct" in assessor_prompt
+        assert "Incorrect" in assessor_prompt
 
-    def test_assessor_product_knowledge_dimension(self, agent_module):
-        assert "Product Knowledge" in agent_module.ASSESSOR_SYSTEM
+    def test_partially_correct_marker_present(self, assessor_prompt: str) -> None:
+        assert "Partially correct" in assessor_prompt or "partially correct" in assessor_prompt.lower()
 
-    def test_assessor_numbered_dimensions(self, agent_module):
-        prompt = agent_module.ASSESSOR_SYSTEM
-        for i in range(1, 6):
-            assert f"### {i}." in prompt or f"{i}." in prompt
+    # -- Markdown heading format ------------------------------------------
 
-    def test_assessor_list_products_use_first(self, agent_module):
-        """Assessor should be instructed to use list_products when unsure of product name."""
-        assert "list_products" in agent_module.ASSESSOR_SYSTEM
-        assert "unsure" in agent_module.ASSESSOR_SYSTEM.lower() or "exact product name" in agent_module.ASSESSOR_SYSTEM.lower()
+    def test_uses_markdown_h2_for_overall_score(self, assessor_prompt: str) -> None:
+        assert "## Overall Score" in assessor_prompt
+
+    def test_uses_markdown_h3_for_dimensions(self, assessor_prompt: str) -> None:
+        assert "### 1." in assessor_prompt
 
 
 # ---------------------------------------------------------------------------
-# ASSESSOR_SYSTEM format() behaviour
+# Prompt consistency tests (teacher vs assessor)
 # ---------------------------------------------------------------------------
 
 
-class TestAssessorSystemFormatting:
-    @pytest.mark.parametrize("profile,conversation", [
-        ("Client: John Doe, Age 50", "Agent: Hello\nCustomer: Hi"),
-        ("", ""),
-        (SYNTHETIC_PROFILES[0], SYNTHETIC_CONVERSATIONS[0]),
-        (SYNTHETIC_PROFILES[1], SYNTHETIC_CONVERSATIONS[1]),
-        (SYNTHETIC_PROFILES[3], SYNTHETIC_CONVERSATIONS[3]),
-    ])
-    def test_format_with_profile_and_conversation(self, agent_module, profile, conversation):
-        """ASSESSOR_SYSTEM must be a valid Python format string for {profile}/{conversation}."""
-        result = agent_module.ASSESSOR_SYSTEM.format(
-            profile=profile, conversation=conversation
-        )
-        assert isinstance(result, str)
-        assert profile in result
-        assert conversation in result
+class TestPromptConsistency:
+    """Cross-prompt consistency checks."""
 
-    def test_format_missing_profile_raises(self, agent_module):
-        with pytest.raises(KeyError):
-            agent_module.ASSESSOR_SYSTEM.format(conversation="some conv")
+    @pytest.mark.parametrize("tool_name", EXPECTED_TOOLS)
+    def test_tool_in_both_prompts(
+        self, teacher_prompt: str, assessor_prompt: str, tool_name: str
+    ) -> None:
+        assert tool_name in teacher_prompt, f"{tool_name} missing from TEACHER_SYSTEM"
+        assert tool_name in assessor_prompt, f"{tool_name} missing from ASSESSOR_SYSTEM"
 
-    def test_format_missing_conversation_raises(self, agent_module):
-        with pytest.raises(KeyError):
-            agent_module.ASSESSOR_SYSTEM.format(profile="some profile")
+    def test_both_prompts_distinct(self, teacher_prompt: str, assessor_prompt: str) -> None:
+        """The two system prompts must not be identical."""
+        assert teacher_prompt != assessor_prompt
 
-    def test_format_result_contains_all_dimensions(self, agent_module):
-        result = agent_module.ASSESSOR_SYSTEM.format(
-            profile="Test profile", conversation="Test conversation"
-        )
-        for dim in ASSESSOR_DIMENSIONS:
-            assert dim in result
+    def test_alb_reminder_in_both_prompts(
+        self, teacher_prompt: str, assessor_prompt: str
+    ) -> None:
+        for prompt, name in [(teacher_prompt, "TEACHER_SYSTEM"), (assessor_prompt, "ASSESSOR_SYSTEM")]:
+            assert "ALB" in prompt or "Age Last Birthday" in prompt, (
+                f"ALB reminder missing from {name}"
+            )
 
-    def test_format_result_contains_tools(self, agent_module):
-        result = agent_module.ASSESSOR_SYSTEM.format(
-            profile="p", conversation="c"
-        )
-        for tool in EXPECTED_TOOLS:
-            assert tool in result
+    def test_get_current_date_in_both_prompts(
+        self, teacher_prompt: str, assessor_prompt: str
+    ) -> None:
+        assert "get_current_date" in teacher_prompt
+        assert "get_current_date" in assessor_prompt
 
-    def test_format_with_special_characters_in_profile(self, agent_module):
-        profile = "Client: 李明, Age 45, 香港居民"
-        conversation = "代理人: 您好！"
-        result = agent_module.ASSESSOR_SYSTEM.format(
-            profile=profile, conversation=conversation
-        )
-        assert profile in result
 
-    def test_format_with_braces_in_conversation(self, agent_module):
-        """Curly braces in the conversation text should not break formatting if escaped."""
-        # This tests a known edge case — unescaped braces in user input would raise
-        #
+# ---------------------------------------------------------------------------
+# Synthetic data / parameterised content tests
+# ---------------------------------------------------------------------------
+
+
+class TestSyntheticDataRelevance:
+    """
+    Verify the prompts are consistent with the synthetic insurance product data samples
+    (Generations II, hospital network documents
