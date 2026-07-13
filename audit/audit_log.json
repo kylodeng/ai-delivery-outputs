@@ -1583,5 +1583,16 @@
     "output_url": "",
     "run_url": "https://github.com/kylodeng/Insurance-Training-Bot-main/actions/runs/29244524588",
     "summary": "Expecting value: line 1 column 1 (char 0)"
+  },
+  {
+    "timestamp": "2026-07-13T11:22:29Z",
+    "tool": "code-review",
+    "status": "SUCCESS",
+    "source_repo": "kylodeng/underwriting_chatbot-main",
+    "output_url": "https://github.com/kylodeng/ai-delivery-outputs/blob/main/code-review/kylodeng-underwriting_chatbot-main-20260713.md",
+    "run_url": "https://github.com/kylodeng/underwriting_chatbot-main/actions/runs/29245948141",
+    "summary": "Score 62/100 - 17 findings - REQUEST_CHANGES",
+    "score": 62,
+    "findings_count": 17
   }
 ]
