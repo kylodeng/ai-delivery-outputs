@@ -1574,5 +1574,14 @@
     "summary": "Score 62/100 - 16 findings - REQUEST_CHANGES",
     "score": 62,
     "findings_count": 16
+  },
+  {
+    "timestamp": "2026-07-13T10:58:22Z",
+    "tool": "code-review",
+    "status": "FAILED",
+    "source_repo": "kylodeng/Insurance-Training-Bot-main",
+    "output_url": "",
+    "run_url": "https://github.com/kylodeng/Insurance-Training-Bot-main/actions/runs/29244524588",
+    "summary": "Expecting value: line 1 column 1 (char 0)"
   }
 ]
