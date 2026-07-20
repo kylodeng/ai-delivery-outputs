@@ -1644,5 +1644,16 @@
       "ARCHITECTURE.md",
       "RUNBOOK.md"
     ]
+  },
+  {
+    "timestamp": "2026-07-20T10:49:23Z",
+    "tool": "code-review",
+    "status": "SUCCESS",
+    "source_repo": "kylodeng/Insurance-Training-Bot-main",
+    "output_url": "https://github.com/kylodeng/ai-delivery-outputs/blob/main/code-review/kylodeng-Insurance-Training-Bot-main-20260720.md",
+    "run_url": "https://github.com/kylodeng/Insurance-Training-Bot-main/actions/runs/29736304059",
+    "summary": "Score 58/100 - 16 findings - REQUEST_CHANGES",
+    "score": 58,
+    "findings_count": 16
   }
 ]
