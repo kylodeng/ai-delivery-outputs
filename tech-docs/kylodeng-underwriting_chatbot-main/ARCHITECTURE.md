@@ -4,7 +4,7 @@
 
 ## 1. Overview
 
-The Underwriting Chatbot is an AI-powered insurance underwriting assistant that enables underwriters to assess customer risk profiles through a conversational interface. The system ingests structured customer data from multiple SQLite databases (customer profiles, financial data, KYC records, application profiles, and ML model predictions), runs parallel specialist LLM assessments across domains such as finance, health, and life risk, and aggregates results into a structured `UnderwritingReport`. A FastAPI backend exposes a streaming Server-Sent Events (SSE) chat endpoint consumed by a frontend UI, with Redis used for LangGraph conversation checkpointing and PostgreSQL for Chainlit session persistence. The repository also includes five GitHub Actions–based AI delivery tools (code review, tech docs, business docs, auto-testing, and UAT facilitation) powered by Anthropic's Claude API.
+The Underwriting Chatbot is an AI-powered insurance underwriting assistant that enables underwriters to assess customer risk profiles through a conversational interface. The system ingests pre-computed customer data from multiple SQLite databases, runs parallel multi-specialist LLM assessments (using Anthropic Claude as the primary model and Google Gemini as an alternative), and produces structured underwriting reports covering finance, health, life, KYC, and other risk domains. A React/Chainlit-based frontend communicates with a FastAPI streaming backend over Server-Sent Events (SSE); Redis provides conversational memory via LangGraph checkpointing, and PostgreSQL persists Chainlit session/user data. A suite of five GitHub Actions CI/CD workflows automate code review, technical documentation, business documentation, test generation, and UAT facilitation — all powered by Claude via the Anthropic API.
 
 ---
 
@@ -12,80 +12,86 @@ The Underwriting Chatbot is an AI-powered insurance underwriting assistant that 
 
 | Resource | Type | Cloud Provider | Purpose |
 |---|---|---|---|
-| `backend` | Docker container (FastAPI) | Self-hosted / Docker Compose | Core API server; hosts LangGraph agent, assessment pipeline, SSE streaming endpoint |
-| `frontend` | Docker container | Self-hosted / Docker Compose | User-facing chat UI (Chainlit-based) |
-| `redis` | Docker container (`redis/redis-stack-server:7.2.0-v14`) | Self-hosted / Docker Compose | LangGraph conversation checkpointing (in-memory, ephemeral) |
-| `postgres` | Docker container (`postgres:16-alpine`) | Self-hosted / Docker Compose | Chainlit session/user data persistence |
-| `customer_profile.db` | SQLite database (read-only volume) | Self-hosted | Customer demographic and profile data |
-| `feature_importance.db` | SQLite database (read-only volume) | Self-hosted | CatBoost model feature importance data |
-| `model_predictions.db` | SQLite database (read-only volume) | Self-hosted | Pre-computed ML risk classification predictions |
-| `application_profile.db` | SQLite database (read-only volume) | Self-hosted | Insurance application data |
-| `postgres_data` | Docker named volume | Self-hosted | Persistent PostgreSQL storage |
-| Anthropic Claude API | External SaaS API | Anthropic | LLM inference for agent reasoning and specialist assessments |
-| Google Gemini API | External SaaS API | Google Cloud | Alternative LLM provider (configured but usage unclear) |
-| GitHub Actions runners | CI/CD compute (`ubuntu-latest`) | GitHub | Five AI delivery workflow tools |
-| `ai-delivery-outputs` | GitHub repository | GitHub | Stores generated docs, test reports, UAT packs from AI tools |
-| SendGrid | External SaaS API | Twilio/SendGrid | Email notifications from AI delivery tools |
+| `backend` | Docker container (FastAPI, Python 3.x) | Self-hosted / Docker Compose | Serves `/chat` SSE endpoint and `/health`; orchestrates LangGraph agent and LLM calls |
+| `frontend` | Docker container (Chainlit/React) | Self-hosted / Docker Compose | Conversational UI for underwriters |
+| `redis` (redis-stack-server:7.2.0-v14) | Docker container | Self-hosted / Docker Compose | LangGraph conversation checkpointing / session memory |
+| `postgres` (postgres:16-alpine) | Docker container | Self-hosted / Docker Compose | Chainlit session/user persistence |
+| `customer_profile.db` | SQLite file (read-only volume mount) | Self-hosted | Customer demographic and profile data |
+| `feature_importance.db` | SQLite file (read-only volume mount) | Self-hosted | CatBoostClassifier feature importance scores |
+| `model_predictions.db` | SQLite file (read-only volume mount) | Self-hosted | Pre-computed ML model predictions |
+| `application_profile.db` | SQLite file (read-only volume mount) | Self-hosted | Insurance application data |
+| `postgres_data` | Docker named volume | Self-hosted | PostgreSQL data persistence |
+| Anthropic Claude API (claude-sonnet-4-20250514, claude-haiku-4-5-20251001) | External SaaS API | Anthropic | Primary LLM for chat, specialist assessment, aggregation, and all CI workflows |
+| Google Gemini API (gemini-3-flash-preview) | External SaaS API | Google Cloud | Alternative LLM provider (partially configured) |
+| GitHub Actions runners (ubuntu-latest) | Managed CI/CD | GitHub | Executes all five automation workflow tools |
+| `ai-delivery-outputs` (GitHub repo) | External GitHub repository | GitHub | Stores generated docs, test files, UAT packs, and code review reports |
+| SendGrid | External SaaS API | Twilio/SendGrid | Email notifications for CI workflow outputs |
+| CatBoostClassifier model | Serialised ML model | Self-hosted | Pre-trained risk classification model (referenced in model_card.json) |
 
 ---
 
 ## 3. Data Flow
 
-### Chat / Assessment Flow
+### Primary Chat Flow
 
-1. **User sends message** via the frontend UI (HTTP POST to `http://backend:8000/chat`) with `session_id`, `model`, `mode`, `temperature`, and `message` fields.
-2. **FastAPI backend** receives the `ChatRequest`, builds a LangGraph agent (`build_agent`) with the selected model and tools, and streams events via SSE (`EventSourceResponse`).
-3. **LangGraph agent** (backed by `AsyncRedisSaver`) loads conversation history from **Redis** keyed by `session_id`, then invokes the LLM (Claude or Gemini) with the system prompt and conversation history.
-4. **Agent decides tool calls** by returning JSON with `action: "tool_call"`. Available tools are:
-   - `get_customer_profile` — queries SQLite `customer_profile.db`
-   - `customer_lookalike` — reads `backend/tmp/customer_similarity_dict.json` to find similar customers
-   - `run_underwriting_assessment` — triggers the parallel specialist assessment pipeline
-5. **Underwriting assessment** (`_run_underwriting_assessment`): for each domain category (finance, health, life, etc.) a specialist LLM call is made **concurrently** (bounded by `asyncio.Semaphore(4)`), reading prompt criteria from `prompts/assessment_criterias.json`.
-6. **Aggregator LLM** receives all specialist reports and produces a structured `UnderwritingReport` Pydantic model via `structured_output`.
-7. **Rendered report** is returned to the agent as a tool result; the agent formats a final answer.
-8. **SSE events** stream back to the frontend: `tool_start`, `tool_end`, `response` (text chunks), `chart` (feature importance/lookalike data), and `report` (full JSON report).
-9. **Conversation state** is checkpointed back to Redis after each turn.
-10. **Frontend** renders streamed text, charts, and the structured underwriting report in the UI.
+1. **User Input**: An underwriter types a message in the Chainlit frontend (port 8080). The frontend sends a POST request to `http://backend:8000/chat` with `{message, temperature, session_id, model, mode}`.
 
-### AI Delivery Tools Flow (GitHub Actions)
+2. **Agent Initialisation**: The FastAPI backend (`main.py`) calls `build_agent()`, which initialises a LangGraph agent with Redis-backed checkpointing (`AsyncRedisSaver`) keyed by `session_id`. Prior conversation turns are loaded from Redis.
 
-1. A trigger event (PR open, push to `main`, release tag, schedule) fires a GitHub Actions workflow.
-2. The workflow checks out the source repo and runs a Python script (e.g., `tool1_code_review.py`).
-3. The script fetches repo files or PR diffs via the **GitHub API** using `GH_TOKEN`.
-4. Content is sent to **Claude API** (`claude-sonnet-4-6`) for analysis.
-5. Results are written to the **`ai-delivery-outputs`** GitHub repository via the GitHub Contents API.
-6. A **SendGrid** email notification is sent to `kylo.deng@capco.com`.
-7. For code review, a PR comment is also posted via the GitHub Issues API.
+3. **Agent Reasoning (Tool Selection)**: The LangGraph agent sends the user message plus conversation history to the Claude LLM (via `langchain_anthropic`). The LLM responds with a JSON tool-call directive (e.g., `{"action": "tool_call", "tool_name": "get_customer_profile", ...}`).
+
+4. **Tool: `get_customer_profile`**: The agent invokes the profile tool, which queries the `customer_profile.db` SQLite database (mounted read-only at `/data/customer_profile.db`) and returns structured customer data.
+
+5. **Tool: `customer_lookalike`**: Optionally invoked; reads `backend/tmp/customer_similarity_dict.json` to find similar historical customers by ID.
+
+6. **Tool: `run_underwriting_assessment`**: The agent invokes the assessment tool with the customer profile string. Inside `assessment.py`:
+   - Up to 4 concurrent specialist LLM calls (semaphore-limited) are dispatched via `asyncio`, each targeting a domain category (finance, health, life, KYC, etc.) using prompts from `assessment_criterias.json`.
+   - Specialist LLM: `claude-haiku-4-5-20251001` (anthropic-fast), max 1,500 tokens per specialist, tagged `"thinking"`.
+   - Results are aggregated by a second LLM call using `claude-haiku-4-5-20251001`, max 8,000 tokens, with structured output enforced via Pydantic (`UnderwritingReport`).
+
+7. **Streaming Response**: The backend streams SSE events back to the frontend: `tool_start`, `tool_end`, `response` (text chunks), `chart` (feature importance visualisations), and `done`. The frontend renders these progressively.
+
+8. **Conversation Persistence**: Each turn's messages (including tool calls/results) are checkpointed to Redis via LangGraph's `AsyncRedisSaver`.
+
+9. **PostgreSQL**: Chainlit session metadata (users, threads) is persisted to the `chainlit` PostgreSQL database.
+
+### CI/CD Automation Flow (GitHub Actions)
+
+10. **Trigger**: A PR, push to `main`, scheduled cron, version tag, or manual dispatch triggers one of five workflows.
+
+11. **Claude Analysis**: The workflow script fetches repo files or PR diffs via the GitHub REST API, sends them to `claude-sonnet-4-6` (hardcoded in `shared.py`), and receives structured output (JSON or Markdown).
+
+12. **Output Storage**: Generated artefacts (review JSON, docs, test files, UAT packs) are committed to the `ai-delivery-outputs` GitHub repository via the GitHub API.
+
+13. **Notification**: SendGrid sends an email to `kylo.deng@capco.com` with links to the generated output.
 
 ---
 
 ## 4. Security Posture
 
-### ✅ What Is Secured
+### What IS Secured
 
-- **API keys in GitHub Actions** are stored as GitHub repository secrets (`ANTHROPIC_API_KEY`, `GH_TOKEN`, `SENDGRID_API_KEY`) and injected as environment variables — not hardcoded in workflow files.
-- **SQLite databases are mounted read-only** (`ro`) in the backend container, preventing accidental writes.
-- **Semaphore on concurrent LLM calls** (`asyncio.Semaphore(4)`) prevents runaway API spend from unbounded parallelism.
-- **Model card stored in-repo** provides audit trail for the CatBoost classifier used in predictions.
-- **Specialist LLM token cap** (`specialist_max_tokens: 1500`) limits runaway output costs.
-- **System prompt instructs the agent** never to reveal internal instructions or tool inventory to users.
+- **API keys in CI**: `ANTHROPIC_API_KEY`, `GH_TOKEN`, `SENDGRID_API_KEY`, and `GOOGLE_API_KEY` are stored as GitHub Actions secrets and injected at runtime — not hardcoded in workflow YAML.
+- **SQLite databases mounted read-only**: All four SQLite databases are mounted with `:ro` in Docker Compose, preventing write access from the backend container.
+- **Prompt injection guard**: The system prompt explicitly instructs the agent never to reveal internal instructions or tool details.
+- **Semaphore limiting**: Concurrent LLM calls are capped at 4 to prevent runaway resource consumption.
+- **Token caps**: Specialist LLM responses are hard-capped at 1,500 tokens; aggregator at 8,000 tokens.
 
-### ❌ Gaps and Missing Controls
+### What IS NOT Secured (Gaps)
 
-- **PostgreSQL credentials are hardcoded** in `docker-compose.yml` (`POSTGRES_USER: chainlit`, `POSTGRES_PASSWORD: chainlit`). These must be replaced with secrets before any non-local deployment.
-- **Redis has no authentication configured** — the Redis container is exposed on port `6379` with no password, `requirepass`, or TLS. Conversation history is unencrypted in transit and at rest.
-- **No encryption at rest** for Redis, SQLite databases, or PostgreSQL named volume. Sensitive customer PII and financial data in SQLite files are unencrypted.
-- **CORS is fully open** (`allow_origins=["*"]`, `allow_methods=["*"]`, `allow_headers=["*"]`) in `main.py`. This is acceptable for local dev but is a critical misconfiguration in production.
-- **No authentication or authorization on the `/chat` endpoint** — any caller can query any `session_id` or submit arbitrary messages.
-- **`GH_TOKEN` scope is unknown** — if it has write access to the entire GitHub organization, it is overly broad. [TODO: restrict to minimum required scopes — `contents:write` on `ai-delivery-outputs` and `pull-requests:write` on source repos only.]
-- **Customer similarity dict is stored in `backend/tmp/`** as a plain JSON file, unencrypted, and contains customer IDs in plaintext.
-- **No secrets scanning** configured in the repository (no `.gitleaks`, `trufflehog`, or GitHub secret scanning policy visible).
-- **No input validation/sanitization** on the `message` field in `ChatRequest` beyond Pydantic type checking — prompt injection is a risk.
-- **No rate limiting** on the `/chat` endpoint.
-- **`GOOGLE_API_KEY` loaded from `.env`** directly via `dotenv` in `LLMS.py` — if `.env` is accidentally committed, the key is exposed. Verify `.env` is in `.gitignore`. [TODO: confirm `.env` is gitignored.]
-- **`_charts_sent` is a module-level in-process set** — it does not survive restarts and will diverge across multiple backend replicas.
-- **No TLS/HTTPS** configured at the Docker Compose level — all traffic between frontend and backend is plaintext HTTP.
-- **Shared AI delivery tools use a hardcoded `MODEL = "claude-sonnet-4-6"` in `shared.py`** which differs from the model IDs in `config.yml`, suggesting a version mismatch or copy-paste error.
+- **⚠️ CORS is fully open**: `allow_origins=["*"]`, `allow_methods=["*"]`, `allow_headers=["*"]` in `main.py`. Any origin can call the `/chat` and `/health` endpoints. There is no authentication or authorisation on the API.
+- **⚠️ No authentication on `/chat`**: Any client that can reach port 8000 can submit chat requests with arbitrary `session_id`, `model`, and `mode` parameters — including model selection, which could route to more expensive models.
+- **⚠️ PostgreSQL credentials are hardcoded** in `docker-compose.yml`: `POSTGRES_USER=chainlit`, `POSTGRES_PASSWORD=chainlit`. These are trivially guessable and should be secrets.
+- **⚠️ Redis has no authentication**: Redis port 6379 is exposed with no password, ACLs, or TLS. All conversation history (which may contain PII and underwriting data) is stored unencrypted.
+- **⚠️ No encryption at rest**: SQLite databases, Redis data, and PostgreSQL data are stored on plain Docker volumes with no encryption. Customer PII (age, income, medical conditions, nationality) and model predictions are unprotected at rest.
+- **⚠️ No encryption in transit** between internal Docker services (backend↔redis, backend↔postgres, frontend↔backend): plain TCP, no TLS within the Docker network.
+- **⚠️ Sensitive data in `tmp/` directory**: `backend/tmp/customer_similarity_dict.json` contains a pre-computed similarity mapping for ~10,000 customer IDs committed to the repository.
+- **⚠️ `.env` file loaded from disk**: `main.py` calls `load_dotenv()` — if the `.env` file is included in the Docker image build context, secrets may be baked into the image.
+- **⚠️ No input sanitisation**: User messages are passed directly to the LLM without length limits or content filtering beyond the system prompt instruction.
+- **⚠️ `GH_TOKEN` scope unknown**: The GitHub token used in CI workflows has unknown scope. If it has `repo` write access across the organisation, it could be misused. [TODO: confirm minimum required scopes for GH_TOKEN]
+- **⚠️ No rate limiting**: The `/chat` endpoint has no rate limiting, making it susceptible to abuse and runaway LLM cost.
+- **⚠️ `customer_similarity_dict.json` in source control**: Contains mappings of real (or realistic) customer IDs — this should not be committed to a repository.
+- **⚠️ Ports 6379 and 5432 exposed to host**: Redis and PostgreSQL are bound to `0.0.0.0` on the Docker host, not restricted to the internal Docker network.
 
 ---
 
@@ -94,60 +100,47 @@ The Underwriting Chatbot is an AI-powered insurance underwriting assistant that 
 | Name | Required | Sensitivity | Where Set |
 |---|---|---|---|
 | `ANTHROPIC_API_KEY` | Yes | 🔴 High — billable API key | GitHub Actions secret; `.env` file for backend |
-| `GH_TOKEN` | Yes (CI tools) | 🔴 High — GitHub API access | GitHub Actions secret |
-| `SENDGRID_API_KEY` | Yes (CI tools) | 🔴 High — email sending capability | GitHub Actions secret |
-| `GOOGLE_API_KEY` | Yes (if Gemini used) | 🔴 High — billable API key | `.env` file for backend |
-| `REDIS_HOST` | No | 🟢 Low | `docker-compose.yml` environment; defaults to `localhost` |
-| `DATABASE_URL` | Yes (frontend) | 🟡 Medium — DB credentials | `docker-compose.yml` environment (hardcoded) |
-| `BACKEND_URL` | Yes (frontend) | 🟢 Low | `docker-compose.yml` environment |
-| `POSTGRES_USER` | Yes | 🟡 Medium | `docker-compose.yml` (hardcoded `chainlit`) |
-| `POSTGRES_PASSWORD` | Yes | 🔴 High | `docker-compose.yml` (hardcoded `chainlit` — **must be changed**) |
-| `POSTGRES_DB` | Yes | 🟢 Low | `docker-compose.yml` (hardcoded `chainlit`) |
-| `OUTPUT_REPO` | No (CI tools) | 🟢 Low | GitHub Actions workflow env; defaults to `ai-delivery-outputs` |
-| `OUTPUT_REPO_OWNER` | No (CI tools) | 🟢 Low | GitHub Actions workflow env |
-| `NOTIFY_EMAIL` | No (CI tools) | 🟡 Medium | GitHub Actions workflow env (hardcoded `kylo.deng@capco.com`) |
-| `SENDER_EMAIL` | No (CI tools) | 🟢 Low | GitHub Actions workflow env |
-| `REVIEW_MODE` | No (CI tools) | 🟢 Low | Set dynamically in workflow step |
-| `PR_NUMBER` | No (CI tools) | 🟢 Low | Set dynamically in workflow step |
-| `RELEASE_VERSION` | No (CI tools) | 🟢 Low | Set dynamically in workflow step |
-| `PROJECT_NAME` | No (CI tools) | 🟢 Low | Set dynamically in workflow step |
-| `TEST_MODE` | No (CI tools) | 🟢 Low | GitHub Actions workflow env |
-| `UAT_MODE` | No (CI tools) | 🟢 Low | Set dynamically in workflow step |
+| `GOOGLE_API_KEY` | Yes (if using Gemini) | 🔴 High — billable API key | `.env` file for backend |
+| `GH_TOKEN` | Yes (CI only) | 🔴 High — GitHub repo access | GitHub Actions secret |
+| `SENDGRID_API_KEY` | Yes (CI only) | 🔴 High — email sending | GitHub Actions secret |
+| `REDIS_HOST` | No | 🟢 Low | Docker Compose `environment`; defaults to `localhost` |
+| `DATABASE_URL` | Yes (frontend) | 🟡 Medium — DB credentials in URL | Docker Compose `environment` (hardcoded) |
+| `BACKEND_URL` | Yes (frontend) | 🟢 Low | Docker Compose `environment` |
+| `POSTGRES_USER` | Yes | 🟡 Medium | Docker Compose `environment` (hardcoded as `chainlit`) |
+| `POSTGRES_PASSWORD` | Yes | 🔴 High | Docker Compose `environment` (hardcoded as `chainlit`) ⚠️ |
+| `POSTGRES_DB` | Yes | 🟢 Low | Docker Compose `environment` (hardcoded as `chainlit`) |
+| `OUTPUT_REPO` | No (CI) | 🟢 Low | GitHub Actions `env` block; defaults to `ai-delivery-outputs` |
+| `OUTPUT_REPO_OWNER` | No (CI) | 🟢 Low | GitHub Actions `env` block |
+| `NOTIFY_EMAIL` | No (CI) | 🟢 Low | GitHub Actions `env` block (hardcoded: `kylo.deng@capco.com`) |
+| `SENDER_EMAIL` | No (CI) | 🟢 Low | GitHub Actions `env` block (hardcoded: `noreply@ai-delivery.capco.com`) |
+| `REVIEW_MODE` | No (CI Tool 1) | 🟢 Low | Set dynamically in workflow step |
+| `PR_NUMBER` | No (CI Tool 1) | 🟢 Low | Set dynamically in workflow step |
+| `RELEASE_VERSION` | No (CI Tool 3/5) | 🟢 Low | Set dynamically in workflow step |
+| `PROJECT_NAME` | No (CI Tool 3) | 🟢 Low | Set dynamically in workflow step |
+| `TEST_MODE` | No (CI Tool 4) | 🟢 Low | Set dynamically in workflow step |
+| `UAT_MODE` | No (CI Tool 5) | 🟢 Low | Set dynamically in workflow step |
 
 ---
 
 ## 6. Dependencies
 
-### External Services and APIs
-
-| Dependency | Type | Purpose | Notes |
+| Dependency | Type | Used By | Notes |
 |---|---|---|---|
-| Anthropic Claude API | SaaS LLM | Agent reasoning, specialist assessments, AI delivery tools | Models: `claude-sonnet-4-20250514`, `claude-haiku-4-5-20251001`, `claude-sonnet-4-6` (version mismatch — see Risks) |
-| Google Gemini API | SaaS LLM | Alternative LLM provider | Model: `gemini-3-flash-preview`; configured but [TODO: confirm actively used] |
-| GitHub API (`api.github.com`) | REST API | File fetching, PR comments, output repo writes | Used by all 5 CI tools |
-| SendGrid API | SaaS Email | Notification emails on tool completion | Sender: `noreply@ai-delivery.capco.com` |
-
-### Key Python Libraries
-
-| Library | Purpose |
-|---|---|
-| `fastapi` | REST API framework |
-| `langgraph` | Agent graph orchestration and state management |
-| `langchain-anthropic` | Anthropic LLM integration |
-| `langchain-google-genai` | Google Gemini LLM integration |
-| `langchain-core` | LangChain abstractions |
-| `redis` (asyncio) | LangGraph checkpoint backend |
-| `pydantic` | Data validation and structured output models |
-| `sse-starlette` | Server-Sent Events streaming |
-| `anthropic` | Direct Anthropic SDK (used in CI tools) |
-| `catboost` | [TODO: confirm if runtime inference is performed or only pre-computed predictions are read] |
-| `yaml` | Config file parsing |
-
-### Other Repositories
-
-| Repository | Relationship |
-|---|---|
-| `{owner}/ai-delivery-outputs` | Output repo — CI tools write generated docs, reports, and UAT packs here |
+| Anthropic API (`api.anthropic.com`) | External SaaS | Backend (LLM inference), all CI workflows | Primary LLM provider; models: `claude-sonnet-4-20250514`, `claude-haiku-4-5-20251001`, `claude-sonnet-4-6` (CI) |
+| Google Generative AI API | External SaaS | Backend | Secondary LLM provider (Gemini); `gemini-3-flash-preview` — model name appears non-standard [TODO: verify correct Gemini model identifier] |
+| LangChain / LangGraph | Python library | Backend | Agent orchestration, tool execution, streaming |
+| LangChain Anthropic (`langchain_anthropic`) | Python library | Backend | Anthropic integration for LangChain |
+| LangChain Google GenAI (`langchain_google_genai`) | Python library | Backend | Google Gemini integration |
+| Redis Stack Server 7.2.0 | Infrastructure | Backend | LangGraph conversation checkpointing |
+| PostgreSQL 16 | Infrastructure | Frontend (Chainlit) | Session/user data persistence |
+| Chainlit | Python/Frontend framework | Frontend | Conversational UI framework |
+| FastAPI + sse-starlette | Python library | Backend | HTTP API and SSE streaming |
+| Pydantic | Python library | Backend | Structured LLM output validation (`UnderwritingReport`) |
+| CatBoostClassifier (pre-trained) | ML model artefact | Backend (via SQLite DBs) | Risk classification — model stored as predictions in `model_predictions.db`; training data not in repo |
+| SendGrid (`api.sendgrid.com`) | External SaaS | CI workflows | Email notifications |
+| GitHub REST API (`api.github.com`) | External API | CI workflows | Fetching repo files, PR diffs, posting comments, writing to output repo |
+| `ai-delivery-outputs` (GitHub repo) | External repo (`kylodeng/ai-delivery-outputs`) | CI workflows | Storage for all generated documentation, test files, UAT packs |
+| `anthropic` Python SDK | Python library | CI workflows | Direct Anthropic API calls in GitHub Actions |
 
 ---
 
@@ -155,79 +148,55 @@ The Underwriting Chatbot is an AI-powered insurance underwriting assistant that 
 
 ### Prerequisites
 
-- Docker and Docker Compose installed
-- A `.env` file in the repo root containing at minimum:
+- Docker and Docker Compose v2+ installed
+- `.env` file created in the project root with required secrets (see Section 5)
+- SQLite database files present under `./database/`
 
-```bash
-ANTHROPIC_API_KEY=sk-ant-...
-GOOGLE_API_KEY=AIza...
-```
-
-### Local Deployment (Docker Compose)
+### Local / Single-Host Deployment
 
 ```bash
 # 1. Clone the repository
 git clone https://github.com/kylodeng/underwriting_chatbot-main.git
 cd underwriting_chatbot-main
 
-# 2. Create the .env file
-cp .env.example .env   # if template exists, otherwise create manually
-# Edit .env and populate ANTHROPIC_API_KEY, GOOGLE_API_KEY
+# 2. Create the .env file with required secrets
+cat > .env << EOF
+ANTHROPIC_API_KEY=<your-anthropic-api-key>
+GOOGLE_API_KEY=<your-google-api-key>
+EOF
 
-# 3. Build and start all services
-docker compose up --build
+# 3. Ensure database files exist
+ls ./database/
+# Expected: customer_profile.db  feature_importance.db  model_predictions.db  application_profile.db
 
-# 4. Verify backend health
+# 4. Build and start all services
+docker compose up --build -d
+
+# 5. Verify health
 curl http://localhost:8000/health
 # Expected: {"status": "ok"}
 
-# 5. Access the frontend
+# 6. Access the frontend
 open http://localhost:8080
 ```
 
-### Services and Ports
-
-| Service | Host Port | Purpose |
-|---|---|---|
-| `backend` | `8000` | FastAPI chat API |
-| `frontend` | `8080` | Chat UI |
-| `redis` | `6379` | Redis (local access only needed for debugging) |
-| `postgres` | `5432` | PostgreSQL (local access only needed for debugging) |
-
-### Stopping Services
+### Service Logs
 
 ```bash
-docker compose down          # stop and remove containers
-docker compose down -v       # also remove named volumes (destroys PostgreSQL data)
+# All services
+docker compose logs -f
+
+# Individual service
+docker compose logs -f backend
+docker compose logs -f frontend
+docker compose logs -f redis
+docker compose logs -f postgres
 ```
 
-### Triggering CI/AI Delivery Tools Manually
+### Stopping and Cleanup
 
 ```bash
-# Tool 1: Code Review (repo-wide)
-gh workflow run tool1_code_review.yml -f review_mode=repo
+# Stop services (preserves volumes)
+docker compose down
 
-# Tool 2: Tech Documentation
-gh workflow run tool2_tech_docs.yml
-
-# Tool 3: Business Documentation
-gh workflow run tool3_business_docs.yml -f project_name="Underwriting Chatbot" -f release_version="1.0.0"
-
-# Tool 4: Auto Testing
-gh workflow run tool4_auto_testing.yml -f test_mode=generate
-
-# Tool 5: UAT Facilitation
-gh workflow run tool5_uat.yml -f uat_mode=generate -f release_version="1.0.0"
-```
-
----
-
-## 8. Risks and TODOs
-
-### Extracted from Code
-
-| Risk / TODO | Severity | Source |
-|---|---|---|
-| `# TODO: migrate Redis to an external service (e.g. Azure Cache for Redis)` — Redis is ephemeral; conversation history is lost on container restart | 🔴 High | `backend/agent/graph.py` |
-| `# TODO: add more providers here` — `azure` and `openai` entries in `LLMS.model_mapper` return `None` and will raise `ValueError` at runtime | 🟡 Medium | `backend/modules/LLMS.py` |
-| Model name mismatch: `shared.py` hardcodes `claude-sonnet-4-6`, `config.yml` specifies `claude-sonnet-4-20250514` and `claude-haiku-4-5-20251001`, `LLMS.py` hardc
+# Stop and remove volumes (destroys
