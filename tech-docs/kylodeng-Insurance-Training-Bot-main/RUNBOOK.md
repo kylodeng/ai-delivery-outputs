@@ -8,7 +8,7 @@
 
 ## 1. Service Overview
 
-The Insurance Training Bot is a FastAPI-based web application that helps new insurance agents master product knowledge and sales technique through two interactive modes: a **Teacher mode** (ongoing streamed chat with an AI coach powered by LangGraph) and a **Roleplay/Assessment mode** (simulated customer conversations with automated performance scoring). The backend exposes a REST API served from Azure App Service (`training-bot-api`), while the frontend (Chainlit UI) is deployed as a separate Azure App Service (`training-bot-frontend`). Product knowledge is stored in a local vector store (FAISS or Chroma) built from PDF brochures and supplementary documents under `data/Insurance-product-info/`. Ingestion is triggered manually via `POST /ingest`; all LLM calls route through an OpenRouter-compatible endpoint (defaulting to `openai/gpt-oss-20b:free`) configured via environment variables. Sessions are persisted to `data/sessions.json` and survive server restarts.
+The Insurance Training Bot is a FastAPI-based AI application that helps insurance agents in Hong Kong master product knowledge and sales techniques through two interaction modes: a **Teacher mode** (ongoing streamed chat with a LangGraph agent) and a **Roleplay/Assessment mode** (one-shot simulation against a generated customer profile followed by automated scoring). The backend exposes a REST API served on Azure App Service (`training-bot-api`), backed by a vector store (ChromaDB or FAISS, with optional Pinecone) that is populated by ingesting insurance product PDF brochures from the `data/Insurance-product-info/` directory. A separate frontend app service (`training-bot-frontend`) hosts the Chainlit UI. LLM inference is routed through OpenRouter (or an Anthropic-compatible endpoint) using a configured model (default: `openai/gpt-oss-20b:free`). Session state is persisted to `data/sessions.json` and survives restarts. CI/CD runs via GitHub Actions on Python 3.13, using `uv` for dependency management, and deploys to Azure on every push to `main`.
 
 ---
 
@@ -16,46 +16,57 @@ The Insurance Training Bot is a FastAPI-based web application that helps new ins
 
 Run these checks in order to confirm the service is fully operational.
 
-### 2.1 API Service
+### 2.1 Azure App Service — API
+
 ```bash
-# Basic liveness — expect HTTP 200
-curl -s -o /dev/null -w "%{http_code}" https://<api-hostname>/docs
+# Basic HTTP probe — expect 200 and JSON body
+curl -s https://training-bot-api.azurewebsites.net/
 
-# List active sessions — expect HTTP 200 + JSON array
-curl https://<api-hostname>/sessions
+# Readiness — vector store must be loaded
+curl -s https://training-bot-api.azurewebsites.net/health
+# [TODO: does a /health endpoint exist? Add one if not.]
 ```
-> [TODO: What is the production hostname for `training-bot-api` on Azure?]
 
-### 2.2 Frontend (Chainlit)
-- Navigate to `https://<frontend-hostname>` in a browser.
-- Confirm the chat interface loads and a new session can be started.
+| Check | Expected result |
+|---|---|
+| HTTP GET `/` | `200 OK`, JSON response |
+| Azure Portal → App Service → Overview | Status = **Running** |
+| Azure Portal → App Service → Log stream | No `ERROR` or `CRITICAL` entries at startup |
+| Vector store loaded | Log line: `Vector store loaded (N products)` at startup |
+| Sessions file readable | Log line: sessions loaded (no `FileNotFoundError`) |
 
-> [TODO: What is the production hostname for `training-bot-frontend` on Azure?]
+### 2.2 Azure App Service — Frontend
 
-### 2.3 Vector Store
 ```bash
-# POST /ingest status check — confirm store is loaded, not empty
-curl -s https://<api-hostname>/ingest   # expect 200 or a "already loaded" message
+curl -s -o /dev/null -w "%{http_code}" https://training-bot-frontend.azurewebsites.net/
+# Expect: 200
 ```
-In the API startup logs, look for:
-```
-Vector store loaded (N products)
-```
-If you see `No vector store found — run POST /ingest first`, the store needs rebuilding (see §3).
 
-### 2.4 LLM Connectivity
-Send a minimal teacher-mode message and confirm a streamed response is returned within ~10 seconds.
+### 2.3 Ingest endpoint (after PDF changes)
+
 ```bash
-curl -s -N -X POST https://<api-hostname>/chat \
+curl -s -X POST https://training-bot-api.azurewebsites.net/ingest
+# Expect: 200 and a chunk count in response
+# [TODO: confirm exact /ingest endpoint path and payload]
+```
+
+### 2.4 LLM connectivity
+
+```bash
+# Create a session and send a teacher message — expect a streamed response
+curl -s -X POST https://training-bot-api.azurewebsites.net/sessions \
   -H "Content-Type: application/json" \
-  -d '{"session_id":"<id>","message":"Hello"}'
+  -d '{"mode": "teacher"}'
+# [TODO: confirm exact session creation endpoint and payload schema]
 ```
-> [TODO: Confirm exact chat endpoint path from `api/main.py` route definitions not shown in truncated file.]
 
-### 2.5 GitHub Actions Pipelines
-In the repo's **Actions** tab, verify:
-- `Test & Deploy` workflow is green on `main`.
-- No failed runs for `Tool 1–5` workflows within the last 24 hours.
+### 2.5 Local smoke test
+
+```bash
+cd Insurance-Training-Bot-main
+uv run uvicorn api.main:app --reload --port 8000
+curl http://localhost:8000/
+```
 
 ---
 
@@ -63,50 +74,48 @@ In the repo's **Actions** tab, verify:
 
 | Symptom | Likely Cause | Resolution Steps |
 |---|---|---|
-| API returns `500` on all requests | Vector store not loaded at startup — log shows `No vector store found` | Run `POST /ingest` endpoint to rebuild the store; confirm `data/sessions.json` and `data/` directory are accessible to the app |
-| Chat responses are empty or stream hangs indefinitely | LLM API key invalid, rate-limited, or OpenRouter endpoint unreachable | Check `API_KEY` and `OPENAI_URL_BASE` env vars on Azure; test connectivity to `https://openrouter.ai/api/v1`; check OpenRouter dashboard for quota |
-| `SSL: CERTIFICATE_VERIFY_FAILED` errors in logs | `verify=False` is set in `httpx` clients but the Azure outbound proxy may intercept TLS | Confirm `verify=False` is propagated to both sync and async `httpx` clients in `api/main.py`; check Azure App Service networking/proxy settings |
-| Sessions lost after deployment / restart | `data/sessions.json` is on ephemeral storage | Ensure `data/` is mapped to persistent Azure storage (e.g. Azure Files mount); confirm `load_sessions()` runs successfully at lifespan startup |
-| `KeyError: ANTHROPIC_API_KEY` in GitHub Actions | Secret not set in repository settings | Add `ANTHROPIC_API_KEY` (and `GH_TOKEN`, `SENDGRID_API_KEY`) to GitHub repository secrets under **Settings → Secrets and variables → Actions** |
-| RAG tools return no results / agent says "I don't know" | Vector store index stale or empty after PDF additions | Re-run ingestion: `POST /ingest`; check `data/Insurance-product-info/` for new PDFs; verify annotation `.annot.json` sidecar files are present |
-| `deploy-api` or `deploy-frontend` job fails in CI | `AZURE_WEBAPP_PUBLISH_PROFILE_API` or `AZURE_WEBAPP_PUBLISH_PROFILE_FRONTEND` secret missing or expired | Download fresh publish profiles from Azure Portal → App Service → **Get publish profile**; update the corresponding GitHub secret |
-| Pytest fails in `test` job | Dependency mismatch or missing test fixtures | Run `uv sync` locally and reproduce; check Python version is 3.13 (as pinned in workflow) vs 3.12 used in other jobs — [TODO: confirm intended Python version consistency] |
-| `Tool 2 — Tech Documentation` workflow fails on Sunday | `GH_TOKEN` lacks write access to `ai-delivery-outputs` repo | Ensure the PAT stored as `GH_TOKEN` has `repo` scope and the owner matches `OUTPUT_REPO_OWNER` |
-| Ingestion produces zero chunks for a PDF | PDF is image-only (no extractable text) or all pages marked `relevant: false` in annotation | Open the PDF manually; if scanned, run OCR pre-processing; inspect `.annot.json` sidecar and flip `relevant` to `true` for affected pages |
-| Age/premium calculation wrong in Teacher mode | Agent did not call `get_current_date` tool before quoting premium | This is a prompt adherence issue — review the `TEACHER_SYSTEM` prompt; confirm the tool is registered in `make_teacher_agent()`; [TODO: add an automated test for this tool-call ordering] |
-| CORS errors in browser console | Frontend origin not in `allow_origins` list | Add the production frontend URL to `CORSMiddleware` in `api/main.py` and redeploy |
+| API returns `500` on all requests; startup log shows `No vector store found` | Vector store was never built or the `data/` directory is missing/empty | 1. Confirm PDFs exist in `data/Insurance-product-info/`. 2. POST to `/ingest` or run `python core/ingest.py --pdf-dir data/Insurance-product-info`. 3. Restart the app service. |
+| Streaming chat hangs or returns empty response | `API_KEY` / `OPENAI_URL_BASE` env var missing, wrong, or quota exhausted | 1. Check App Service → Configuration → Application Settings for `API_KEY`, `OPENAI_URL_BASE`, `OPENAI_MODEL`. 2. Verify key validity against OpenRouter dashboard. 3. Rotate key and redeploy if exhausted. |
+| LLM returns generic/wrong product details; citations missing | Embeddings in vector store are stale or the PDF was not re-ingested after update | 1. Add/replace PDF in `data/Insurance-product-info/`. 2. Delete the `.annot.json` sidecar if re-annotation is needed. 3. POST to `/ingest`. 4. Confirm chunk count increased in logs. |
+| `sessions.json` corruption — app fails to load sessions on restart | Concurrent writes or incomplete write during shutdown | 1. SSH into App Service or use Kudu console. 2. Inspect `data/sessions.json` for invalid JSON. 3. If corrupt, rename to `sessions.json.bak` and restart (sessions lost but service recovers). 4. [TODO: implement atomic write / backup rotation] |
+| GitHub Actions deploy job fails (`AZURE_WEBAPP_PUBLISH_PROFILE_API` secret missing) | Secret not set or expired in GitHub repo settings | 1. Go to GitHub repo → Settings → Secrets → Actions. 2. Download fresh publish profile from Azure Portal → App Service → Get publish profile. 3. Update the `AZURE_WEBAPP_PUBLISH_PROFILE_API` (and `_FRONTEND`) secrets. 4. Re-run the workflow. |
+| `pytest` failing in CI — `ModuleNotFoundError` | Dependency not in `pyproject.toml` or `uv.lock` out of sync | 1. Run `uv sync` locally. 2. Commit updated `uv.lock`. 3. Re-run CI. |
+| TLS/SSL errors in logs (`verify=False` suppresses but underlying connectivity fails) | Network egress blocked from App Service to OpenRouter or Anthropic API | 1. Check App Service outbound IP allowlist on the LLM provider side. 2. Check Azure VNET/NSG rules if applicable. 3. [TODO: remove `verify=False` and install proper certs] |
+| Roleplay assessment returns empty or malformed JSON | LLM model context window exceeded during long roleplay sessions | 1. Check session message count — trim old messages if > ~20 turns. 2. Switch to a higher-context model via `OPENAI_MODEL` env var. 3. [TODO: implement message truncation strategy in agent.py] |
+| Annotation (`.annot.json`) missing for new PDF | `llm` not passed to `ingest_directory`, or annotation LLM call timed out | 1. Check ingest logs for `annotation failed for <file>`. 2. Re-run ingest with `llm` configured. 3. Manually delete partial `.annot.json` and retry. |
+| Frontend returns `502 Bad Gateway` | API App Service is down or cold-starting | 1. Check API app service status in Azure Portal. 2. Trigger a warm-up GET request. 3. Check deployment logs for startup errors. |
+| `CORS` errors in browser console | Frontend origin not in the `allow_origins` list in `main.py` | 1. Identify the production frontend URL. 2. Add it to `allow_origins` in `api/main.py`. 3. Redeploy. |
 
 ---
 
 ## 4. Deployment Procedure
 
-Deployment is automated via `.github/workflows/deploy.yml` and triggers on every push to `main` after tests pass. The steps below cover both the automated flow and manual deployment.
+### Prerequisites
 
-### 4.1 Pre-deployment Checklist
-- [ ] All tests pass locally: `uv run pytest tests/ -v`
-- [ ] Environment variables confirmed in Azure App Service configuration (see §5)
-- [ ] Vector store data (`data/` directory) is on persistent storage
-- [ ] Publish profiles for both App Services are valid
+- Azure CLI authenticated (`az login`)
+- GitHub repo secrets set: `AZURE_WEBAPP_PUBLISH_PROFILE_API`, `AZURE_WEBAPP_PUBLISH_PROFILE_FRONTEND`
+- `uv` installed locally (`pip install uv`)
 
-### 4.2 Automated Deployment (normal path)
+---
+
+### 4.1 Standard Deployment (via CI/CD — preferred)
 
 ```
-push to main
-    │
-    ├─► job: test
-    │     uv sync
-    │     uv run pytest tests/ -v
-    │
-    ├─► job: deploy-api  (needs: test)
-    │     uv export --no-dev --format requirements-txt -o requirements.txt
-    │     azure/webapps-deploy → app-name: training-bot-api
-    │
-    └─► job: deploy-frontend  (needs: test)
-          uv export --no-dev --format requirements-txt -o requirements.txt
-          azure/webapps-deploy → app-name: training-bot-frontend
+Push to main branch → GitHub Actions "Test & Deploy" workflow triggers automatically
 ```
 
-### 4.3 Manual Deployment
+**Steps:**
+
+1. Create a feature branch and open a PR against `main`.
+2. Verify the `test` job passes (all `pytest` tests green).
+3. Merge the PR to `main`.
+4. Monitor the `deploy-api` and `deploy-frontend` jobs in GitHub Actions.
+5. Confirm both jobs show ✅ green.
+6. Run health checks from Section 2.
+
+---
+
+### 4.2 Manual Deployment (emergency / hotfix)
 
 ```bash
 # 1. Clone and install
@@ -114,53 +123,96 @@ git clone https://github.com/kylodeng/Insurance-Training-Bot-main.git
 cd Insurance-Training-Bot-main
 uv sync
 
-# 2. Set required environment variables (see §5)
-cp .env.example .env   # [TODO: confirm .env.example exists]
-# Edit .env with API keys
-
-# 3. Run tests
+# 2. Run tests locally
 uv run pytest tests/ -v
 
-# 4. Generate requirements.txt for Azure
+# 3. Generate requirements.txt (Azure App Service needs this)
 uv export --no-dev --format requirements-txt -o requirements.txt
 
-# 5. Deploy API to Azure (requires Azure CLI logged in)
-az webapp deploy --resource-group <rg> --name training-bot-api \
-  --src-path . --type zip
+# 4. Deploy API
+az webapp deploy \
+  --resource-group <RESOURCE_GROUP> \
+  --name training-bot-api \
+  --src-path . \
+  --type zip
 
-# 6. Deploy Frontend to Azure
-az webapp deploy --resource-group <rg> --name training-bot-frontend \
-  --src-path . --type zip
+# 5. Deploy Frontend
+az webapp deploy \
+  --resource-group <RESOURCE_GROUP> \
+  --name training-bot-frontend \
+  --src-path . \
+  --type zip
 
-# 7. Ingest knowledge base (first deploy or after PDF changes)
-curl -X POST https://<api-hostname>/ingest
+# 6. Set environment variables (if not already configured)
+az webapp config appsettings set \
+  --resource-group <RESOURCE_GROUP> \
+  --name training-bot-api \
+  --settings \
+    API_KEY="<your-llm-api-key>" \
+    OPENAI_URL_BASE="https://openrouter.ai/api/v1" \
+    OPENAI_MODEL="openai/gpt-oss-20b:free" \
+    SHOW_TOOL_CALLS="true"
 ```
 
-> [TODO: Is the frontend a separate Chainlit process within the same repo, or a distinct sub-directory? Confirm entry points for both App Services.]
+---
+
+### 4.3 Post-Deployment Verification
+
+```bash
+# 1. Check app is running
+az webapp show --name training-bot-api --resource-group <RG> --query state
+
+# 2. Tail live logs
+az webapp log tail --name training-bot-api --resource-group <RG>
+
+# 3. Run health checks from Section 2
+```
+
+---
 
 ### 4.4 Rollback Steps
 
+**Option A — Revert via Git (preferred)**
+
 ```bash
-# Option A — Revert via git and re-trigger CI
-git revert HEAD --no-edit
+# Identify the last good commit
+git log --oneline -10
+
+# Revert (creates a new commit, safe for main branch)
+git revert <bad-commit-sha>
 git push origin main
-# CI will run tests → deploy on passing
+# CI/CD will automatically redeploy the reverted code
+```
 
-# Option B — Azure Portal rollback
-# Azure Portal → App Service (training-bot-api / training-bot-frontend)
-# → Deployment Center → Deployments → select previous deployment → Redeploy
+**Option B — Azure deployment slot swap**
 
-# Option C — Azure CLI rollback to previous slot (if deployment slots configured)
+```bash
+# [TODO: confirm whether staging slots are configured on these App Services]
 az webapp deployment slot swap \
-  --resource-group <rg> \
+  --resource-group <RESOURCE_GROUP> \
   --name training-bot-api \
   --slot staging \
   --target-slot production
 ```
 
-> [TODO: Are staging slots configured on either Azure App Service?]
+**Option C — Redeploy a specific git tag/release**
 
-After rollback, verify health checks in §2 pass before marking incident resolved.
+```bash
+git checkout v<last-good-version>
+uv export --no-dev --format requirements-txt -o requirements.txt
+# Then follow manual deployment steps above
+```
+
+**Vector Store Rollback:**
+
+```bash
+# The vector store index is stored in data/ — back it up before ingesting
+cp -r data/chroma_db data/chroma_db.bak   # [TODO: confirm actual store path]
+# To rollback, restore the backup
+cp -r data/chroma_db.bak data/chroma_db
+# Restart the app service
+az webapp restart --name training-bot-api --resource-group <RG>
+```
 
 ---
 
@@ -170,155 +222,120 @@ After rollback, verify health checks in §2 pass before marking incident resolve
 
 | Metric | Where to find it | Alert threshold |
 |---|---|---|
-| HTTP 5xx error rate | Azure App Service → Monitoring → Metrics → Http5xx | > 1% over 5 min |
-| HTTP response time (P95) | Azure App Service → Metrics → Response Time | > 10 s |
-| CPU percentage | Azure App Service → Metrics → CpuPercentage | > 80% sustained 10 min |
-| Memory percentage | Azure App Service → Metrics → MemoryPercentage | > 85% |
-| LLM API latency | Application logs — search `call_claude` or `ChatOpenAI` duration | > 30 s per call |
-| Vector store load success | App startup log — `Vector store loaded (N products)` | Alert if N = 0 or log absent |
-| Sessions file size | `data/sessions.json` file size growth | [TODO: define max acceptable size] |
-| GitHub Actions failure | GitHub → Actions tab | Any red run on `main` |
+| HTTP 5xx error rate | Azure Portal → App Service → Metrics → HTTP Server Errors | > 5 errors / 5 min |
+| Response time (P95) | Azure Portal → App Service → Metrics → Response Time | > 30 s (streaming) |
+| App Service CPU % | Azure Portal → App Service → Metrics → CPU Percentage | > 80% sustained |
+| App Service Memory % | Azure Portal → App Service → Metrics → Memory Working Set | > 85% |
+| App Service availability | Azure Portal → App Service → Metrics → Availability | < 99% |
+| GitHub Actions workflow failures | GitHub → Actions tab; or configure webhook notification | Any failure on `main` |
+| LLM API quota / rate limit errors | App Service log stream; search for `429` or `RateLimitError` | Any occurrence |
 
-### 5.2 Log Locations
+### 5.2 Logs to Monitor
 
-| Log type | Location |
+```bash
+# Live log streaming (Azure CLI)
+az webapp log tail --name training-bot-api --resource-group <RG>
+
+# Download logs
+az webapp log download --name training-bot-api --resource-group <RG> --log-file api-logs.zip
+```
+
+**Key log patterns to alert on:**
+
+| Log pattern | Meaning |
 |---|---|
-| API application logs | Azure Portal → `training-bot-api` → Log stream, or `az webapp log tail` |
-| Frontend logs | Azure Portal → `training-bot-frontend` → Log stream |
-| Ingestion logs | Application logs — prefixed `[ingest]` |
-| GitHub Actions CI/CD logs | `https://github.com/kylodeng/Insurance-Training-Bot-main/actions` |
-| AI delivery tool audit logs | `ai-delivery-outputs` repo (written by `shared.py` `write_audit_entry`) |
+| `No vector store found` | Ingest has not been run; RAG tools will return empty results |
+| `annotation failed for` | A PDF was not annotated; chunks may be lower quality |
+| `Vector store loaded (0 products)` | Empty index — ingest failed silently |
+| `ERROR` / `CRITICAL` | Any unhandled exception |
+| `rate-limit pause` | Embedding batch throttled — ingest is running slowly |
+| `Could not parse Claude response as JSON` | Tool 1/2 LLM response parsing failure |
 
-### 5.3 Structured Log Patterns to Monitor
+### 5.3 Alerting Setup
 
-```
-# Startup — vector store healthy
-INFO:     Vector store loaded (N products)
+[TODO: Are Azure Monitor alerts configured? Set up the following if not:]
 
-# Startup — vector store missing (ALERT)
-WARNING:  No vector store found — run POST /ingest first.
-
-# LLM errors to watch
-ERROR:    ... ChatOpenAI ... 401 Unauthorized
-ERROR:    ... ChatOpenAI ... 429 Too Many Requests
-ERROR:    ... ChatOpenAI ... 503 Service Unavailable
-
-# Annotation failure (non-fatal but degrades RAG quality)
-WARNING:  [ingest] annotation failed for <filename>.pdf: <reason> — using raw chunker
-```
-
-### 5.4 Alerting Setup
-> [TODO: Are Azure Monitor alerts configured? If not, create alerts for HTTP 5xx > 1% and response time P95 > 10 s on both App Services.]
-> [TODO: Is there a PagerDuty / OpsGenie / Teams webhook for incident notification?]
+- Azure Monitor alert rule: HTTP 5xx > threshold → email/Teams notification
+- Azure Monitor alert rule: App Service stopped → immediate page
+- GitHub Actions: enable email notifications for failed workflows (Settings → Notifications)
+- [TODO: Is Application Insights connected to the App Service? Enable it for distributed tracing.]
 
 ---
 
 ## 6. Escalation Path
 
-| Level | Role | Contact | When to escalate |
+| Level | Who | When to escalate | Contact |
 |---|---|---|---|
-| L1 | On-call engineer | [TODO: name / email / Teams handle] | Service health check fails; deployment stuck |
-| L2 | Backend lead | [TODO: name / email] | LLM integration errors; vector store corruption; data loss |
-| L3 | Platform / DevOps | [TODO: name / email] | Azure infrastructure issues; secrets rotation; cost spike |
-| L4 | Product owner | [TODO: Kylo Deng — `kylo.deng@capco.com`] | Business-critical outage > 1 h; security incident; data breach |
-| External | OpenRouter / Anthropic support | [TODO: support URLs] | LLM API sustained outage not caused by our configuration |
-| External | Azure Support | [TODO: support ticket URL] | Azure App Service platform failure |
+| L1 — First responder | On-call engineer | Service down, health checks failing | [TODO: team Slack channel / PagerDuty rotation] |
+| L2 — Application owner | Backend developer | Code-level bug, data corruption, failed deploy | [TODO: name and contact] |
+| L3 — Platform / Infra | Azure admin / DevOps | App Service outage, networking, quota, billing | [TODO: name and contact] |
+| L4 — LLM vendor | OpenRouter / Anthropic support | API key suspended, model unavailable, billing issue | https://openrouter.ai/docs · support@openrouter.ai |
+| L5 — Business owner | Product owner | Go/no-go on rollback, data loss decisions | [TODO: name and contact] |
+
+**Notification email (configured in workflows):** `kylo.deng@capco.com`
 
 ---
 
 ## 7. Useful Commands
 
-### Start the API locally
+### Service Management
+
+```bash
+# Restart API app service
+az webapp restart --name training-bot-api --resource-group <RG>
+
+# Restart frontend app service
+az webapp restart --name training-bot-frontend --resource-group <RG>
+
+# Check app service status
+az webapp show --name training-bot-api --resource-group <RG> --query "state" -o tsv
+
+# Stream live logs
+az webapp log tail --name training-bot-api --resource-group <RG>
+
+# List all app settings (env vars)
+az webapp config appsettings list --name training-bot-api --resource-group <RG> -o table
+```
+
+### Local Development
+
 ```bash
 # Install dependencies
 uv sync
 
-# Run FastAPI development server
-uv run uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
-```
+# Run API locally with hot-reload
+uv run uvicorn api.main:app --reload --port 8000
 
-### Run tests
-```bash
+# Run all tests
 uv run pytest tests/ -v
 
-# With coverage report
+# Run tests with coverage
 uv run pytest tests/ -v --cov=api --cov=core --cov-report=term-missing
-```
 
-### Ingest knowledge base
-```bash
-# Via HTTP (server must be running)
-curl -X POST http://localhost:8000/ingest
-
-# Directly via CLI
-uv run python -m core.ingest --pdf-dir data/Insurance-product-info --verbose
-```
-
-### Rebuild vector store from scratch
-```bash
-# Delete existing index and re-ingest
-rm -rf data/chroma_db/   # or data/faiss_index/ depending on VECTOR_STORE env var
-curl -X POST http://localhost:8000/ingest
-```
-
-> [TODO: Confirm the exact vector store directory name — `chroma_db`, `faiss_index`, or other — from `core/vector_store.py`.]
-
-### Tail Azure App Service logs
-```bash
-# API service
-az webapp log tail --resource-group <rg> --name training-bot-api
-
-# Frontend service
-az webapp log tail --resource-group <rg> --name training-bot-frontend
-```
-
-### Check and update App Service environment variables
-```bash
-# List current settings
-az webapp config appsettings list \
-  --resource-group <rg> --name training-bot-api --output table
-
-# Set / update a variable
-az webapp config appsettings set \
-  --resource-group <rg> --name training-bot-api \
-  --settings API_KEY="<new-value>"
-```
-
-### Restart App Services
-```bash
-az webapp restart --resource-group <rg> --name training-bot-api
-az webapp restart --resource-group <rg> --name training-bot-frontend
-```
-
-### Generate requirements.txt from uv lockfile
-```bash
+# Generate requirements.txt from lockfile
 uv export --no-dev --format requirements-txt -o requirements.txt
 ```
 
-### Trigger AI delivery tools manually (GitHub CLI)
-```bash
-# Tool 2 — regenerate tech docs
-gh workflow run tool2_tech_docs.yml --repo kylodeng/Insurance-Training-Bot-main
+### Vector Store / Ingestion
 
-# Tool 1 — code review a specific PR
-gh workflow run tool1_code_review.yml \
-  --repo kylodeng/Insurance-Training-Bot-main \
-  -f review_mode=pr \
-  -f pr_number=42
+```bash
+# Ingest all PDFs (from repo root)
+uv run python core/ingest.py --pdf-dir data/Insurance-product-info
+
+# Ingest with verbose chunk output
+uv run python core/ingest.py --pdf-dir data/Insurance-product-info --verbose
+
+# Trigger ingest via API (POST endpoint)
+curl -X POST http://localhost:8000/ingest
+# [TODO: confirm endpoint exists and payload]
+
+# Back up vector store before re-ingesting
+cp -r data/chroma_db data/chroma_db.bak_$(date +%Y%m%d)
+# [TODO: confirm actual vector store directory name]
 ```
 
-### Check sessions file
+### Session Management
+
 ```bash
-# Count active sessions
-python -c "import json; d=json.load(open('data/sessions.json')); print(f'{len(d)} sessions')"
-
-# Pretty-print first session
-python -c "import json; d=json.load(open('data/sessions.json')); print(json.dumps(list(d.values())[0], indent=2))"
-```
-
-### Required environment variables reference
-
-| Variable | Required | Description |
-|---|---|---|
-| `API_KEY` | Yes | LLM provider API key (OpenRouter or Anthropic) |
-| `OPENAI_URL
+# View sessions file
+cat data/sessions.json | python -m json.tool | head -100
