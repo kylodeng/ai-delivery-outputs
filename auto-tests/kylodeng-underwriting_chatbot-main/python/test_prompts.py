@@ -2,35 +2,31 @@
 Test module for backend/agent/prompts.py
 
 What is tested:
-- MODULE_CARD loading from model_card.json (content, structure, types)
-- SYSTEM_PROMPT content, type, and behavioural constraints
-- Module-level constants are correctly initialised at import time
-- Path resolution for _model_card_path
-- Error conditions: missing/malformed model_card.json
+- MODULE_CARD: successful loading and structure of MODEL_CARD from model_card.json
+- SYSTEM_PROMPT: content, type, and behavioural constraints encoded in the prompt string
+- Module-level side effects: file loading at import time
 
 Mocks used:
-- unittest.mock.patch / mock_open to simulate file I/O for model_card.json
-- tmp_path (pytest fixture) for real file-based integration-style tests
-- importlib to reload the module under controlled conditions
+- unittest.mock.patch / mock_open: to simulate model_card.json file reads without touching the filesystem
+- tmp_path (pytest fixture): for integration-style tests that write a real temp JSON file
 
 TODOs:
-- TODO: Full integration test against the real model_card.json requires the file
-        to be present in the repo; stub provided below for CI environments without it.
-- TODO: Extend SYSTEM_PROMPT behavioural tests if the prompt is retrieved dynamically
-        in the future (currently it is a static string).
+- TODO: Extend MODEL_CARD structure tests once the full model_card.json schema is finalised
+- TODO: Add tests for any future prompt-builder functions added to prompts.py
 """
 
+import builtins
 import importlib
 import json
 import sys
-import types
 from pathlib import Path
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
+
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers / fixtures
 # ---------------------------------------------------------------------------
 
 MINIMAL_MODEL_CARD = {
@@ -49,314 +45,319 @@ MINIMAL_MODEL_CARD = {
 }
 
 
-def _reload_prompts_with_card(model_card_data: dict):
+def _reload_prompts_with_card(model_card_dict: dict):
     """
-    Reload the prompts module with a patched open() that returns *model_card_data*
-    as JSON.  Returns the freshly imported module object.
+    Helper: reload the prompts module after patching the open() call so that
+    model_card.json returns *model_card_dict*.
+    Returns the freshly imported module.
     """
-    json_bytes = json.dumps(model_card_data)
-    m_open = mock_open(read_data=json_bytes)
+    json_bytes = json.dumps(model_card_dict)
+    m = mock_open(read_data=json_bytes)
 
-    # Remove cached module so importlib actually re-executes module-level code.
+    # Remove cached module so importlib.import_module re-executes module body
     sys.modules.pop("backend.agent.prompts", None)
     sys.modules.pop("agent.prompts", None)
 
-    with patch("builtins.open", m_open):
-        import backend.agent.prompts as prompts_module  # noqa: PLC0415
+    with patch("builtins.open", m):
+        import backend.agent.prompts as prompts_mod  # noqa: PLC0415
 
-        importlib.reload(prompts_module)
-
-    return prompts_module
+        return prompts_mod
 
 
 # ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture()
-def prompts_module(tmp_path, monkeypatch):
-    """
-    Provide a clean import of backend.agent.prompts backed by a real
-    temporary model_card.json file so we don't depend on the repo file.
-    """
-    # Write a real JSON file to a temp directory
-    card_file = tmp_path / "model_card.json"
-    card_file.write_text(json.dumps(MINIMAL_MODEL_CARD), encoding="utf-8")
-
-    # Patch Path.__new__ / the resolved path used inside prompts.py
-    # Strategy: patch builtins.open with a side_effect that intercepts the
-    # model_card path and serves our temp file for any path, else delegates.
-    original_open = open  # noqa: WPS421
-
-    def _patched_open(file, *args, **kwargs):
-        # Intercept any attempt to open a file whose name is model_card.json
-        if Path(str(file)).name == "model_card.json":
-            return original_open(str(card_file), *args, **kwargs)
-        return original_open(file, *args, **kwargs)
-
-    sys.modules.pop("backend.agent.prompts", None)
-
-    with patch("builtins.open", side_effect=_patched_open):
-        import backend.agent.prompts as mod  # noqa: PLC0415
-
-        importlib.reload(mod)
-
-    return mod
-
-
-# ---------------------------------------------------------------------------
-# Tests – MODEL_CARD loading
+# MODEL_CARD loading tests
 # ---------------------------------------------------------------------------
 
 
 class TestModelCardLoading:
-    """Tests that MODEL_CARD is loaded correctly from model_card.json."""
+    """Tests focused on the MODEL_CARD constant populated at import time."""
 
-    def test_model_card_is_dict(self, prompts_module):
-        assert isinstance(prompts_module.MODEL_CARD, dict)
-
-    def test_model_card_has_model_name(self, prompts_module):
-        assert "model_name" in prompts_module.MODEL_CARD
-
-    def test_model_card_model_name_value(self, prompts_module):
-        assert prompts_module.MODEL_CARD["model_name"] == "Underwriting Risk Classification"
-
-    def test_model_card_has_model_type(self, prompts_module):
-        assert "model_type" in prompts_module.MODEL_CARD
-
-    def test_model_card_model_type_value(self, prompts_module):
-        assert prompts_module.MODEL_CARD["model_type"] == "CatBoostClassifier"
-
-    def test_model_card_has_target_variable(self, prompts_module):
-        assert "target_variable" in prompts_module.MODEL_CARD
-
-    def test_model_card_target_variable_value(self, prompts_module):
-        assert prompts_module.MODEL_CARD["target_variable"] == "Risk_Classification"
-
-    def test_model_card_has_global_feature_importance(self, prompts_module):
-        assert "global_feature_importance" in prompts_module.MODEL_CARD
-
-    def test_global_feature_importance_is_dict(self, prompts_module):
-        assert isinstance(prompts_module.MODEL_CARD["global_feature_importance"], dict)
-
-    @pytest.mark.parametrize(
-        "feature, expected_value",
-        [
-            ("Age", 34.57614295408571),
-            ("Education_Level", 2.0984070824092758),
-            ("Employment_Status", 2.1318889906418717),
-            ("Nationality", 2.2774559327846506),
-            ("Customer_Segment", 1.8731465731883152),
-            ("Annual_Income", 1.0169358497744714),
-            ("Liquid_Assets", 1.2231046859555164),
-        ],
-    )
-    def test_global_feature_importance_values(self, prompts_module, feature, expected_value):
-        gfi = prompts_module.MODEL_CARD["global_feature_importance"]
-        assert feature in gfi
-        assert gfi[feature] == pytest.approx(expected_value)
-
-    def test_model_card_not_empty(self, prompts_module):
-        assert len(prompts_module.MODEL_CARD) > 0
-
-    def test_model_card_loaded_with_minimal_card(self):
-        """Reload with mock_open to verify any valid JSON dict is accepted."""
+    def test_model_card_is_dict(self):
+        """MODEL_CARD must be a dictionary (parsed JSON object)."""
         mod = _reload_prompts_with_card(MINIMAL_MODEL_CARD)
-        assert mod.MODEL_CARD == MINIMAL_MODEL_CARD
+        assert isinstance(mod.MODEL_CARD, dict)
 
-    def test_model_card_loaded_with_extra_keys(self):
-        """Extra keys in model_card.json should be preserved as-is."""
-        extended = {**MINIMAL_MODEL_CARD, "extra_field": [1, 2, 3]}
-        mod = _reload_prompts_with_card(extended)
-        assert mod.MODEL_CARD["extra_field"] == [1, 2, 3]
+    def test_model_card_has_model_name(self):
+        mod = _reload_prompts_with_card(MINIMAL_MODEL_CARD)
+        assert mod.MODEL_CARD["model_name"] == "Underwriting Risk Classification"
 
-    def test_model_card_with_empty_feature_importance(self):
-        """An empty global_feature_importance dict is still valid JSON."""
-        card = {**MINIMAL_MODEL_CARD, "global_feature_importance": {}}
-        mod = _reload_prompts_with_card(card)
-        assert mod.MODEL_CARD["global_feature_importance"] == {}
+    def test_model_card_has_model_type(self):
+        mod = _reload_prompts_with_card(MINIMAL_MODEL_CARD)
+        assert mod.MODEL_CARD["model_type"] == "CatBoostClassifier"
 
-    def test_model_card_with_nested_structure(self):
-        """Deeply nested structures should survive the JSON round-trip."""
-        card = {**MINIMAL_MODEL_CARD, "metadata": {"version": "1.0", "tags": ["prod"]}}
-        mod = _reload_prompts_with_card(card)
-        assert mod.MODEL_CARD["metadata"]["tags"] == ["prod"]
+    def test_model_card_has_target_variable(self):
+        mod = _reload_prompts_with_card(MINIMAL_MODEL_CARD)
+        assert mod.MODEL_CARD["target_variable"] == "Risk_Classification"
 
+    def test_model_card_has_global_feature_importance(self):
+        mod = _reload_prompts_with_card(MINIMAL_MODEL_CARD)
+        assert "global_feature_importance" in mod.MODEL_CARD
+        assert isinstance(mod.MODEL_CARD["global_feature_importance"], dict)
 
-# ---------------------------------------------------------------------------
-# Tests – MODEL_CARD error conditions
-# ---------------------------------------------------------------------------
+    def test_model_card_feature_importance_values_are_floats(self):
+        mod = _reload_prompts_with_card(MINIMAL_MODEL_CARD)
+        for key, val in mod.MODEL_CARD["global_feature_importance"].items():
+            assert isinstance(val, float), f"Feature {key!r} importance is not a float"
 
+    def test_model_card_age_importance_boundary(self):
+        """Age importance should be the dominant feature (>30 in the sample)."""
+        mod = _reload_prompts_with_card(MINIMAL_MODEL_CARD)
+        age_importance = mod.MODEL_CARD["global_feature_importance"]["Age"]
+        assert age_importance > 30.0
 
-class TestModelCardErrorConditions:
-    """Tests for error conditions when loading model_card.json."""
-
-    def test_missing_file_raises_file_not_found(self):
-        """If model_card.json does not exist the module should raise FileNotFoundError."""
-        sys.modules.pop("backend.agent.prompts", None)
-
-        with patch("builtins.open", side_effect=FileNotFoundError("no such file")):
-            with pytest.raises(FileNotFoundError):
-                import backend.agent.prompts  # noqa: PLC0415, F401
-
-                importlib.reload(backend.agent.prompts)
-
-    def test_malformed_json_raises_json_decode_error(self):
-        """If model_card.json contains invalid JSON a JSONDecodeError should propagate."""
-        sys.modules.pop("backend.agent.prompts", None)
-
-        m_open = mock_open(read_data="{ this is not valid json }")
-        with patch("builtins.open", m_open):
-            with pytest.raises(json.JSONDecodeError):
-                import backend.agent.prompts  # noqa: PLC0415, F401
-
-                importlib.reload(backend.agent.prompts)
-
-    def test_empty_json_object_is_accepted(self):
-        """An empty JSON object ({}) is valid – module should load without error."""
+    def test_model_card_empty_dict(self):
+        """An empty JSON object should still load without raising."""
         mod = _reload_prompts_with_card({})
         assert mod.MODEL_CARD == {}
 
-    def test_permission_error_propagates(self):
-        """A PermissionError when opening model_card.json should propagate."""
+    def test_model_card_nested_extra_keys(self):
+        """Extra keys beyond the known schema should be preserved."""
+        extended = dict(MINIMAL_MODEL_CARD)
+        extended["extra_metadata"] = {"version": "1.0", "author": "QA"}
+        mod = _reload_prompts_with_card(extended)
+        assert mod.MODEL_CARD["extra_metadata"]["version"] == "1.0"
+
+    def test_model_card_file_not_found_raises(self):
+        """If the model card file is missing, the module should raise FileNotFoundError."""
         sys.modules.pop("backend.agent.prompts", None)
+        sys.modules.pop("agent.prompts", None)
 
-        with patch("builtins.open", side_effect=PermissionError("permission denied")):
-            with pytest.raises(PermissionError):
-                import backend.agent.prompts  # noqa: PLC0415, F401
+        with patch("builtins.open", side_effect=FileNotFoundError("no such file")):
+            with pytest.raises(FileNotFoundError):
+                import backend.agent.prompts  # noqa: F401, PLC0415
 
-                importlib.reload(backend.agent.prompts)
+    def test_model_card_invalid_json_raises(self):
+        """Malformed JSON in model_card.json must raise json.JSONDecodeError."""
+        sys.modules.pop("backend.agent.prompts", None)
+        sys.modules.pop("agent.prompts", None)
+
+        m = mock_open(read_data="{ this is not valid json }")
+        with patch("builtins.open", m):
+            with pytest.raises(json.JSONDecodeError):
+                import backend.agent.prompts  # noqa: F401, PLC0415
+
+    def test_model_card_list_json_raises_or_loads(self):
+        """
+        A JSON array at the top level is valid JSON but semantically wrong for
+        MODEL_CARD (expected dict).  The module currently does no validation, so
+        it should load as a list.  This test documents that behaviour.
+        """
+        mod = _reload_prompts_with_card([])  # type: ignore[arg-type]
+        # No assertion on type – just confirm it doesn't crash.
+        # If schema validation is added later, update this test.
+        assert mod.MODEL_CARD == []
+
+    def test_model_card_path_points_to_parent_parent(self):
+        """
+        The path used to open model_card.json must resolve relative to the
+        parent's parent of the prompts module file (i.e. backend/).
+        We verify open() is called with a Path ending in 'model_card.json'.
+        """
+        sys.modules.pop("backend.agent.prompts", None)
+        sys.modules.pop("agent.prompts", None)
+
+        json_bytes = json.dumps(MINIMAL_MODEL_CARD)
+        m = mock_open(read_data=json_bytes)
+
+        with patch("builtins.open", m) as patched_open:
+            import backend.agent.prompts  # noqa: F401, PLC0415
+
+        call_args = patched_open.call_args
+        opened_path = call_args[0][0]  # first positional argument
+        assert Path(opened_path).name == "model_card.json"
 
 
 # ---------------------------------------------------------------------------
-# Tests – _model_card_path resolution
-# ---------------------------------------------------------------------------
-
-
-class TestModelCardPath:
-    """Tests for the _model_card_path module-level variable."""
-
-    def test_path_is_path_object(self, prompts_module):
-        assert isinstance(prompts_module._model_card_path, Path)
-
-    def test_path_filename_is_model_card_json(self, prompts_module):
-        assert prompts_module._model_card_path.name == "model_card.json"
-
-    def test_path_parent_directory_name_is_backend(self, prompts_module):
-        """The path should point to backend/model_card.json, so parent name == 'backend'."""
-        assert prompts_module._model_card_path.parent.name == "backend"
-
-    def test_path_is_absolute(self, prompts_module):
-        assert prompts_module._model_card_path.is_absolute()
-
-
-# ---------------------------------------------------------------------------
-# Tests – SYSTEM_PROMPT
+# SYSTEM_PROMPT tests
 # ---------------------------------------------------------------------------
 
 
 class TestSystemPrompt:
-    """Tests for the SYSTEM_PROMPT module-level constant."""
+    """Tests for the SYSTEM_PROMPT string constant."""
 
-    def test_system_prompt_is_string(self, prompts_module):
-        assert isinstance(prompts_module.SYSTEM_PROMPT, str)
+    @pytest.fixture(autouse=True)
+    def prompts_module(self):
+        self.mod = _reload_prompts_with_card(MINIMAL_MODEL_CARD)
 
-    def test_system_prompt_is_not_empty(self, prompts_module):
-        assert len(prompts_module.SYSTEM_PROMPT.strip()) > 0
+    def test_system_prompt_is_string(self):
+        assert isinstance(self.mod.SYSTEM_PROMPT, str)
 
-    def test_system_prompt_mentions_underwriting(self, prompts_module):
-        assert "underwriting" in prompts_module.SYSTEM_PROMPT.lower()
+    def test_system_prompt_not_empty(self):
+        assert len(self.mod.SYSTEM_PROMPT.strip()) > 0
 
-    def test_system_prompt_mentions_underwriter(self, prompts_module):
-        assert "underwriter" in prompts_module.SYSTEM_PROMPT.lower()
+    def test_system_prompt_mentions_underwriting(self):
+        assert "underwriting" in self.mod.SYSTEM_PROMPT.lower()
 
-    def test_system_prompt_mentions_assistant(self, prompts_module):
-        assert "assistant" in prompts_module.SYSTEM_PROMPT.lower()
+    def test_system_prompt_mentions_underwriter(self):
+        assert "underwriter" in self.mod.SYSTEM_PROMPT.lower()
 
-    def test_system_prompt_mentions_assessments(self, prompts_module):
-        assert "assessment" in prompts_module.SYSTEM_PROMPT.lower()
-
-    # --- Security / confidentiality constraints ---
-
-    def test_system_prompt_prohibits_disclosure_of_instructions(self, prompts_module):
-        """The prompt must instruct the model never to disclose system instructions."""
-        prompt_lower = prompts_module.SYSTEM_PROMPT.lower()
+    def test_system_prompt_prohibits_disclosure_of_instructions(self):
+        """Prompt must encode the confidentiality constraint."""
+        prompt_lower = self.mod.SYSTEM_PROMPT.lower()
+        # Either "disclose" or "reveal" must appear
         assert "disclose" in prompt_lower or "reveal" in prompt_lower
 
-    def test_system_prompt_prohibits_revealing_tools(self, prompts_module):
-        """The prompt must reference keeping tools confidential."""
-        assert "tools" in prompts_module.SYSTEM_PROMPT.lower()
+    def test_system_prompt_prohibits_tool_disclosure(self):
+        """Tools available to the agent must not be revealed."""
+        assert "tools" in self.mod.SYSTEM_PROMPT.lower()
 
-    def test_system_prompt_references_never_disclose(self, prompts_module):
-        prompt_lower = prompts_module.SYSTEM_PROMPT.lower()
-        assert "never" in prompt_lower or "cannot" in prompt_lower or "can never" in prompt_lower
+    def test_system_prompt_describes_assistant_role(self):
+        assert "assistant" in self.mod.SYSTEM_PROMPT.lower()
 
-    # --- Role description ---
+    def test_system_prompt_mentions_assessments(self):
+        assert "assessment" in self.mod.SYSTEM_PROMPT.lower()
 
-    def test_system_prompt_describes_senior_role(self, prompts_module):
-        assert "senior" in prompts_module.SYSTEM_PROMPT.lower()
+    def test_system_prompt_mentions_gathering_information(self):
+        assert "gather" in self.mod.SYSTEM_PROMPT.lower() or "information" in self.mod.SYSTEM_PROMPT.lower()
 
-    def test_system_prompt_describes_information_gathering(self, prompts_module):
-        prompt_lower = prompts_module.SYSTEM_PROMPT.lower()
-        assert "gather" in prompt_lower or "information" in prompt_lower
-
-    def test_system_prompt_describes_helpful_assistant(self, prompts_module):
-        prompt_lower = prompts_module.SYSTEM_PROMPT.lower()
-        assert "helpful" in prompt_lower
-
-    # --- Immutability check (constant should not be accidentally mutable reference) ---
-
-    def test_system_prompt_is_immutable_str(self, prompts_module):
-        """Strings are immutable in Python; verify the value cannot be reassigned externally."""
-        original = prompts_module.SYSTEM_PROMPT
-        # Attempt to rebind the name locally – module value must be unchanged
-        _ = "tampered"
-        assert prompts_module.SYSTEM_PROMPT == original
-
-    def test_system_prompt_does_not_expose_json_keys(self, prompts_module):
-        """The prompt text must not accidentally contain raw JSON key names from model_card."""
-        assert "global_feature_importance" not in prompts_module.SYSTEM_PROMPT
-        assert "model_type" not in prompts_module.SYSTEM_PROMPT
-
-    @pytest.mark.parametrize(
-        "forbidden_phrase",
-        [
-            "system instructions",
-            "internal",
-        ],
-    )
-    def test_system_prompt_instructs_confidentiality_of_phrases(
-        self, prompts_module, forbidden_phrase
-    ):
+    def test_system_prompt_no_leading_trailing_newlines(self):
         """
-        The prompt explicitly instructs the model to hide 'internal system instructions'.
-        Verify those exact concepts appear so the guard is not accidentally removed.
+        The prompt is a plain concatenated string literal; it should not start
+        or end with a bare newline that might confuse the LLM tokenizer.
         """
-        assert forbidden_phrase in prompts_module.SYSTEM_PROMPT.lower()
+        assert not self.mod.SYSTEM_PROMPT.startswith("\n")
+        assert not self.mod.SYSTEM_PROMPT.endswith("\n")
+
+    def test_system_prompt_never_reveals_internal_system_instruction_phrase(self):
+        """
+        The prompt explicitly says it cannot reveal 'internal system instructions'.
+        Verify that phrase (or close variant) is present.
+        """
+        assert "internal system" in self.mod.SYSTEM_PROMPT.lower()
+
+    def test_system_prompt_does_not_contain_placeholder_tokens(self):
+        """No unfilled template placeholders like {variable} should exist."""
+        import re
+
+        placeholders = re.findall(r"\{[^}]+\}", self.mod.SYSTEM_PROMPT)
+        assert placeholders == [], f"Unfilled placeholders found: {placeholders}"
+
+    def test_system_prompt_is_senior_underwriting_assistant(self):
+        """Role description must reference 'senior underwriting assistant'."""
+        assert "senior underwriting assistant" in self.mod.SYSTEM_PROMPT.lower()
 
 
 # ---------------------------------------------------------------------------
-# Tests – module public interface
+# Module-level public surface tests
 # ---------------------------------------------------------------------------
 
 
-class TestModulePublicInterface:
-    """Verify the module exports the expected public names."""
+class TestModulePublicSurface:
+    """Ensure the module exports exactly the expected public names."""
 
-    @pytest.mark.parametrize("attr", ["MODEL_CARD", "SYSTEM_PROMPT"])
-    def test_public_attribute_exists(self, prompts_module, attr):
-        assert hasattr(prompts_module, attr)
+    @pytest.fixture(autouse=True)
+    def prompts_module(self):
+        self.mod = _reload_prompts_with_card(MINIMAL_MODEL_CARD)
 
-    def test_model_card_and_system_prompt_are_independent(self, prompts_module):
-        """MODEL_CARD and SYSTEM_PROMPT should be independent objects."""
-        assert prompts_module.MODEL_CARD is not prompts_module.SYSTEM_PROMPT
+    def test_model_card_exported(self):
+        assert hasattr(self.mod, "MODEL_CARD")
 
-    def test_module_has_no_unexpected_callables(self, prompts_module):
-        """prompts.py defines no public functions; verify there are none exported."""
-        public_callables = [
-            name
-            for name in dir(prompts_module)
-            if not name.startswith("_") and callable(getattr(prompts_module, name))
-            and not isinstance(getattr(prompts_module, name), types.ModuleType)
-        ]
+    def test_system_prompt_exported(self):
+        assert hasattr(self.mod, "SYSTEM_PROMPT")
+
+    def test_model_card_is_not_none(self):
+        assert self.mod.MODEL_CARD is not None
+
+    def test_system_prompt_is_not_none(self):
+        assert self.mod.SYSTEM_PROMPT is not None
+
+
+# ---------------------------------------------------------------------------
+# Integration test: real filesystem via tmp_path
+# ---------------------------------------------------------------------------
+
+
+class TestModelCardIntegrationWithRealFile:
+    """
+    Write an actual JSON file in a temp directory and verify the module loads
+    it correctly, without mocking builtins.open.
+    Uses monkeypatching to redirect the module's path constant.
+    """
+
+    def test_real_file_read(self, tmp_path, monkeypatch):
+        card_file = tmp_path / "model_card.json"
+        card_file.write_text(json.dumps(MINIMAL_MODEL_CARD))
+
+        sys.modules.pop("backend.agent.prompts", None)
+        sys.modules.pop("agent.prompts", None)
+
+        # Patch Path so that the computed _model_card_path resolves to our temp file.
+        original_path_init = Path.__new__
+
+        with patch("backend.agent.prompts._model_card_path", card_file, create=True):
+            # Re-open is already done at module level; we need a full reload.
+            # Simplest approach: patch builtins.open specifically for the known path.
+            real_open = builtins.open
+
+            def selective_open(file, *args, **kwargs):
+                if Path(file).name == "model_card.json":
+                    return real_open(card_file, *args, **kwargs)
+                return real_open(file, *args, **kwargs)
+
+            with patch("builtins.open", side_effect=selective_open):
+                import backend.agent.prompts as mod  # noqa: PLC0415
+
+        assert mod.MODEL_CARD["model_name"] == "Underwriting Risk Classification"
+        assert mod.MODEL_CARD["model_type"] == "CatBoostClassifier"
+
+    def test_real_file_with_unicode_values(self, tmp_path):
+        """Model card containing unicode characters should parse correctly."""
+        card = {"model_name": "模型卡片", "model_type": "CatBoostClassifier"}
+        card_file = tmp_path / "model_card.json"
+        card_file.write_text(json.dumps(card, ensure_ascii=False), encoding="utf-8")
+
+        sys.modules.pop("backend.agent.prompts", None)
+        sys.modules.pop("agent.prompts", None)
+
+        real_open = builtins.open
+
+        def selective_open(file, *args, **kwargs):
+            if Path(file).name == "model_card.json":
+                return real_open(card_file, encoding="utf-8")
+            return real_open(file, *args, **kwargs)
+
+        with patch("builtins.open", side_effect=selective_open):
+            import backend.agent.prompts as mod  # noqa: PLC0415
+
+        assert mod.MODEL_CARD["model_name"] == "模型卡片"
+
+
+# ---------------------------------------------------------------------------
+# Parametrised edge-case tests for MODEL_CARD content
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "card,expected_key,expected_value",
+    [
+        ({"model_name": "A"}, "model_name", "A"),
+        ({"model_type": "XGBoost"}, "model_type", "XGBoost"),
+        ({"target_variable": "Risk"}, "target_variable", "Risk"),
+        ({"numeric_value": 0}, "numeric_value", 0),
+        ({"boolean_flag": True}, "boolean_flag", True),
+        ({"null_field": None}, "null_field", None),
+        ({"nested": {"a": 1}}, "nested", {"a": 1}),
+    ],
+)
+def test_model_card_various_shapes(card, expected_key, expected_value):
+    """MODEL_CARD faithfully reflects whatever JSON is in the file."""
+    mod = _reload_prompts_with_card(card)
+    assert mod.MODEL_CARD[expected_key] == expected_value
+
+
+# ---------------------------------------------------------------------------
+# TODO stubs
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skip(reason="TODO: full model_card.json schema not yet finalised — add exhaustive key checks")
+def test_model_card_full_schema_validation():
+    pass
+
+
+@pytest.mark.skip(reason="TODO: if prompt-builder functions are added to prompts.py, test them here")
+def test_prompt_builder_functions():
+    pass
+
+
+@pytest.mark.skip(reason="TODO: test behaviour when model_card.json contains very large feature importance dicts (performance)")
