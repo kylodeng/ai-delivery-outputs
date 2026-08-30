@@ -2,7 +2,7 @@
 
 ## 1. Project Overview
 
-An AI-powered underwriting assistant that helps insurance underwriters assess customer risk profiles through a conversational chat interface. The system orchestrates multiple specialist LLM agents to evaluate finance, health, and life risk categories in parallel, then aggregates their outputs into a structured `UnderwritingReport`. A suite of five GitHub Actions CI/CD tools (code review, tech docs, business docs, auto-testing, and UAT facilitation) is also included, each powered by Claude AI.
+An AI-powered underwriting assistant that helps insurance underwriters assess customer risk profiles through a conversational chat interface. The system uses a multi-agent LangGraph pipeline to run parallel specialist assessments across domains such as finance, health, and life risk, then aggregates the results into a structured underwriting report. A suite of five GitHub Actions–driven AI workflows (code review, technical docs, business docs, auto-testing, and UAT facilitation) are also included to support the software delivery lifecycle.
 
 ---
 
@@ -10,64 +10,68 @@ An AI-powered underwriting assistant that helps insurance underwriters assess cu
 
 | Component | Technology | Version/Notes |
 |---|---|---|
-| Backend API | FastAPI | Python, Server-Sent Events via `sse_starlette` |
-| LLM Orchestration | LangGraph + LangChain | `StateGraph`, streaming events v2 |
-| Primary LLM (fast) | Anthropic Claude Haiku | `claude-haiku-4-5-20251001` |
-| Primary LLM (deep) | Anthropic Claude Sonnet | `claude-sonnet-4-20250514` |
-| Secondary LLM | Google Gemini | `gemini-3-flash-preview` |
-| Risk Classification Model | CatBoostClassifier | v1.0, trained on merged customer/KYC/application profiles |
-| Session Memory / Checkpointing | Redis (LangGraph Redis Saver) | `redis/redis-stack-server:7.2.0-v14` |
-| Customer Data | SQLite databases | `customer_profile.db`, `feature_importance.db`, `model_predictions.db`, `application_profile.db` |
-| Frontend | [TODO: what framework is the frontend built with?] | Port 8080 |
-| Database (Frontend Auth/State) | PostgreSQL | `postgres:16-alpine`, via `asyncpg` |
-| Containerisation | Docker Compose | Multi-service stack |
-| CI/CD AI Tools | GitHub Actions + Anthropic Claude | `claude-sonnet-4-6`, Python 3.12 |
-| Email Notifications | SendGrid | Via `SENDGRID_API_KEY` |
-| Environment Config | python-dotenv | `.env` file |
+| Backend API | FastAPI | Python, streamed via SSE |
+| Agent Framework | LangGraph + LangChain | Multi-node stateful graph |
+| LLM – Default (fast) | Claude Haiku | `claude-haiku-4-5-20251001` via `langchain-anthropic` |
+| LLM – Full (deep) | Claude Sonnet | `claude-sonnet-4-20250514` via `langchain-anthropic` |
+| LLM – Alternative | Gemini Flash | `gemini-3-flash-preview` via `langchain-google-genai` |
+| Agent Memory / Checkpointing | Redis | `redis/redis-stack-server:7.2.0-v14` via `AsyncRedisSaver` |
+| Frontend | Chainlit | Connects to backend over HTTP |
+| Database (customer data) | SQLite | `.db` files mounted read-only into backend |
+| Database (Chainlit session) | PostgreSQL | `postgres:16-alpine` |
+| Containerisation | Docker Compose | `docker-compose.yml` at repo root |
+| Risk model metadata | CatBoostClassifier model card | `model_card.json` (feature importances, version 1.0) |
+| CI/CD AI Tools | GitHub Actions + Claude Sonnet (`claude-sonnet-4-6`) | 5 automated delivery workflows |
+| Email notifications | SendGrid | Via `SENDGRID_API_KEY` |
 
 ---
 
 ## 3. Architecture
 
-The system is composed of four Docker services that interact as follows:
-
-1. **Frontend** (port 8080) presents the chat UI to the underwriter. It communicates with the **Backend** over HTTP, reading streamed responses via Server-Sent Events (SSE).
-2. **Backend** (port 8000) is a FastAPI application. On each `/chat` request it builds a LangGraph agent, which:
-   - Calls tool `get_customer_profile` to retrieve customer data from SQLite databases.
-   - Calls `run_underwriting_assessment` which fans out parallel async calls to specialist LLMs (finance, health, life categories), then aggregates results into a structured `UnderwritingReport` using a second LLM with structured output.
-   - Calls `customer_lookalike` to find similar customers.
-   - Streams partial text tokens and tool-start/end events back to the frontend as SSE.
-3. **Redis** (port 6379) stores LangGraph conversation checkpoints, providing multi-turn session memory.
-4. **PostgreSQL** (port 5432) is used by the frontend for auth/state persistence (initialised via `postgres/init.sql`).
-
-Five **GitHub Actions workflows** run independently of the application stack, each invoking Claude via the Anthropic API to perform: automated code review, technical documentation generation, business documentation generation, test generation/gap analysis, and UAT test pack generation/analysis. Results are written to a separate `ai-delivery-outputs` GitHub repository.
-
 ```
-Underwriter
-    │
-    ▼
-Frontend (8080)
-    │ HTTP / SSE
-    ▼
-Backend FastAPI (8000)
-    │
-    ├── LangGraph Agent
-    │       ├── get_customer_profile ──► SQLite DBs
-    │       ├── customer_lookalike   ──► customer_similarity_dict.json
-    │       └── run_underwriting_assessment
-    │               ├── Specialist LLM (finance) ─┐
-    │               ├── Specialist LLM (health)  ─┼─► Aggregator LLM ──► UnderwritingReport
-    │               └── Specialist LLM (life)    ─┘
-    │
-    ├── Redis (6379)  ◄── session checkpoints
-    └── PostgreSQL (5432) ◄── frontend state
+┌─────────────┐        HTTP/SSE        ┌──────────────────────────────────────────┐
+│   Frontend  │ ─────────────────────► │  FastAPI Backend  (:8000)                │
+│  (Chainlit) │                        │                                          │
+└─────────────┘                        │  /chat  → build_agent()                  │
+                                       │           ↓                              │
+                                       │  LangGraph Agent Graph                   │
+                                       │    ├─ get_customer_profile (tool)        │
+                                       │    ├─ customer_lookalike (tool)          │
+                                       │    └─ run_underwriting_assessment (tool) │
+                                       │         ↓ parallel specialist LLM calls  │
+                                       │    [finance | health | life | ...]        │
+                                       │         ↓ aggregator LLM                 │
+                                       │    UnderwritingReport (Pydantic)         │
+                                       └──────┬───────────────────────────────────┘
+                                              │
+                              ┌───────────────┼────────────────┐
+                              ▼               ▼                ▼
+                           Redis           PostgreSQL       SQLite DBs
+                        (checkpoints)   (Chainlit sessions) (customer/
+                                                             model data)
 ```
+
+**Data flow summary:**
+
+1. The user sends a message from the Chainlit frontend to the FastAPI `/chat` endpoint.
+2. FastAPI streams the response back using Server-Sent Events (SSE).
+3. The LangGraph agent decides which tool(s) to call, one at a time.
+4. `get_customer_profile` looks up the customer in SQLite databases; `customer_lookalike` returns similar customer IDs from a pre-computed JSON dictionary.
+5. `run_underwriting_assessment` fans out parallel async LLM calls to specialist agents (finance, health, life, etc.), capped by a semaphore (concurrency=4).
+6. An aggregator LLM consolidates specialist outputs into a structured `UnderwritingReport` Pydantic model.
+7. Conversation state (thread checkpoints) is persisted in Redis so sessions survive across turns.
+8. Chainlit session data is stored in PostgreSQL.
 
 ---
 
 ## 4. Local Development Setup
 
-**Prerequisites:** Docker, Docker Compose, Python 3.12, Git.
+### Prerequisites
+
+- Docker and Docker Compose installed
+- An `.env` file at the repo root (see [Environment Variables](#5-environment-variables))
+
+### Steps
 
 1. **Clone the repository**
 
@@ -76,49 +80,46 @@ git clone https://github.com/kylodeng/underwriting_chatbot-main.git
 cd underwriting_chatbot-main
 ```
 
-2. **Create the root `.env` file** (used by the backend service via `env_file: .env`):
+2. **Create the environment file**
 
 ```bash
-cp .env.example .env   # [TODO: confirm whether .env.example exists]
-# Then edit .env and fill in the required variables (see Environment Variables section)
+cp .env.example .env   # if an example exists, otherwise create .env manually
 ```
 
-3. **Ensure SQLite database files are present** under `./database/`:
+Populate `.env` with at minimum `ANTHROPIC_API_KEY` and `GOOGLE_API_KEY` (see the table below).
 
-```
-database/
-  customer_profile.db
-  feature_importance.db
-  model_predictions.db
-  application_profile.db
-```
-
-[TODO: How are these database files generated or seeded? Is there a script to create them?]
-
-4. **Start all services with Docker Compose**
+3. **Start all services via Docker Compose**
 
 ```bash
 docker compose up --build
 ```
 
-5. **Verify the backend is healthy**
+This will start:
+- `redis` on port `6379`
+- `postgres` on port `5432`
+- `backend` (FastAPI) on port `8000`
+- `frontend` (Chainlit) on port `8080`
+
+4. **Verify the backend is healthy**
 
 ```bash
 curl http://localhost:8000/health
 # Expected: {"status": "ok"}
 ```
 
-6. **Access the frontend**
+5. **Open the chat UI**
 
-Open [http://localhost:8080](http://localhost:8080) in your browser.
+Navigate to [http://localhost:8080](http://localhost:8080) in your browser.
 
-7. **(Optional) Run the backend directly for development** (outside Docker):
+6. **(Optional) Run the backend directly without Docker**
 
 ```bash
 cd backend
-pip install -r requirements.txt   # [TODO: confirm requirements.txt exists]
+pip install -r requirements.txt   # [TODO: confirm requirements file name/location]
 uvicorn main:app --reload --port 8000
 ```
+
+> **Note:** You must have Redis running locally on port `6379` and set `REDIS_HOST=localhost` (the default) when running outside Docker.
 
 ---
 
@@ -126,32 +127,35 @@ uvicorn main:app --reload --port 8000
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `ANTHROPIC_API_KEY` | Yes | — | Anthropic API key for Claude LLMs (backend + CI tools) |
-| `GOOGLE_API_KEY` | Yes (if using Gemini) | — | Google API key for Gemini models |
-| `REDIS_HOST` | No | `localhost` | Redis hostname; set to `redis` when running via Docker Compose |
-| `GH_TOKEN` | Yes (CI only) | — | GitHub personal access token for CI workflow scripts |
-| `SENDGRID_API_KEY` | Yes (CI only) | — | SendGrid API key for email notifications from CI tools |
-| `OUTPUT_REPO` | No (CI only) | `ai-delivery-outputs` | GitHub repo name where CI tool outputs are written |
-| `OUTPUT_REPO_OWNER` | No (CI only) | `GITHUB_REPOSITORY_OWNER` | Owner of the output repo |
-| `NOTIFY_EMAIL` | No (CI only) | `kylo.deng@capco.com` | Recipient email for CI tool notifications |
-| `SENDER_EMAIL` | No (CI only) | `kylo.deng@capco.com` | Sender email for CI tool notifications |
-| `BACKEND_URL` | No (frontend) | `http://backend:8000` | URL the frontend uses to reach the backend |
-| `DATABASE_URL` | No (frontend) | `postgresql+asyncpg://chainlit:chainlit@postgres:5432/chainlit` | PostgreSQL connection string for the frontend |
-| `POSTGRES_USER` | No | `chainlit` | PostgreSQL username (set in docker-compose.yml) |
-| `POSTGRES_PASSWORD` | No | `chainlit` | PostgreSQL password (set in docker-compose.yml) |
-| `POSTGRES_DB` | No | `chainlit` | PostgreSQL database name (set in docker-compose.yml) |
+| `ANTHROPIC_API_KEY` | Yes | — | API key for Anthropic Claude models |
+| `GOOGLE_API_KEY` | Yes (if using Gemini) | — | API key for Google Generative AI (Gemini) |
+| `REDIS_HOST` | No | `localhost` | Hostname of the Redis server |
+| `GH_TOKEN` | Yes (CI workflows only) | — | GitHub Personal Access Token for workflow scripts |
+| `SENDGRID_API_KEY` | Yes (CI workflows only) | — | SendGrid API key for email notifications |
+| `OUTPUT_REPO` | No (CI workflows only) | `ai-delivery-outputs` | GitHub repo name where AI workflow outputs are written |
+| `OUTPUT_REPO_OWNER` | No (CI workflows only) | `GITHUB_REPOSITORY_OWNER` | Owner of the output repo |
+| `NOTIFY_EMAIL` | No (CI workflows only) | `kylo.deng@capco.com` | Email address to receive workflow notifications |
+| `SENDER_EMAIL` | No (CI workflows only) | `kylo.deng@capco.com` | Sender address for workflow notification emails |
+
+> The backend reads its `.env` file from `backend/.env` (loaded via `python-dotenv`). The Docker Compose `env_file: .env` directive loads the root `.env` into the backend container.
 
 ---
 
 ## 6. Running Tests
 
-[TODO: Are there any existing test files in the repository? No test files were found in the provided source. The CI pipeline (Tool 4) auto-generates tests via Claude and writes them to the `ai-delivery-outputs` repo — what framework do those generated tests use for this project?]
+[TODO: Are there any existing test files in the repository? No test files were found in the provided source tree. The `tool4_auto_testing.py` CI workflow is designed to *generate* tests via Claude, but no hand-written or generated test suite was found in the repository.]
 
-To trigger AI-generated test generation manually via GitHub Actions:
+To trigger AI-generated test generation for a PR:
 
-1. Go to **Actions → Tool 4 — Auto Testing** in the GitHub UI.
-2. Click **Run workflow**, select mode `generate` or `gap-analysis`, and run.
-3. Generated test files are written to the `ai-delivery-outputs` repository.
+```bash
+# Open or push to a pull request that modifies src/, *.py, *.js, or *.ts files.
+# The "Tool 4 — Auto Testing" GitHub Actions workflow will run automatically.
+```
+
+To run gap analysis manually via GitHub Actions:
+
+1. Go to **Actions → Tool 4 — Auto Testing → Run workflow**
+2. Select mode: `gap-analysis`
 
 ---
 
@@ -163,31 +167,35 @@ To trigger AI-generated test generation manually via GitHub Actions:
 docker compose up --build
 ```
 
-### Stopping services
+### Production
+
+[TODO: Is there an IaC definition (Terraform, Bicep, etc.) for production infrastructure? None was found in the provided files.]
+
+[TODO: What is the target cloud provider and deployment platform (e.g. Azure Container Apps, AWS ECS, Kubernetes)?]
+
+The application is fully containerised. To deploy to any container platform:
+
+1. **Build and push images**
 
 ```bash
-docker compose down
+docker build -t <registry>/underwriting-backend:latest ./backend
+docker build -t <registry>/underwriting-frontend:latest ./frontend
+docker push <registry>/underwriting-backend:latest
+docker push <registry>/underwriting-frontend:latest
 ```
 
-### Stopping and removing volumes (full reset)
+2. **Provision dependencies**
+   - Redis (see known issue below — currently in-container, should be an external managed service)
+   - PostgreSQL (for Chainlit session storage)
+   - SQLite database files: `customer_profile.db`, `feature_importance.db`, `model_predictions.db`, `application_profile.db` must be available and mounted read-only into the backend container at `/data/`
 
-```bash
-docker compose down -v
-```
+3. **Set all required environment variables** (see table above) on the target platform.
 
-### GitHub Actions CI Tools
+4. **Apply the `docker-compose.yml`** as a reference for port mappings, volume mounts, health checks, and service dependencies.
 
-The five AI delivery tools run automatically based on their triggers, or can be dispatched manually:
+### GitHub Actions AI Delivery Workflows
 
-| Tool | Workflow File | Auto-trigger |
-|---|---|---|
-| Code Review | `tool1_code_review.yml` | PR open/sync; Monday 08:00 UTC |
-| Tech Documentation | `tool2_tech_docs.yml` | Push to `main`; Sunday 06:00 UTC |
-| Business Documentation | `tool3_business_docs.yml` | Push of `v*` tag |
-| Auto Testing | `tool4_auto_testing.yml` | PR open/sync on `.py/.js/.ts`; Wednesday 07:00 UTC |
-| UAT Facilitation | `tool5_uat.yml` | Creation of `release/*` branch |
-
-Required GitHub repository secrets for CI tools:
+The five CI/CD AI tools require the following repository secrets to be set:
 
 ```
 ANTHROPIC_API_KEY
@@ -195,27 +203,27 @@ GH_TOKEN
 SENDGRID_API_KEY
 ```
 
-To trigger manually:
-1. Go to **Actions** in the GitHub UI.
-2. Select the desired workflow.
-3. Click **Run workflow** and fill in any required inputs.
-
-[TODO: Is there a cloud deployment target (e.g. Azure, AWS, GCP)? No IaC files (Terraform, Bicep, etc.) were found in the provided sources.]
+| Workflow | Trigger |
+|---|---|
+| Tool 1 — Code Review | PR open/sync, Monday 08:00 UTC cron, manual dispatch |
+| Tool 2 — Tech Documentation | Push to `main`, Sunday 06:00 UTC cron, manual dispatch |
+| Tool 3 — Business Documentation | Version tag push (`v*`), manual dispatch |
+| Tool 4 — Auto Testing | PR open/sync on source files, Wednesday 07:00 UTC cron, manual dispatch |
+| Tool 5 — UAT Facilitation | `release/*` branch creation, manual dispatch |
 
 ---
 
 ## 8. Known Issues / TODOs
 
-Extracted from code comments and prompts:
-
 | Location | Issue / TODO |
 |---|---|
-| `backend/agent/graph.py` | `# TODO: migrate Redis to an external service (e.g. Azure Cache for Redis, dedicated Redis container) so that memory persists across serverless backend instances.` |
-| `backend/modules/LLMS.py` | `# TODO: add more providers here` — `azure` and `openai` entries in `model_mapper` are set to `None` and will raise `ValueError` if selected. |
-| `backend/main.py` | `lifespan` function is commented out — application lifecycle management (startup/shutdown hooks) is not wired up. |
-| `backend/agent/agent_with_skills.py` | `agent_with_skills.py` defines its own `TOOLS` dict and graph independently of `agent/graph.py`; it is unclear which agent implementation is actually used by `main.py` at runtime. [TODO: Which agent module (`agent_with_skills.py` or `graph.py`) is the active one?] |
-| `docker-compose.yml` | PostgreSQL is initialised from `./postgres/init.sql` — [TODO: confirm this file exists in the repo]. |
-| `backend/modules/LLMS.py` | `gemini-3-flash-preview` is referenced as the Gemini model; this appears to be a preview/unreleased model identifier — [TODO: verify this model name is correct and available]. |
-| CI Tool 3 (`tool3_business_docs.py`) | Stakeholder names, dates, and go-live milestones are always emitted as `[TODO]` — a human must complete them after generation. |
-| CI Tool 5 (`tool5_uat.yml`) | Escalation path in generated runbooks is always `[TODO: fill in team contacts]`. |
-| General | No test files were found in the repository; test coverage is 0% until Tool 4 generates them. |
+| `backend/agent/graph.py` | **TODO:** Migrate Redis to an external managed service (e.g. Azure Cache for Redis, dedicated Redis container) so that memory persists across serverless backend instances. Currently Redis runs as a sidecar container and state is lost on restart. |
+| `backend/modules/LLMS.py` | **TODO:** Add more LLM providers. `azure` and `openai` entries exist in the model mapper but are set to `None` and will raise `ValueError` if selected. |
+| `backend/modules/LLMS.py` | The Gemini model string `gemini-3-flash-preview` may not match the current Google API model identifier — verify against the Google AI SDK. |
+| `backend/agent/agent_with_skills.py` | `agent_with_skills.py` and `agent/graph.py` both define agents; it is unclear which is used by `main.py` at runtime. `main.py` imports from `agent.graph`. |
+| `docker-compose.yml` | PostgreSQL credentials (`chainlit`/`chainlit`) are hardcoded — these should be injected via environment variables or secrets in production. |
+| `backend/tmp/customer_similarity_dict.json` | Similarity data is stored as a static JSON file in `tmp/` — [TODO: Is this pre-computed offline or should it be regenerated? What is the source dataset?] |
+| `.github/scripts/shared.py` | `send_email`, `email_html`, and `write_audit_entry` are imported by all tool scripts but their implementations are not present in the provided files — the file appears truncated. |
+| `backend/agent/graph.py` | Imports `from langchain.agents import create_agent` — verify this is the correct import path for the installed LangChain version. |
+| General | No test suite found in the repository. CI test generation is AI-assisted (Tool 4) but no baseline tests exist. |
+| General | No IaC (Terraform/Bicep/CloudFormation) found — production infrastructure provisioning is undocumented. |
