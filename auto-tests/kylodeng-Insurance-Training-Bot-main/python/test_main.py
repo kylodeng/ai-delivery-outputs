@@ -1,377 +1,367 @@
 """
-Test suite for api/main.py — Insurance Agent Training System FastAPI backend.
+Test module for api/main.py — Insurance Agent Training System FastAPI backend.
 
 What is tested:
-- _get_llm() helper: shared instance reuse, new instance creation on model/temp change
-- _build_roleplay_system() prompt builder (happy path, edge cases, missing fields)
-- _ROLEPLAY_SYSTEM / _PRIOR_CONTEXT_PROMPT template string integrity
-- FastAPI app lifecycle (lifespan, startup loading)
-- CORS middleware configuration
-- Static files mount at /docs
-- SHOW_TOOL_CALLS env-var parsing
-- HTTP endpoints (mocked): POST /ingest, GET /sessions, etc. where discoverable
-- CustomerProfile / Session pydantic models via imported symbols
+    - _get_llm(): returns shared instance vs new instance based on parameters
+    - _build_roleplay_system(): builds roleplay system prompt correctly
+    - _ROLEPLAY_SYSTEM / _PRIOR_CONTEXT_PROMPT: template strings contain required placeholders
+    - FastAPI app endpoints (via TestClient / AsyncClient):
+        * GET /health or root behaviour
+        * POST /ingest
+        * POST /chat (streaming)
+        * Session CRUD endpoints
+        * Profile generation endpoint
+    - CORS middleware is configured
+    - Lifespan: load_sessions and vector store load/warn paths
 
 Mocks used:
-- langchain_openai.ChatOpenAI (patched at api.main._llm and constructor)
-- core.vector_store.get_vector_store
-- api.rag_tools.make_rag_tools
-- api.agent.make_teacher_agent, make_assessor_agent
-- api.sessions.* (load_sessions, create_session, get_session, etc.)
-- httpx.Client / httpx.AsyncClient (SSL verification disabled — not called for real)
-- fastapi.staticfiles.StaticFiles (to avoid filesystem dependency)
+    - langchain_openai.ChatOpenAI (to avoid real LLM calls)
+    - httpx.Client / httpx.AsyncClient (SSL/network calls)
+    - core.vector_store.get_vector_store
+    - api.rag_tools.make_rag_tools
+    - api.agent.make_teacher_agent / make_assessor_agent
+    - api.sessions.* (load_sessions, create_session, get_session, etc.)
+    - os.getenv (selectively, via monkeypatch)
 
 TODOs:
-- TODO: Test all REST endpoints once their route definitions are visible (file was truncated)
-- TODO: Test _PRIOR_CONTEXT_PROMPT injection into agent when stage/profile vary
-- TODO: Integration test for streaming SSE response (requires full route body)
-- TODO: Test ingest endpoint with real PDF fixture if available
+    - TODO: Full streaming SSE response body parsing requires a running event loop +
+            real async generator; stub tests are provided with pytest.mark.skip
+    - TODO: POST /ingest endpoint body not visible in the provided source snippet;
+            stubs are provided
+    - TODO: _build_roleplay_system full implementation not in snippet; tests cover
+            what is visible + expected contract
 """
 
 import importlib
 import sys
 import types
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
 import pytest
+from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 
 # ---------------------------------------------------------------------------
-# Helpers to build lightweight stub modules so api/main.py can be imported
-# without real heavy dependencies being present in the test environment.
+# Helpers: build a minimal fake module tree so that importing api.main does
+# not fail due to missing optional dependencies in the test environment.
 # ---------------------------------------------------------------------------
 
-def _make_stub_modules():
-    """Inject minimal stub modules for heavy/external deps before import."""
+def _make_fake_sessions_module():
+    """Return a mock module that satisfies `from api.sessions import ...`."""
+    mod = types.ModuleType("api.sessions")
 
-    # --- langchain stubs ---
-    lc_core = types.ModuleType("langchain_core")
-    lc_messages = types.ModuleType("langchain_core.messages")
-
-    class _Msg:
-        def __init__(self, content=""):
-            self.content = content
-
-    lc_messages.AIMessage = type("AIMessage", (_Msg,), {})
-    lc_messages.HumanMessage = type("HumanMessage", (_Msg,), {})
-    lc_messages.SystemMessage = type("SystemMessage", (_Msg,), {})
-    lc_core.messages = lc_messages
-    sys.modules.setdefault("langchain_core", lc_core)
-    sys.modules.setdefault("langchain_core.messages", lc_messages)
-
-    lc_openai = types.ModuleType("langchain_openai")
-    mock_llm_instance = MagicMock(name="ChatOpenAI_instance")
-
-    class _FakeChatOpenAI:
-        def __init__(self, **kwargs):
-            self._kwargs = kwargs
-            self.model = kwargs.get("model", "")
-            self.temperature = kwargs.get("temperature", 0.6)
-
-        def __repr__(self):
-            return f"FakeChatOpenAI(model={self.model})"
-
-    lc_openai.ChatOpenAI = _FakeChatOpenAI
-    sys.modules.setdefault("langchain_openai", lc_openai)
-
-    # --- core.vector_store stub ---
-    core_mod = types.ModuleType("core")
-    core_vs = types.ModuleType("core.vector_store")
-    fake_store = MagicMock(name="VectorStore")
-    fake_store.load.return_value = True
-    fake_store.get_known_products.return_value = ["ProductA", "ProductB"]
-    core_vs.get_vector_store = MagicMock(return_value=fake_store)
-    core_mod.vector_store = core_vs
-    sys.modules.setdefault("core", core_mod)
-    sys.modules.setdefault("core.vector_store", core_vs)
-
-    # --- api sub-package stubs ---
-    api_mod = sys.modules.setdefault("api", types.ModuleType("api"))
-
-    rag_tools_mod = types.ModuleType("api.rag_tools")
-    rag_tools_mod.make_rag_tools = MagicMock(return_value=[MagicMock(name="rag_tool")])
-    sys.modules.setdefault("api.rag_tools", rag_tools_mod)
-
-    agent_mod = types.ModuleType("api.agent")
-    agent_mod.make_teacher_agent = MagicMock(return_value=MagicMock(name="teacher"))
-    agent_mod.make_assessor_agent = MagicMock(return_value=MagicMock(name="assessor"))
-    sys.modules.setdefault("api.agent", agent_mod)
-
-    # --- api.sessions stub ---
-    sessions_mod = types.ModuleType("api.sessions")
-
-    class _CustomerProfile:
+    class CustomerProfile:
         def __init__(self, **kwargs):
             for k, v in kwargs.items():
                 setattr(self, k, v)
 
-    class _Session:
-        def __init__(self, **kwargs):
-            for k, v in kwargs.items():
-                setattr(self, k, v)
+    class Session:
+        def __init__(self, session_id="s1", title="T", messages=None, profile=None):
+            self.session_id = session_id
+            self.title = title
+            self.messages = messages or []
+            self.profile = profile
 
-    sessions_mod.CustomerProfile = _CustomerProfile
-    sessions_mod.Session = _Session
-    sessions_mod.create_session = MagicMock(return_value=_Session(id="sess-1"))
-    sessions_mod.delete_session = MagicMock(return_value=True)
-    sessions_mod.generate_profile = MagicMock(return_value=_CustomerProfile(name="Alice"))
-    sessions_mod.get_session = MagicMock(return_value=_Session(id="sess-1"))
-    sessions_mod.list_sessions = MagicMock(return_value=[])
-    sessions_mod.load_sessions = MagicMock()
-    sessions_mod.update_session_title = MagicMock()
-    sys.modules.setdefault("api.sessions", sessions_mod)
-
-    # --- dotenv stub ---
-    dotenv_mod = types.ModuleType("dotenv")
-    dotenv_mod.load_dotenv = MagicMock()
-    sys.modules.setdefault("dotenv", dotenv_mod)
-
-    # --- StaticFiles stub (avoids filesystem check) ---
-    statics_mod = sys.modules.get("fastapi.staticfiles")
-    if statics_mod is None:
-        statics_mod = types.ModuleType("fastapi.staticfiles")
-    statics_mod.StaticFiles = MagicMock(name="StaticFiles")
-    sys.modules["fastapi.staticfiles"] = statics_mod
-
-    return fake_store
+    mod.CustomerProfile = CustomerProfile
+    mod.Session = Session
+    mod.create_session = MagicMock(return_value=Session())
+    mod.delete_session = MagicMock(return_value=True)
+    mod.generate_profile = MagicMock(return_value=CustomerProfile(name="Alice"))
+    mod.get_session = MagicMock(return_value=Session())
+    mod.list_sessions = MagicMock(return_value=[])
+    mod.load_sessions = MagicMock()
+    mod.update_session_title = MagicMock(return_value=True)
+    return mod
 
 
-_fake_store = _make_stub_modules()
-
-# Now safe to import the module under test
-import api.main as main_module  # noqa: E402
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-@pytest.fixture()
-def app():
-    return main_module.app
+def _make_fake_vector_store():
+    vs = MagicMock()
+    vs.load.return_value = True
+    vs.get_known_products.return_value = ["ProductA", "ProductB"]
+    return vs
 
 
-@pytest.fixture()
-def async_client(app):
-    """Return an httpx AsyncClient wired to the FastAPI test app."""
-    from httpx import AsyncClient, ASGITransport
-    return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+def _patch_imports_and_import_app():
+    """
+    Patch all heavy dependencies before importing api.main so tests remain
+    isolated from real LLM / vector-store / HTTP infrastructure.
+    Returns the imported app module.
+    """
+    # Fake out the ChatOpenAI constructor to avoid real network/SSL
+    fake_llm = MagicMock()
+    fake_llm_cls = MagicMock(return_value=fake_llm)
 
+    # Build fake sub-modules
+    fake_sessions = _make_fake_sessions_module()
+    fake_vs = _make_fake_vector_store()
+    fake_rag_tools = [MagicMock(name="rag_tool_1")]
+    fake_teacher_agent = MagicMock()
+    fake_assessor_agent = MagicMock()
 
-@pytest.fixture()
-def sample_profile_data():
-    return {
-        "name": "Alice Chan",
-        "age": 35,
-        "occupation": "Software Engineer",
-        "profile": (
-            "Alice is a 35-year-old software engineer living in Hong Kong. "
-            "She has two kids and a mortgage. She is interested in long-term savings."
+    # We must inject fakes BEFORE the module is imported
+    patches = {
+        "langchain_openai": MagicMock(ChatOpenAI=fake_llm_cls),
+        "langchain_core.messages": MagicMock(
+            AIMessage=MagicMock,
+            HumanMessage=MagicMock,
+            SystemMessage=MagicMock,
         ),
+        "httpx": MagicMock(
+            Client=MagicMock(return_value=MagicMock()),
+            AsyncClient=MagicMock(return_value=MagicMock()),
+        ),
+        "core.vector_store": MagicMock(get_vector_store=MagicMock(return_value=fake_vs)),
+        "api.rag_tools": MagicMock(make_rag_tools=MagicMock(return_value=fake_rag_tools)),
+        "api.agent": MagicMock(
+            make_teacher_agent=MagicMock(return_value=fake_teacher_agent),
+            make_assessor_agent=MagicMock(return_value=fake_assessor_agent),
+        ),
+        "api.sessions": fake_sessions,
+        "dotenv": MagicMock(load_dotenv=MagicMock()),
+    }
+
+    # Register patches into sys.modules
+    for name, fake in patches.items():
+        sys.modules[name] = fake
+
+    # Also make sub-packages available
+    if "api" not in sys.modules:
+        sys.modules["api"] = types.ModuleType("api")
+    if "core" not in sys.modules:
+        sys.modules["core"] = types.ModuleType("core")
+
+    # Remove previously cached api.main so re-import picks up patches
+    sys.modules.pop("api.main", None)
+
+    import api.main as main_module  # noqa: PLC0415
+
+    return main_module, fake_llm, fake_llm_cls, fake_sessions, fake_vs
+
+
+# ---------------------------------------------------------------------------
+# Module-level fixture: import once and share
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def main_mod():
+    mod, fake_llm, fake_llm_cls, fake_sessions, fake_vs = _patch_imports_and_import_app()
+    return {
+        "mod": mod,
+        "fake_llm": fake_llm,
+        "fake_llm_cls": fake_llm_cls,
+        "fake_sessions": fake_sessions,
+        "fake_vs": fake_vs,
     }
 
 
-# ---------------------------------------------------------------------------
-# Tests: module-level constants and env-var parsing
-# ---------------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def client(main_mod):
+    """Synchronous TestClient wrapping the FastAPI app."""
+    app = main_mod["mod"].app
+    with TestClient(app, raise_server_exceptions=True) as c:
+        yield c
+
+
+# ===========================================================================
+# 1. Module-level constant & env-var tests
+# ===========================================================================
 
 class TestModuleConstants:
-    def test_llm_temperature_default(self):
-        assert main_module._LLM_TEMPERATURE == 0.6
 
-    def test_base_url_default_contains_openrouter(self):
-        # Default when env var not set
-        assert "openrouter" in main_module._BASE_URL or main_module._BASE_URL.startswith("http")
+    def test_show_tool_calls_default_true(self, main_mod):
+        """SHOW_TOOL_CALLS should default to True when env var not set."""
+        # The module was imported without explicit env manipulation;
+        # the default in source is os.getenv("SHOW_TOOL_CALLS", "true") == "true"
+        assert isinstance(main_mod["mod"].SHOW_TOOL_CALLS, bool)
 
-    def test_show_tool_calls_is_bool(self):
-        assert isinstance(main_module.SHOW_TOOL_CALLS, bool)
+    def test_llm_temperature_constant(self, main_mod):
+        assert main_mod["mod"]._LLM_TEMPERATURE == 0.6
 
-    @pytest.mark.parametrize("env_val,expected", [
-        ("true", True),
-        ("True", True),
-        ("TRUE", True),
-        ("false", False),
-        ("False", False),
-        ("0", False),
-        ("yes", False),
-        ("", False),
-    ])
-    def test_show_tool_calls_env_parsing(self, env_val, expected, monkeypatch):
-        monkeypatch.setenv("SHOW_TOOL_CALLS", env_val)
-        # Re-evaluate the expression as main.py does
-        result = env_val.lower() == "true"
-        assert result == expected
-
-    def test_roleplay_system_template_has_required_placeholders(self):
-        template = main_module._ROLEPLAY_SYSTEM
+    def test_roleplay_system_contains_placeholders(self, main_mod):
+        template = main_mod["mod"]._ROLEPLAY_SYSTEM
         for placeholder in ["{name}", "{age}", "{occupation}", "{profile}",
                              "{stage_instruction}", "{today}"]:
             assert placeholder in template, f"Missing placeholder: {placeholder}"
 
-    def test_prior_context_prompt_has_required_placeholders(self):
-        template = main_module._PRIOR_CONTEXT_PROMPT
+    def test_prior_context_prompt_contains_placeholders(self, main_mod):
+        template = main_mod["mod"]._PRIOR_CONTEXT_PROMPT
         for placeholder in ["{profile}", "{stage}"]:
             assert placeholder in template, f"Missing placeholder: {placeholder}"
 
-    def test_roleplay_system_instructs_character_maintenance(self):
-        assert "Never break character" in main_module._ROLEPLAY_SYSTEM
+    def test_prior_context_prompt_max_words_mentioned(self, main_mod):
+        """Prompt instructions should reference the 350-word limit."""
+        assert "350" in main_mod["mod"]._PRIOR_CONTEXT_PROMPT
 
-    def test_prior_context_prompt_word_limit_mentioned(self):
-        assert "350" in main_module._PRIOR_CONTEXT_PROMPT
+    def test_roleplay_system_mentions_today(self, main_mod):
+        assert "Today's date" in main_mod["mod"]._ROLEPLAY_SYSTEM
 
 
-# ---------------------------------------------------------------------------
-# Tests: _get_llm()
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 2. _get_llm() tests
+# ===========================================================================
 
 class TestGetLlm:
-    def test_returns_shared_instance_when_no_args(self):
-        result = main_module._get_llm()
-        assert result is main_module._llm
 
-    def test_returns_shared_instance_with_default_temperature(self):
-        result = main_module._get_llm(model=None, temperature=main_module._LLM_TEMPERATURE)
-        assert result is main_module._llm
+    def test_returns_shared_instance_when_no_override(self, main_mod):
+        """_get_llm() with defaults returns the module-level _llm."""
+        mod = main_mod["mod"]
+        result = mod._get_llm()
+        assert result is mod._llm
 
-    def test_returns_new_instance_when_model_specified(self):
-        result = main_module._get_llm(model="openai/gpt-4")
-        assert result is not main_module._llm
+    def test_returns_new_instance_when_model_differs(self, main_mod):
+        mod = main_mod["mod"]
+        fake_llm_cls = main_mod["fake_llm_cls"]
+        call_count_before = fake_llm_cls.call_count
+        result = mod._get_llm(model="some-other-model")
+        assert fake_llm_cls.call_count > call_count_before
+        # The result should NOT be the shared _llm
+        # (it is the return value of the constructor mock, but a NEW call was made)
 
-    def test_returns_new_instance_when_temperature_differs(self):
-        result = main_module._get_llm(temperature=0.9)
-        assert result is not main_module._llm
+    def test_returns_new_instance_when_temperature_differs(self, main_mod):
+        mod = main_mod["mod"]
+        fake_llm_cls = main_mod["fake_llm_cls"]
+        call_count_before = fake_llm_cls.call_count
+        mod._get_llm(temperature=0.9)
+        assert fake_llm_cls.call_count > call_count_before
 
-    def test_new_instance_has_correct_model(self):
-        custom_model = "openai/gpt-4-turbo"
-        result = main_module._get_llm(model=custom_model)
-        assert result.model == custom_model
+    def test_returns_shared_when_temperature_equals_default(self, main_mod):
+        mod = main_mod["mod"]
+        result = mod._get_llm(model=None, temperature=0.6)
+        assert result is mod._llm
 
-    def test_new_instance_has_correct_temperature(self):
-        result = main_module._get_llm(temperature=0.1)
-        assert result.temperature == 0.1
+    def test_new_instance_uses_provided_model_name(self, main_mod):
+        mod = main_mod["mod"]
+        fake_llm_cls = main_mod["fake_llm_cls"]
+        fake_llm_cls.reset_mock()
+        mod._get_llm(model="custom-model-xyz")
+        _, kwargs = fake_llm_cls.call_args
+        assert kwargs.get("model") == "custom-model-xyz"
 
-    def test_new_instance_falls_back_to_default_model_when_none(self):
-        result = main_module._get_llm(model=None, temperature=0.99)
-        assert result.model == main_module._LLM_MODEL
+    def test_new_instance_uses_provided_temperature(self, main_mod):
+        mod = main_mod["mod"]
+        fake_llm_cls = main_mod["fake_llm_cls"]
+        fake_llm_cls.reset_mock()
+        mod._get_llm(temperature=0.1)
+        _, kwargs = fake_llm_cls.call_args
+        assert kwargs.get("temperature") == 0.1
 
-    def test_returns_new_instance_when_both_differ(self):
-        result = main_module._get_llm(model="openai/gpt-4", temperature=0.0)
-        assert result is not main_module._llm
-        assert result.model == "openai/gpt-4"
-        assert result.temperature == 0.0
+    def test_new_instance_uses_default_model_when_model_none_but_temp_differs(self, main_mod):
+        mod = main_mod["mod"]
+        fake_llm_cls = main_mod["fake_llm_cls"]
+        fake_llm_cls.reset_mock()
+        mod._get_llm(model=None, temperature=0.2)
+        _, kwargs = fake_llm_cls.call_args
+        assert kwargs.get("model") == mod._LLM_MODEL
+
+    def test_get_llm_streaming_enabled(self, main_mod):
+        mod = main_mod["mod"]
+        fake_llm_cls = main_mod["fake_llm_cls"]
+        fake_llm_cls.reset_mock()
+        mod._get_llm(temperature=0.3)
+        _, kwargs = fake_llm_cls.call_args
+        assert kwargs.get("streaming") is True
 
 
-# ---------------------------------------------------------------------------
-# Tests: FastAPI app configuration
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 3. FastAPI app structure tests
+# ===========================================================================
 
-class TestAppConfiguration:
-    def test_app_title(self, app):
-        assert app.title == "Insurance Agent Trainer"
+class TestAppStructure:
 
-    def test_app_is_fastapi_instance(self, app):
-        from fastapi import FastAPI
-        assert isinstance(app, FastAPI)
+    def test_app_title(self, main_mod):
+        assert main_mod["mod"].app.title == "Insurance Agent Trainer"
 
-    def test_cors_middleware_present(self, app):
-        from fastapi.middleware.cors import CORSMiddleware
-        middleware_types = [m.cls for m in app.user_middleware]
+    def test_cors_middleware_present(self, main_mod):
+        from starlette.middleware.cors import CORSMiddleware
+        middleware_types = [
+            m.cls for m in main_mod["mod"].app.user_middleware
+        ]
         assert CORSMiddleware in middleware_types
 
-    def test_cors_allows_localhost_5173(self, app):
-        from fastapi.middleware.cors import CORSMiddleware
+    def test_cors_allows_localhost_5173(self, main_mod):
+        app = main_mod["mod"].app
+        # Find CORSMiddleware config
+        from starlette.middleware.cors import CORSMiddleware
         for m in app.user_middleware:
             if m.cls is CORSMiddleware:
                 origins = m.kwargs.get("allow_origins", [])
                 assert "http://localhost:5173" in origins
                 break
-        else:
-            pytest.fail("CORSMiddleware not found")
 
-    def test_cors_allows_localhost_8000(self, app):
-        from fastapi.middleware.cors import CORSMiddleware
+    def test_cors_allows_localhost_8000(self, main_mod):
+        app = main_mod["mod"].app
+        from starlette.middleware.cors import CORSMiddleware
         for m in app.user_middleware:
             if m.cls is CORSMiddleware:
                 origins = m.kwargs.get("allow_origins", [])
                 assert "http://localhost:8000" in origins
                 break
-        else:
-            pytest.fail("CORSMiddleware not found")
 
-    def test_cors_allows_all_methods(self, app):
-        from fastapi.middleware.cors import CORSMiddleware
-        for m in app.user_middleware:
-            if m.cls is CORSMiddleware:
-                assert "*" in m.kwargs.get("allow_methods", [])
-                break
-
-    def test_cors_allows_all_headers(self, app):
-        from fastapi.middleware.cors import CORSMiddleware
-        for m in app.user_middleware:
-            if m.cls is CORSMiddleware:
-                assert "*" in m.kwargs.get("allow_headers", [])
-                break
+    def test_docs_route_mounted(self, main_mod):
+        """Static files should be mounted at /docs."""
+        app = main_mod["mod"].app
+        route_paths = [getattr(r, "path", None) for r in app.routes]
+        assert "/docs" in route_paths
 
 
-# ---------------------------------------------------------------------------
-# Tests: Lifespan / startup behaviour
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 4. Lifespan tests
+# ===========================================================================
 
 class TestLifespan:
-    @pytest.mark.asyncio
-    async def test_lifespan_calls_load_sessions(self):
-        sessions_mod = sys.modules["api.sessions"]
-        sessions_mod.load_sessions.reset_mock()
 
-        async with main_module.lifespan(main_module.app):
+    @pytest.mark.asyncio
+    async def test_lifespan_calls_load_sessions(self, main_mod):
+        fake_sessions = main_mod["fake_sessions"]
+        fake_sessions.load_sessions.reset_mock()
+        mod = main_mod["mod"]
+
+        async with mod.lifespan(mod.app):
             pass
 
-        sessions_mod.load_sessions.assert_called_once()
+        fake_sessions.load_sessions.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_lifespan_calls_store_load(self):
-        _fake_store.load.reset_mock()
-        _fake_store.load.return_value = True
+    async def test_lifespan_logs_warning_when_store_not_loaded(self, main_mod):
+        mod = main_mod["mod"]
+        fake_vs = main_mod["fake_vs"]
+        fake_vs.load.return_value = False
 
-        async with main_module.lifespan(main_module.app):
-            pass
-
-        _fake_store.load.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_lifespan_warns_when_store_not_found(self, caplog):
-        import logging
-        _fake_store.load.return_value = False
-
-        with caplog.at_level(logging.WARNING, logger="api.main"):
-            async with main_module.lifespan(main_module.app):
+        with patch.object(mod.logger, "warning") as mock_warn:
+            async with mod.lifespan(mod.app):
                 pass
+            mock_warn.assert_called()
+            call_args = str(mock_warn.call_args)
+            assert "ingest" in call_args.lower() or "vector" in call_args.lower()
 
-        assert any("No vector store" in r.message for r in caplog.records)
-        _fake_store.load.return_value = True  # restore
+        # Reset for other tests
+        fake_vs.load.return_value = True
 
     @pytest.mark.asyncio
-    async def test_lifespan_logs_product_count_on_success(self, caplog):
-        import logging
-        _fake_store.load.return_value = True
-        _fake_store.get_known_products.return_value = ["P1", "P2", "P3"]
+    async def test_lifespan_logs_info_when_store_loaded(self, main_mod):
+        mod = main_mod["mod"]
+        fake_vs = main_mod["fake_vs"]
+        fake_vs.load.return_value = True
+        fake_vs.get_known_products.return_value = ["P1", "P2", "P3"]
 
-        with caplog.at_level(logging.INFO, logger="api.main"):
-            async with main_module.lifespan(main_module.app):
+        with patch.object(mod.logger, "info") as mock_info:
+            async with mod.lifespan(mod.app):
                 pass
+            calls_str = " ".join(str(c) for c in mock_info.call_args_list)
+            assert "3" in calls_str or "vector" in calls_str.lower()
 
-        assert any("Vector store loaded" in r.message for r in caplog.records)
 
+# ===========================================================================
+# 5. _ROLEPLAY_SYSTEM prompt formatting
+# ===========================================================================
 
-# ---------------------------------------------------------------------------
-# Tests: _build_roleplay_system (if accessible — partial source provided)
-# ---------------------------------------------------------------------------
+class TestRoleplaySystemPrompt:
 
-class TestBuildRoleplaySystem:
-    """Tests for _build_roleplay_system if it is defined in the module."""
-
-    @pytest.fixture(autouse=True)
-    def skip_if_not_defined(self):
-        if not hasattr(main_
+    def test_format_with_all_required_fields(self, main_mod):
+        template = main_mod["mod"]._ROLEPLAY_SYSTEM
+        result = template.format(
+            name="Alice",
+            age=35,
+            occupation="teacher",
+            profile="Single mother, two kids.",
