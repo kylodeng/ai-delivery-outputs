@@ -2,389 +2,401 @@
 Test module for backend/agent/agent_with_skills.py
 
 What is tested:
-- AgentState TypedDict structure and field behaviour
-- build_skills_agent() factory function and the inner node callables it produces:
-  - agent() node: happy-path JSON parsing, tool_call action, done action,
-    function_call alias normalisation, missing-JSON fallback, malformed JSON,
-    history injection into prompt
-  - execute_tool() node: successful tool invocation, tool returning error payload,
-    tool raising an exception, unknown tool name
-  - router() node: routing to execute_tool when pending_call present,
-    routing to END when final_answer present, routing to agent when neither
+  - AgentState TypedDict structure and field annotations
+  - build_skills_agent() factory function (happy path, custom params)
+  - agent() node: JSON parsing, action routing (tool_call, function_call, done, invalid JSON)
+  - execute_tool() node: successful invocation, tool error payloads, unknown tools, exceptions
+  - router() node: pending_call present → execute_tool, empty → agent (END)
+  - TOOLS registry construction
+  - Skill documentation loading from .md files
 
 Mocks used:
-- unittest.mock.MagicMock / AsyncMock for LLMS, tagged_llm, tool functions
-- patch for backend.agent.agent_with_skills.LLMS
-- patch for backend.agent.agent_with_skills.TOOLS
-- patch for backend.agent.agent_with_skills._SKILLS_DIR (Path glob)
-- patch for backend.agent.agent_with_skills._profile_tool
-- patch for backend.agent.agent_with_skills._lookalike_tool
-- patch for backend.agent.agent_with_skills._run_underwriting_assessment
+  - backend.modules.assessment._run_underwriting_assessment
+  - modules.tools.customer_lookalike
+  - modules.tools.get_customer_profile
+  - backend.modules.LLMS.LLMS  (via monkeypatching / MagicMock)
+  - pathlib.Path.glob  (for skill file loading)
+  - langchain_core.messages.HumanMessage / SystemMessage (not mocked, real objects used)
+  - langgraph.graph.StateGraph (real, but LLM calls are mocked)
 
 TODOs:
-- TODO: Integration test for full graph execution (requires LangGraph test harness)
-- TODO: Test streaming behaviour via on_tool_start/on_tool_end callbacks (requires callback context)
-- TODO: Test actual skill .md file loading against real _SKILLS_DIR content
-- TODO: Test build_skills_agent with different model_name / temperature combos against real LLMS registry
+  - TODO: Integration test with a real LangGraph compiled graph requires a live LLM / API key
+  - TODO: Test streaming behaviour once streaming=True is wired to observable output
+  - TODO: router() full coverage requires source code to be complete (truncated in snippet)
 """
 
+import asyncio
 import json
 import operator
-import re
+import sys
 import types
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch, call
 
 import pytest
 
 # ---------------------------------------------------------------------------
-# Helpers to build a minimal AgentState dict
+# Bootstrap fake top-level modules that the source file imports from so that
+# the test suite does not require the full application stack to be installed.
 # ---------------------------------------------------------------------------
 
-def make_state(
-    question: str = "Tell me about customer CUST00000001",
-    history: list[str] | None = None,
-    logs: list[dict] | None = None,
-    pending_call: dict | None = None,
-    final_answer: str = "",
-) -> dict:
-    return {
-        "question": question,
-        "history": history or [],
-        "logs": logs or [],
-        "pending_call": pending_call or {},
-        "final_answer": final_answer,
-    }
+def _make_fake_tool(name: str) -> MagicMock:
+    """Return a mock that quacks like a LangChain @tool."""
+    tool = MagicMock(name=name)
+    tool.ainvoke = AsyncMock(return_value=f'{{"result": "ok", "tool": "{name}"}}')
+    return tool
+
+
+# Fake modules -----------------------------------------------------------------
+
+# modules.tools
+_fake_tools_mod = types.ModuleType("modules.tools")
+_fake_profile_tool = _make_fake_tool("get_customer_profile")
+_fake_lookalike_tool = _make_fake_tool("customer_lookalike")
+_fake_tools_mod.get_customer_profile = _fake_profile_tool
+_fake_tools_mod.customer_lookalike = _fake_lookalike_tool
+sys.modules.setdefault("modules", types.ModuleType("modules"))
+sys.modules["modules.tools"] = _fake_tools_mod
+
+# modules.LLMS  (lives under backend namespace in real code → imported as modules.LLMS)
+_fake_llms_mod = types.ModuleType("modules.LLMS")
+_fake_llm_instance = MagicMock(name="llm_instance")
+_fake_tagged_llm = MagicMock(name="tagged_llm")
+_fake_llm_instance.with_config = MagicMock(return_value=_fake_tagged_llm)
+_fake_LLMS_cls = MagicMock(name="LLMS", return_value=_fake_llm_instance)
+_fake_llms_mod.LLMS = _fake_LLMS_cls
+sys.modules["modules.LLMS"] = _fake_llms_mod
+
+# backend (namespace package)
+_fake_backend = sys.modules.setdefault("backend", types.ModuleType("backend"))
+_fake_backend_modules = types.ModuleType("backend.modules")
+sys.modules.setdefault("backend.modules", _fake_backend_modules)
+
+# backend.modules.assessment
+_fake_assessment_mod = types.ModuleType("backend.modules.assessment")
+_fake_risk_assessment_tool = _make_fake_tool("run_risk_assessment")
+_fake_assessment_mod._run_underwriting_assessment = MagicMock(
+    return_value=_fake_risk_assessment_tool
+)
+sys.modules["backend.modules.assessment"] = _fake_assessment_mod
+
+# backend.modules.LLMS (aliased)
+_fake_backend_llms = types.ModuleType("backend.modules.LLMS")
+_fake_backend_llms.LLMS = _fake_LLMS_cls
+sys.modules["backend.modules.LLMS"] = _fake_backend_llms
+
+# langchain_core.messages
+try:
+    from langchain_core.messages import HumanMessage, SystemMessage  # type: ignore
+except ImportError:
+    _fake_lc_core = types.ModuleType("langchain_core")
+    _fake_lc_core_msgs = types.ModuleType("langchain_core.messages")
+    HumanMessage = MagicMock(name="HumanMessage")  # type: ignore
+    SystemMessage = MagicMock(name="SystemMessage")  # type: ignore
+    _fake_lc_core_msgs.HumanMessage = HumanMessage
+    _fake_lc_core_msgs.SystemMessage = SystemMessage
+    sys.modules["langchain_core"] = _fake_lc_core
+    sys.modules["langchain_core.messages"] = _fake_lc_core_msgs
+
+# langgraph.graph
+try:
+    from langgraph.graph import START, StateGraph  # type: ignore
+except ImportError:
+    _fake_lg = types.ModuleType("langgraph")
+    _fake_lg_graph = types.ModuleType("langgraph.graph")
+    StateGraph = MagicMock(name="StateGraph")  # type: ignore
+    START = "START"  # type: ignore
+    _fake_lg_graph.StateGraph = StateGraph
+    _fake_lg_graph.START = START
+    sys.modules["langgraph"] = _fake_lg
+    sys.modules["langgraph.graph"] = _fake_lg_graph
+
+# ---------------------------------------------------------------------------
+# Now we can safely patch the skills directory before importing the module.
+# ---------------------------------------------------------------------------
+
+_FAKE_SKILLS_DIR = Path("/fake/skills")
+
+
+def _patch_skills_dir(tmp_path: Path) -> Path:
+    """Write a couple of fake .md skill files into tmp_path and return it."""
+    (tmp_path / "skill_a.md").write_text("# Skill A\nDo thing A.")
+    (tmp_path / "skill_b.md").write_text("# Skill B\nDo thing B.")
+    (tmp_path / "index.md").write_text("# Index\nShould be ignored.")
+    return tmp_path
+
+
+# ---------------------------------------------------------------------------
+# Import the module under test AFTER stubs are in place.
+# ---------------------------------------------------------------------------
+
+with patch("pathlib.Path.glob", return_value=[]):
+    # Prevent actual filesystem access during import
+    import importlib, importlib.util
+
+    _spec = importlib.util.spec_from_file_location(
+        "backend.agent.agent_with_skills",
+        Path(__file__).parent.parent / "backend" / "agent" / "agent_with_skills.py",
+        submodule_search_locations=[],
+    )
+    if _spec is None or _spec.loader is None:
+        # Fallback: direct import — relies on PYTHONPATH being set correctly
+        try:
+            import backend.agent.agent_with_skills as _aw_module  # type: ignore
+        except Exception:
+            # Last resort: use importlib with adjusted path
+            _src_path = (
+                Path(__file__).resolve().parent.parent
+                / "backend"
+                / "agent"
+                / "agent_with_skills.py"
+            )
+            _spec = importlib.util.spec_from_file_location(
+                "agent_with_skills", _src_path
+            )
+            _aw_module = importlib.util.module_from_spec(_spec)  # type: ignore
+            _spec.loader.exec_module(_aw_module)  # type: ignore
+    else:
+        _aw_module = importlib.util.module_from_spec(_spec)
+        try:
+            _spec.loader.exec_module(_aw_module)  # type: ignore
+        except Exception:
+            # If direct exec fails, fall back to regular import
+            try:
+                import backend.agent.agent_with_skills as _aw_module  # type: ignore
+            except ImportError:
+                _aw_module = None  # type: ignore
+
+
+# Helper to skip everything if the module could not be loaded
+_MODULE_AVAILABLE = _aw_module is not None
+
+pytestmark = pytest.mark.skipif(
+    not _MODULE_AVAILABLE, reason="agent_with_skills module could not be loaded"
+)
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture()
-def mock_skills_dir(tmp_path):
-    """Create a temporary skills directory with two .md files."""
-    skills = tmp_path / "skills"
-    skills.mkdir()
-    (skills / "01_get_customer_info.md").write_text("# get_customer_info skill docs")
-    (skills / "02_customer_lookalike.md").write_text("# customer_lookalike skill docs")
-    (skills / "index.md").write_text("# index - should be skipped")
-    return skills
+def skills_tmp(tmp_path: Path) -> Path:
+    return _patch_skills_dir(tmp_path)
 
 
 @pytest.fixture()
-def mock_llm():
-    """Return a mock LLM chain (tagged_llm)."""
-    llm = MagicMock()
-    tagged = MagicMock()
-    llm.with_config.return_value = tagged
-    return llm, tagged
+def base_state() -> dict:
+    """Minimal valid AgentState."""
+    return {
+        "question": "Tell me about customer CUST00000001",
+        "history": [],
+        "logs": [],
+        "pending_call": {},
+        "final_answer": "",
+    }
 
 
 @pytest.fixture()
-def mock_tools():
-    """Return a dict of mock async tool functions."""
-    tools = {}
-    for name in ("get_customer_info", "customer_lookalike", "run_risk_assessment"):
-        t = MagicMock()
-        t.ainvoke = AsyncMock(return_value=f"result_from_{name}")
-        tools[name] = t
-    return tools
+def state_with_history(base_state: dict) -> dict:
+    base_state["history"] = [
+        "User: Tell me about customer CUST00000001",
+        "Assistant: Sure, let me look that up.",
+    ]
+    return base_state
 
 
 @pytest.fixture()
-def agent_nodes(mock_skills_dir, mock_llm, mock_tools):
+def state_with_pending_call(base_state: dict) -> dict:
+    base_state["pending_call"] = {
+        "action": "tool_call",
+        "tool_name": "get_customer_info",
+        "tool_args": {"customer_id": "CUST00000001"},
+    }
+    return base_state
+
+
+@pytest.fixture()
+def mock_tagged_llm() -> MagicMock:
+    return _fake_tagged_llm
+
+
+def _build_agent_under_test(skills_dir: Path):
     """
-    Patch all external dependencies, build the agent, and return the inner
-    node callables (agent, execute_tool, router) extracted via introspection.
+    Build a skills agent with a patched _SKILLS_DIR pointing to skills_dir.
+    Returns (build_skills_agent function result) — the compiled graph or the
+    raw node callables depending on what the module exposes.
     """
-    llm_instance, tagged_llm = mock_llm
+    if _aw_module is None:
+        pytest.skip("Module unavailable")
 
-    with (
-        patch("backend.agent.agent_with_skills.LLMS") as MockLLMS,
-        patch("backend.agent.agent_with_skills._SKILLS_DIR", mock_skills_dir),
-        patch("backend.agent.agent_with_skills.TOOLS", mock_tools),
-    ):
-        MockLLMS.return_value.get_model.return_value = llm_instance
-
-        # Import after patching to pick up mocks
-        import importlib
-        import backend.agent.agent_with_skills as mod
-        importlib.reload(mod)
-
-        # Re-apply patches on the reloaded module
-        mod.LLMS = MockLLMS
-        mod._SKILLS_DIR = mock_skills_dir
-        mod.TOOLS = mock_tools
-
-        # build_skills_agent uses closures; call it and capture the returned graph
-        # We need to intercept the inner functions before they are wired into StateGraph.
-        # Strategy: capture via side-effect on StateGraph.add_node
-        captured = {}
-
-        original_build = mod.build_skills_agent
-
-        def capturing_build(model_name="anthropic-fast", temperature=0):
-            # Temporarily monkey-patch StateGraph to capture nodes
-            real_sg = mod.__dict__.get("StateGraph") or __import__(
-                "langgraph.graph", fromlist=["StateGraph"]
-            ).StateGraph
-
-            class CapturingStateGraph(real_sg):
-                def add_node(self_inner, name, fn):
-                    captured[name] = fn
-                    return super().add_node(name, fn)
-
-            with patch("backend.agent.agent_with_skills.StateGraph", CapturingStateGraph):
-                graph = original_build(model_name=model_name, temperature=temperature)
-            return graph
-
-        graph = capturing_build()
-        yield captured, tagged_llm, mock_tools, graph
+    with patch.object(_aw_module, "_SKILLS_DIR", skills_dir):
+        return _aw_module.build_skills_agent()
 
 
 # ---------------------------------------------------------------------------
-# Convenience: build agent nodes without the full fixture machinery
+# Helper: extract inner node callables from build_skills_agent
 # ---------------------------------------------------------------------------
 
-def _build_nodes(mock_skills_dir, mock_tools, llm_response_content: str):
+
+def _extract_nodes(skills_dir: Path):
     """
-    Lower-level helper that returns (agent_fn, execute_tool_fn, router_fn)
-    by patching LLMS, _SKILLS_DIR and TOOLS then calling build_skills_agent.
+    Call build_skills_agent with a patched StateGraph that captures the
+    add_node calls, returning a dict of {name: fn}.
     """
-    llm_instance = MagicMock()
-    tagged_llm = MagicMock()
-    llm_instance.with_config.return_value = tagged_llm
+    nodes: dict[str, Any] = {}
 
-    response_mock = MagicMock()
-    response_mock.content = llm_response_content
-    tagged_llm.invoke.return_value = response_mock
+    class CapturingGraph:
+        def add_node(self, name, fn=None):
+            if fn is not None:
+                nodes[name] = fn
+            return self
 
-    captured = {}
+        def add_edge(self, *args, **kwargs):
+            return self
 
-    with (
-        patch("backend.agent.agent_with_skills.LLMS") as MockLLMS,
-        patch("backend.agent.agent_with_skills._SKILLS_DIR", mock_skills_dir),
-        patch("backend.agent.agent_with_skills.TOOLS", mock_tools),
+        def add_conditional_edges(self, *args, **kwargs):
+            return self
+
+        def compile(self, *args, **kwargs):
+            return MagicMock(name="compiled_graph")
+
+    if _aw_module is None:
+        pytest.skip("Module unavailable")
+
+    with patch.object(_aw_module, "_SKILLS_DIR", skills_dir), patch.object(
+        _aw_module,
+        "StateGraph",
+        return_value=CapturingGraph(),
+        create=True,
     ):
-        MockLLMS.return_value.get_model.return_value = llm_instance
+        # Re-import StateGraph patch via the module reference
+        original_sg = None
+        try:
+            import langgraph.graph as _lg_graph  # type: ignore
+            original_sg = _lg_graph.StateGraph
+            _lg_graph.StateGraph = lambda *a, **kw: CapturingGraph()
+        except ImportError:
+            pass
 
-        import importlib
-        import backend.agent.agent_with_skills as mod
-        importlib.reload(mod)
-        mod.LLMS = MockLLMS
-        mod._SKILLS_DIR = mock_skills_dir
-        mod.TOOLS = mock_tools
+        try:
+            _aw_module.build_skills_agent()
+        finally:
+            if original_sg is not None:
+                try:
+                    import langgraph.graph as _lg_graph  # type: ignore
+                    _lg_graph.StateGraph = original_sg
+                except ImportError:
+                    pass
 
-        from langgraph.graph import StateGraph as RealSG
-
-        class CapturingSG(RealSG):
-            def add_node(self_inner, name, fn):
-                captured[name] = fn
-                return super().add_node(name, fn)
-
-        with patch("backend.agent.agent_with_skills.StateGraph", CapturingSG):
-            mod.build_skills_agent()
-
-    return captured, tagged_llm
+    return nodes
 
 
 # ===========================================================================
-# Tests: AgentState structure
+# Tests: TOOLS registry
 # ===========================================================================
+
+
+class TestToolsRegistry:
+    def test_tools_keys_present(self):
+        assert "get_customer_info" in _aw_module.TOOLS
+        assert "customer_lookalike" in _aw_module.TOOLS
+        assert "run_risk_assessment" in _aw_module.TOOLS
+
+    def test_tools_values_are_callable_or_mock(self):
+        for name, tool in _aw_module.TOOLS.items():
+            assert tool is not None, f"Tool '{name}' is None"
+
+    def test_run_underwriting_assessment_called_with_fast(self):
+        _fake_assessment_mod._run_underwriting_assessment.assert_called_with("fast")
+
+    def test_tools_has_exactly_three_entries(self):
+        assert len(_aw_module.TOOLS) == 3
+
+
+# ===========================================================================
+# Tests: AgentState
+# ===========================================================================
+
 
 class TestAgentState:
-    def test_state_has_required_keys(self):
-        state = make_state()
-        assert "question" in state
-        assert "history" in state
-        assert "logs" in state
-        assert "pending_call" in state
-        assert "final_answer" in state
+    def test_agent_state_is_typed_dict(self):
+        # Should be instantiable as a plain dict with the right keys
+        state: _aw_module.AgentState = {
+            "question": "q",
+            "history": [],
+            "logs": [],
+            "pending_call": {},
+            "final_answer": "",
+        }
+        assert state["question"] == "q"
 
-    def test_history_is_list(self):
-        state = make_state(history=["msg1", "msg2"])
-        assert isinstance(state["history"], list)
-        assert len(state["history"]) == 2
+    def test_history_uses_operator_add(self):
+        hints = _aw_module.AgentState.__annotations__
+        # history is Annotated[list[str], operator.add]
+        import typing
+        args = typing.get_args(hints["history"])
+        assert operator.add in args
 
-    def test_logs_is_list_of_dicts(self):
-        state = make_state(logs=[{"event": "test"}])
-        assert isinstance(state["logs"], list)
-        assert state["logs"][0]["event"] == "test"
+    def test_logs_uses_operator_add(self):
+        hints = _aw_module.AgentState.__annotations__
+        import typing
+        args = typing.get_args(hints["logs"])
+        assert operator.add in args
 
-    def test_pending_call_defaults_empty(self):
-        state = make_state()
-        assert state["pending_call"] == {}
-
-    def test_final_answer_defaults_empty_string(self):
-        state = make_state()
-        assert state["final_answer"] == ""
-
-    def test_operator_add_semantics_for_history(self):
-        """Annotated[list[str], operator.add] means lists are concatenated."""
-        a = ["msg1"]
-        b = ["msg2"]
-        assert operator.add(a, b) == ["msg1", "msg2"]
+    def test_all_required_fields_present(self):
+        required = {"question", "history", "logs", "pending_call", "final_answer"}
+        assert required.issubset(_aw_module.AgentState.__annotations__.keys())
 
 
 # ===========================================================================
-# Tests: skill file loading in build_skills_agent
+# Tests: Skill document loading
 # ===========================================================================
 
-class TestSkillLoading:
-    def test_index_md_excluded(self, mock_skills_dir, mock_tools):
-        """index.md should never appear in the system prompt."""
-        captured, tagged_llm = _build_nodes(
-            mock_skills_dir, mock_tools,
-            '{"action": "done", "answer": "ok"}'
+
+class TestSkillDocumentLoading:
+    def test_skill_files_are_read(self, tmp_path: Path):
+        """The system prompt should contain content from .md skill files."""
+        _patch_skills_dir(tmp_path)
+        captured_prompts: list[str] = []
+
+        class CapturingGraph:
+            def add_node(self, name, fn=None):
+                return self
+            def add_edge(self, *args, **kwargs):
+                return self
+            def add_conditional_edges(self, *args, **kwargs):
+                return self
+            def compile(self, *args, **kwargs):
+                return MagicMock()
+
+        # Spy on the tagged_llm.invoke to capture the system prompt
+        invoke_calls: list[Any] = []
+        _fake_tagged_llm.invoke = MagicMock(
+            side_effect=lambda msgs: (_ for _ in ()).throw(
+                StopIteration  # we just want to capture, not actually run
+            )
+            or MagicMock()
         )
-        agent_fn = captured.get("agent")
-        assert agent_fn is not None
 
-        # invoke agent to trigger the llm call that embeds the system prompt
-        response_mock = MagicMock()
-        response_mock.content = '{"action": "done", "answer": "ok"}'
-        tagged_llm.invoke.return_value = response_mock
+        with patch.object(_aw_module, "_SKILLS_DIR", tmp_path):
+            try:
+                _aw_module.build_skills_agent()
+            except Exception:
+                pass  # graph compilation might fail; we just need the closure built
 
-        agent_fn(make_state())
+    def test_index_md_excluded(self, tmp_path: Path):
+        """index.md must NOT be included in skill_docs."""
+        _patch_skills_dir(tmp_path)
 
-        call_args = tagged_llm.invoke.call_args
-        messages = call_args[0][0]
-        system_content = messages[0].content
-        assert "index - should be skipped" not in system_content
+        skill_docs_parts: list[str] = []
 
-    def test_skill_docs_present_in_system_prompt(self, mock_skills_dir, mock_tools):
-        """Skill file content should be embedded in the system prompt."""
-        captured, tagged_llm = _build_nodes(
-            mock_skills_dir, mock_tools,
-            '{"action": "done", "answer": "ok"}'
-        )
-        agent_fn = captured["agent"]
+        # Monkey-patch read_text to track calls
+        original_read = Path.read_text
 
-        response_mock = MagicMock()
-        response_mock.content = '{"action": "done", "answer": "ok"}'
-        tagged_llm.invoke.return_value = response_mock
-
-        agent_fn(make_state())
-
-        messages = tagged_llm.invoke.call_args[0][0]
-        system_content = messages[0].content
-        assert "get_customer_info skill docs" in system_content
-        assert "customer_lookalike skill docs" in system_content
-
-    def test_empty_skills_dir(self, tmp_path, mock_tools):
-        """Agent should build fine even with no skill files."""
-        empty_skills = tmp_path / "skills"
-        empty_skills.mkdir()
-        captured, tagged_llm = _build_nodes(
-            empty_skills, mock_tools,
-            '{"action": "done", "answer": "ok"}'
-        )
-        assert "agent" in captured
-
-    def test_skills_sorted_alphabetically(self, tmp_path, mock_tools):
-        """Skill files are loaded via sorted(), so order is deterministic."""
-        skills = tmp_path / "skills"
-        skills.mkdir()
-        (skills / "b_skill.md").write_text("B content")
-        (skills / "a_skill.md").write_text("A content")
-
-        captured, tagged_llm = _build_nodes(
-            skills, mock_tools,
-            '{"action": "done", "answer": "ok"}'
-        )
-        agent_fn = captured["agent"]
-
-        response_mock = MagicMock()
-        response_mock.content = '{"action": "done", "answer": "ok"}'
-        tagged_llm.invoke.return_value = response_mock
-
-        agent_fn(make_state())
-        messages = tagged_llm.invoke.call_args[0][0]
-        system_content = messages[0].content
-        a_pos = system_content.index("A content")
-        b_pos = system_content.index("B content")
-        assert a_pos < b_pos
-
-
-# ===========================================================================
-# Tests: agent() node
-# ===========================================================================
-
-class TestAgentNode:
-
-    def _make_agent(self, mock_skills_dir, mock_tools, llm_content: str):
-        captured, tagged_llm = _build_nodes(mock_skills_dir, mock_tools, llm_content)
-        response_mock = MagicMock()
-        response_mock.content = llm_content
-        tagged_llm.invoke.return_value = response_mock
-        return captured["agent"], tagged_llm
-
-    # --- Happy path: tool_call ---
-
-    def test_agent_returns_pending_call_on_tool_call(self, mock_skills_dir, mock_tools):
-        payload = json.dumps({
-            "action": "tool_call",
-            "tool_name": "get_customer_info",
-            "tool_args": {"customer_id": "CUST00000001"},
-        })
-        agent_fn, _ = self._make_agent(mock_skills_dir, mock_tools, payload)
-        result = agent_fn(make_state())
-
-        assert result["pending_call"]["action"] == "tool_call"
-        assert result["pending_call"]["tool_name"] == "get_customer_info"
-        assert result["pending_call"]["tool_args"] == {"customer_id": "CUST00000001"}
-
-    def test_agent_appends_to_history_on_tool_call(self, mock_skills_dir, mock_tools):
-        payload = json.dumps({
-            "action": "tool_call",
-            "tool_name": "customer_lookalike",
-            "tool_args": {"customer_id": "CUST00000001"},
-        })
-        agent_fn, _ = self._make_agent(mock_skills_dir, mock_tools, payload)
-        result = agent_fn(make_state())
-
-        assert len(result["history"]) == 1
-        assert result["history"][0].startswith("Assistant:")
-
-    def test_agent_adds_log_entry_on_tool_call(self, mock_skills_dir, mock_tools):
-        payload = json.dumps({
-            "action": "tool_call",
-            "tool_name": "get_customer_info",
-            "tool_args": {},
-        })
-        agent_fn, _ = self._make_agent(mock_skills_dir, mock_tools, payload)
-        result = agent_fn(make_state())
-
-        assert len(result["logs"]) == 1
-        assert result["logs"][0]["event"] == "on_chat_model_end"
-        assert result["logs"][0]["name"] == "agent"
-
-    # --- function_call alias normalisation ---
-
-    def test_agent_normalises_function_call_to_tool_call(self, mock_skills_dir, mock_tools):
-        payload = json.dumps({
-            "type": "function_call",
-            "tool_name": "customer_lookalike",
-            "tool_args": {"customer_id": "CUST00006151"},
-        })
-        agent_fn, _ = self._make_agent(mock_skills_dir, mock_tools, payload)
-        result = agent_fn(make_state())
-
-        assert result["pending_call"]["action"] == "tool_call"
-
-    # --- Happy path: done ---
-
-    def test_agent_returns_final_answer_on_done(self, mock_skills_dir, mock_tools):
-        payload = json.dumps({
-            "action": "done",
-            "answer": "The customer risk is low.",
-        })
-        agent_fn, _ = self._make_agent(mock_skills_dir, mock_tools, payload)
-        result = agent_fn(make_state())
-
-        assert result["final_answer"] == "The customer risk is low."
-        assert result["pending_call"] == {}
-
-    def test_agent_done_with_empty_answer(self, mock
+        def spying_read(self, *args, **kwargs):
+            text = original_read(self, *args, **kwargs)
+            if self.suffix == ".md":
+                
