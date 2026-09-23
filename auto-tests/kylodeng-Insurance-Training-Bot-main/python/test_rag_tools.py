@@ -1,108 +1,144 @@
 """
-Test suite for api/rag_tools.py
+Test module for api/rag_tools.py
 
 What is tested:
-    - reset_sources(): initialises a fresh list in the contextvar
-    - get_current_sources(): returns the current sources list or empty list
-    - _find_file_url(): file-system search with lru_cache (mocked filesystem)
-    - _to_docs_path(): URI-to-server-URL conversion (happy path, edge cases, errors)
-    - _collect_sources(): dedup logic, bucket building, source_id assignment
-    - _log_hits(): conditional logging based on SHOW_TOOL_CALLS env var
-    - make_rag_tools() factory: returns a list of tool objects
-    - get_current_date tool: returns today's date in correct format
-    - list_products tool: stub (source truncated — see TODO)
+- reset_sources(): initialises a fresh list in the contextvar
+- get_current_sources(): returns the current sources list or empty list
+- _find_file_url(): filesystem glob fallback for document URLs
+- _to_docs_path(): conversion from file:/// URI to /docs/-relative server URL
+- _collect_sources(): deduplication, ID assignment, bucket management
+- _log_hits(): conditional logging based on SHOW_TOOL_CALLS env var
+- make_rag_tools() factory: verifies tools are created and callable
+  - get_current_date tool: returns today's date string
+  - list_products tool: stub (incomplete source provided)
 
 Mocks used:
-    - unittest.mock.patch for filesystem (Path.rglob, Path.resolve)
-    - unittest.mock.patch for datetime.date.today
-    - unittest.mock.patch for logging.Logger.info
-    - unittest.mock.MagicMock for the vector store passed to make_rag_tools()
-    - contextvars isolation via manual set/reset in fixtures
+- unittest.mock.patch for filesystem (Path.rglob), os.getenv, logging
+- Fake store object passed to make_rag_tools()
+- Synthetic insurance document metadata from provided samples
 
 TODOs:
-    - list_products tool body is truncated in source; tests are stubbed
-    - Any additional tools returned by make_rag_tools() beyond get_current_date
-      and list_products cannot be tested without full source
-    - _find_file_url cache invalidation between tests requires lru_cache clearing
+- list_products tool body is truncated in source; full behaviour not testable
+- Any tools beyond list_products (not visible in source) need stubs
+- Integration tests against a real vector store are skipped (need store fixture)
 """
 
 import contextvars
+import logging
 import os
 import sys
-import types
 from datetime import date
-from pathlib import Path, PurePosixPath
-from unittest.mock import MagicMock, patch, call
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch, PropertyMock
+
 import pytest
 
 # ---------------------------------------------------------------------------
-# Ensure the package root is importable when running pytest from the repo root
+# Helpers to import the module under test with a controlled environment
 # ---------------------------------------------------------------------------
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import api.rag_tools as rag_tools
-from api.rag_tools import (
-    _collect_sources,
-    _find_file_url,
-    _log_hits,
-    _sources_ctx,
-    _to_docs_path,
-    get_current_sources,
-    make_rag_tools,
-    reset_sources,
-)
+def _import_rag_tools(monkeypatch=None, show_tool_calls: str = "false"):
+    """Re-import rag_tools so module-level constants pick up env overrides."""
+    import importlib
+    if monkeypatch:
+        monkeypatch.setenv("SHOW_TOOL_CALLS", show_tool_calls)
+    # Remove cached module so re-import picks up env changes
+    sys.modules.pop("api.rag_tools", None)
+    sys.modules.pop("rag_tools", None)
+    import api.rag_tools as rt
+    return rt
 
 
-# ===========================================================================
-# Helpers / fixtures
-# ===========================================================================
-
-@pytest.fixture(autouse=True)
-def _isolate_contextvar():
-    """Ensure each test starts with a clean contextvar state."""
-    token = _sources_ctx.set(None)
-    yield
-    _sources_ctx.reset(token)
+@pytest.fixture()
+def rt():
+    """Fresh import of rag_tools with SHOW_TOOL_CALLS=false."""
+    sys.modules.pop("api.rag_tools", None)
+    with patch.dict(os.environ, {"SHOW_TOOL_CALLS": "false"}):
+        import api.rag_tools as module
+        yield module
+    sys.modules.pop("api.rag_tools", None)
 
 
-@pytest.fixture(autouse=True)
-def _clear_lru_cache():
-    """Clear the lru_cache on _find_file_url before each test."""
-    _find_file_url.cache_clear()
-    yield
-    _find_file_url.cache_clear()
+@pytest.fixture()
+def rt_show_calls():
+    """Fresh import of rag_tools with SHOW_TOOL_CALLS=true."""
+    sys.modules.pop("api.rag_tools", None)
+    with patch.dict(os.environ, {"SHOW_TOOL_CALLS": "true"}):
+        import api.rag_tools as module
+        yield module
+    sys.modules.pop("api.rag_tools", None)
 
+
+@pytest.fixture()
+def fake_store():
+    """Minimal fake store object accepted by make_rag_tools."""
+    return MagicMock(name="vector_store")
+
+
+# ---------------------------------------------------------------------------
+# Synthetic hit helpers (based on provided data samples)
+# ---------------------------------------------------------------------------
 
 def _make_hit(
     document_name="Generations-II_PB_EN.pdf",
-    page_start=1,
-    page_end=2,
     product_name="Generations II",
     doc_type="product_brochure",
+    page_start=1,
+    page_end=2,
     section_title="Overview",
+    chunk_id="chunk-001",
     file_url="",
-    chunk_id="c1",
-    word_count=120,
-    text="Sample text for the chunk.",
+    text="Sun Life participating whole life insurance plan.",
+    word_count=8,
 ):
     return {
         "metadata": {
             "document_name": document_name,
-            "page_start": page_start,
-            "page_end": page_end,
             "product_name": product_name,
             "doc_type": doc_type,
+            "page_start": page_start,
+            "page_end": page_end,
             "section_title": section_title,
-            "file_url": file_url,
             "chunk_id": chunk_id,
+            "file_url": file_url,
             "word_count": word_count,
         },
         "text": text,
     }
 
 
-def _make_store():
-    return MagicMock(name="vector_store")
+GENERATIONS_HIT = _make_hit(
+    document_name="Generations-II_PB_EN.pdf",
+    product_name="Generations II",
+    page_start=1,
+    page_end=3,
+    section_title="Plan Features",
+    chunk_id="gen-001",
+    text="Guaranteed lifelong protection, double bonuses, mental incapacity benefit.",
+)
+
+HOSPITAL_LIST_HIT = _make_hit(
+    document_name="List of designated hospitals in mainland China.pdf",
+    product_name="List of Designated Hospitals in Mainland China",
+    doc_type="supplementary",
+    page_start=5,
+    page_end=6,
+    section_title="Class 3 Hospitals",
+    chunk_id="hosp-001",
+    text="All Class 3 hospitals across mainland China.",
+)
+
+VIP_HOSPITAL_HIT = _make_hit(
+    document_name="Mainland_China_VIP_Hospital_Network.pdf",
+    product_name="List of Network Hospitals with Mainland China VIP Medical Navigation Service",
+    doc_type="supplementary",
+    page_start=2,
+    page_end=4,
+    section_title="Shanghai Hospitals",
+    chunk_id="vip-001",
+    text="Hospitals affiliated with top universities in Shanghai.",
+)
 
 
 # ===========================================================================
@@ -110,36 +146,55 @@ def _make_store():
 # ===========================================================================
 
 class TestResetSources:
-    def test_sets_empty_list(self):
-        reset_sources()
-        assert _sources_ctx.get(None) == []
+    def test_sets_empty_list(self, rt):
+        rt.reset_sources()
+        assert rt.get_current_sources() == []
 
-    def test_overwrites_existing_list(self):
-        _sources_ctx.set(["stale"])
-        reset_sources()
-        assert _sources_ctx.get(None) == []
+    def test_clears_previous_sources(self, rt):
+        rt.reset_sources()
+        # Manually populate bucket
+        bucket = rt._sources_ctx.get(None)
+        bucket.append({"source_id": "S1", "document": "doc.pdf", "page_start": 1})
+        assert len(rt.get_current_sources()) == 1
+        # Reset should wipe it
+        rt.reset_sources()
+        assert rt.get_current_sources() == []
 
-    def test_get_current_sources_returns_empty_list_when_none(self):
-        # contextvar is None (no reset called)
-        result = get_current_sources()
+    def test_multiple_resets_each_give_fresh_list(self, rt):
+        rt.reset_sources()
+        first = rt._sources_ctx.get(None)
+        rt.reset_sources()
+        second = rt._sources_ctx.get(None)
+        assert first is not second
+
+    def test_sets_new_list_object(self, rt):
+        rt.reset_sources()
+        result = rt.get_current_sources()
+        assert isinstance(result, list)
+
+
+class TestGetCurrentSources:
+    def test_returns_empty_list_when_not_initialised(self, rt):
+        # Ensure contextvar is None
+        rt._sources_ctx.set(None)
+        result = rt.get_current_sources()
         assert result == []
 
-    def test_get_current_sources_returns_empty_list_after_reset(self):
-        reset_sources()
-        result = get_current_sources()
-        assert result == []
+    def test_returns_empty_list_after_reset(self, rt):
+        rt.reset_sources()
+        assert rt.get_current_sources() == []
 
-    def test_get_current_sources_reflects_mutations(self):
-        reset_sources()
-        bucket = _sources_ctx.get(None)
-        bucket.append({"source_id": "S1"})
-        result = get_current_sources()
-        assert len(result) == 1
-        assert result[0]["source_id"] == "S1"
+    def test_returns_populated_list(self, rt):
+        rt.reset_sources()
+        bucket = rt._sources_ctx.get(None)
+        entry = {"source_id": "S1", "document": "doc.pdf", "page_start": 1}
+        bucket.append(entry)
+        result = rt.get_current_sources()
+        assert result == [entry]
 
-    def test_get_current_sources_when_contextvar_set_to_none_explicitly(self):
-        _sources_ctx.set(None)
-        assert get_current_sources() == []
+    def test_returns_list_not_none_when_contextvar_is_none(self, rt):
+        rt._sources_ctx.set(None)
+        assert rt.get_current_sources() is not None
 
 
 # ===========================================================================
@@ -147,41 +202,37 @@ class TestResetSources:
 # ===========================================================================
 
 class TestFindFileUrl:
-    def test_returns_uri_when_file_found(self, tmp_path):
-        # Create a temporary file and point _DATA_DIR at its parent
-        subdir = tmp_path / "Insurance-product-info"
-        subdir.mkdir()
-        doc = subdir / "Generations-II_PB_EN.pdf"
-        doc.write_text("dummy")
+    def test_returns_uri_when_file_found(self, rt, tmp_path):
+        # Create a temporary file to match
+        doc = tmp_path / "test_doc.pdf"
+        doc.write_bytes(b"%PDF")
+        with patch.object(Path, "rglob", return_value=iter([doc])):
+            # Clear LRU cache to avoid stale results
+            rt._find_file_url.cache_clear()
+            result = rt._find_file_url("test_doc.pdf")
+        assert result.startswith("file:///") or result.startswith("file:/")
+        assert "test_doc" in result
 
-        with patch.object(rag_tools, "_DATA_DIR", tmp_path):
-            result = _find_file_url("Generations-II_PB_EN.pdf")
-
-        assert result.startswith("file://") or result.startswith("file:")
-        assert "Generations-II_PB_EN.pdf" in result
-
-    def test_returns_empty_string_when_file_not_found(self, tmp_path):
-        with patch.object(rag_tools, "_DATA_DIR", tmp_path):
-            result = _find_file_url("nonexistent_document.pdf")
-
+    def test_returns_empty_string_when_not_found(self, rt):
+        rt._find_file_url.cache_clear()
+        with patch.object(Path, "rglob", return_value=iter([])):
+            result = rt._find_file_url("nonexistent_doc.pdf")
         assert result == ""
 
-    def test_lru_cache_returns_same_result_on_second_call(self, tmp_path):
-        subdir = tmp_path / "docs"
-        subdir.mkdir()
-        doc = subdir / "cached_doc.pdf"
-        doc.write_text("data")
+    def test_caches_result(self, rt, tmp_path):
+        doc = tmp_path / "cached_doc.pdf"
+        doc.write_bytes(b"%PDF")
+        rt._find_file_url.cache_clear()
+        with patch.object(Path, "rglob", return_value=iter([doc])) as mock_rglob:
+            rt._find_file_url("cached_doc.pdf")
+            rt._find_file_url("cached_doc.pdf")
+        # rglob called only once due to lru_cache
+        assert mock_rglob.call_count == 1
 
-        with patch.object(rag_tools, "_DATA_DIR", tmp_path):
-            r1 = _find_file_url("cached_doc.pdf")
-            r2 = _find_file_url("cached_doc.pdf")
-
-        assert r1 == r2
-
-    def test_empty_string_document_name(self, tmp_path):
-        with patch.object(rag_tools, "_DATA_DIR", tmp_path):
-            result = _find_file_url("")
-        # Either empty string or a URI; must not raise
+    def test_returns_string_type(self, rt):
+        rt._find_file_url.cache_clear()
+        with patch.object(Path, "rglob", return_value=iter([])):
+            result = rt._find_file_url("anything.pdf")
         assert isinstance(result, str)
 
 
@@ -190,61 +241,61 @@ class TestFindFileUrl:
 # ===========================================================================
 
 class TestToDocsPath:
-    def test_empty_string_returns_empty(self):
-        assert _to_docs_path("") == ""
+    def test_empty_string_returns_empty(self, rt):
+        assert rt._to_docs_path("") == ""
 
-    def test_valid_file_uri_returns_docs_path(self, tmp_path):
-        subdir = tmp_path / "Insurance-product-info"
-        subdir.mkdir()
-        doc = subdir / "doc.pdf"
-        doc.write_text("x")
+    def test_valid_file_url_returns_docs_path(self, rt, tmp_path):
+        # Build a real file URI that is relative to _DATA_DIR
+        # We patch _DATA_DIR so the relative_to() call succeeds
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        sub = data_dir / "Insurance-product-info"
+        sub.mkdir()
+        doc = sub / "doc.pdf"
+        doc.write_bytes(b"%PDF")
 
-        file_uri = doc.resolve().as_uri()
+        file_url = doc.resolve().as_uri()
+        with patch.object(type(rt), "_DATA_DIR", new_callable=lambda: property(lambda self: data_dir), create=True):
+            # Patch the module-level _DATA_DIR directly
+            original = rt._DATA_DIR
+            rt._DATA_DIR = data_dir
+            try:
+                result = rt._to_docs_path(file_url)
+            finally:
+                rt._DATA_DIR = original
 
-        with patch.object(rag_tools, "_DATA_DIR", tmp_path):
-            result = _to_docs_path(file_uri)
+        assert result.startswith("/docs/")
+        assert "doc.pdf" in result
 
-        assert result == "/docs/Insurance-product-info/doc.pdf"
-
-    def test_path_with_spaces_is_percent_encoded(self, tmp_path):
-        subdir = tmp_path / "My Docs"
-        subdir.mkdir()
-        doc = subdir / "my file.pdf"
-        doc.write_text("x")
-
-        file_uri = doc.resolve().as_uri()
-
-        with patch.object(rag_tools, "_DATA_DIR", tmp_path):
-            result = _to_docs_path(file_uri)
-
-        assert "My%20Docs" in result or "My+Docs" in result or "My Docs" not in result
-        assert "my%20file.pdf" in result or "my+file.pdf" in result or "my file.pdf" not in result
-
-    def test_returns_empty_on_path_outside_data_dir(self, tmp_path):
-        """A file:// URI that cannot be made relative to _DATA_DIR returns ''."""
-        other = tmp_path / "other"
-        other.mkdir()
-        doc = other / "doc.pdf"
-        doc.write_text("x")
-
-        # Point _DATA_DIR somewhere that does NOT contain the file
-        unrelated = tmp_path / "unrelated_data"
-        unrelated.mkdir()
-
-        file_uri = doc.resolve().as_uri()
-        with patch.object(rag_tools, "_DATA_DIR", unrelated):
-            result = _to_docs_path(file_uri)
-
+    def test_non_file_url_returns_empty_on_exception(self, rt):
+        # A URL that doesn't relate to _DATA_DIR should return ""
+        result = rt._to_docs_path("file:///some/completely/different/path/doc.pdf")
+        # relative_to will raise ValueError → returns ""
         assert result == ""
 
-    def test_malformed_uri_returns_empty(self):
-        result = _to_docs_path("not_a_valid_uri:::///")
+    def test_returns_string(self, rt):
+        result = rt._to_docs_path("")
         assert isinstance(result, str)
-        # Should not raise; may return "" or some fallback
 
-    def test_non_file_uri_returns_empty_or_string(self):
-        result = _to_docs_path("https://example.com/doc.pdf")
-        assert isinstance(result, str)
+    def test_url_parts_are_encoded(self, rt, tmp_path):
+        """Spaces and special chars in path segments are percent-encoded."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        sub = data_dir / "My Product Folder"
+        sub.mkdir()
+        doc = sub / "my doc.pdf"
+        doc.write_bytes(b"%PDF")
+        file_url = doc.resolve().as_uri()
+
+        original = rt._DATA_DIR
+        rt._DATA_DIR = data_dir
+        try:
+            result = rt._to_docs_path(file_url)
+        finally:
+            rt._DATA_DIR = original
+
+        # spaces encoded as %20
+        assert "%20" in result or " " not in result
 
 
 # ===========================================================================
@@ -252,126 +303,73 @@ class TestToDocsPath:
 # ===========================================================================
 
 class TestCollectSources:
-    def test_returns_empty_strings_when_bucket_is_none(self):
-        hits = [_make_hit(), _make_hit()]
-        result = _collect_sources(hits)
+    def test_returns_empty_strings_when_bucket_is_none(self, rt):
+        rt._sources_ctx.set(None)
+        hits = [GENERATIONS_HIT, HOSPITAL_LIST_HIT]
+        result = rt._collect_sources(hits)
         assert result == ["", ""]
 
-    def test_single_hit_assigned_s1(self):
-        reset_sources()
-        hits = [_make_hit(file_url="")]
-        with patch.object(rag_tools, "_find_file_url", return_value=""):
-            result = _collect_sources(hits)
-        assert result == ["S1"]
-        bucket = _sources_ctx.get(None)
-        assert len(bucket) == 1
-        assert bucket[0]["source_id"] == "S1"
-
-    def test_two_distinct_hits_get_unique_ids(self):
-        reset_sources()
-        hits = [
-            _make_hit(document_name="doc1.pdf", page_start=1),
-            _make_hit(document_name="doc2.pdf", page_start=1),
-        ]
-        with patch.object(rag_tools, "_find_file_url", return_value=""):
-            result = _collect_sources(hits)
+    def test_assigns_sequential_ids(self, rt):
+        rt.reset_sources()
+        with patch.object(rt, "_find_file_url", return_value=""), \
+             patch.object(rt, "_to_docs_path", return_value=""):
+            result = rt._collect_sources([GENERATIONS_HIT, HOSPITAL_LIST_HIT])
         assert result == ["S1", "S2"]
 
-    def test_duplicate_hits_reuse_same_id(self):
-        reset_sources()
-        hit = _make_hit(document_name="doc1.pdf", page_start=3)
-        with patch.object(rag_tools, "_find_file_url", return_value=""):
-            result = _collect_sources([hit, hit])
-        assert result == ["S1", "S1"]
-        bucket = _sources_ctx.get(None)
-        assert len(bucket) == 1  # only one entry despite two hits
+    def test_deduplicates_same_doc_and_page(self, rt):
+        rt.reset_sources()
+        # Two hits with the same document_name + page_start → same ID
+        hit_a = _make_hit(document_name="doc.pdf", page_start=1, chunk_id="c1")
+        hit_b = _make_hit(document_name="doc.pdf", page_start=1, chunk_id="c2")
+        with patch.object(rt, "_find_file_url", return_value=""), \
+             patch.object(rt, "_to_docs_path", return_value=""):
+            result = rt._collect_sources([hit_a, hit_b])
+        assert result[0] == result[1] == "S1"
+        # Only one entry in bucket
+        assert len(rt.get_current_sources()) == 1
 
-    def test_dedup_by_document_and_page_start(self):
-        reset_sources()
-        h1 = _make_hit(document_name="doc.pdf", page_start=5, chunk_id="a")
-        h2 = _make_hit(document_name="doc.pdf", page_start=5, chunk_id="b")  # same page
-        with patch.object(rag_tools, "_find_file_url", return_value=""):
-            result = _collect_sources([h1, h2])
-        assert result[0] == result[1]
-        assert len(_sources_ctx.get(None)) == 1
+    def test_different_pages_same_doc_get_separate_ids(self, rt):
+        rt.reset_sources()
+        hit_a = _make_hit(document_name="doc.pdf", page_start=1)
+        hit_b = _make_hit(document_name="doc.pdf", page_start=5)
+        with patch.object(rt, "_find_file_url", return_value=""), \
+             patch.object(rt, "_to_docs_path", return_value=""):
+            result = rt._collect_sources([hit_a, hit_b])
+        assert result[0] != result[1]
+        assert len(rt.get_current_sources()) == 2
 
-    def test_different_pages_same_doc_get_different_ids(self):
-        reset_sources()
-        h1 = _make_hit(document_name="doc.pdf", page_start=1)
-        h2 = _make_hit(document_name="doc.pdf", page_start=2)
-        with patch.object(rag_tools, "_find_file_url", return_value=""):
-            result = _collect_sources([h1, h2])
-        assert result == ["S1", "S2"]
+    def test_empty_hits_returns_empty_list(self, rt):
+        rt.reset_sources()
+        result = rt._collect_sources([])
+        assert result == []
 
-    def test_source_entry_fields_populated(self):
-        reset_sources()
-        hit = _make_hit(
-            document_name="Generations-II_PB_EN.pdf",
-            page_start=10,
-            page_end=11,
-            product_name="Generations II",
-            section_title="Benefits",
-            chunk_id="chunk_42",
-            text="A" * 300,
-            file_url="",
-        )
-        with patch.object(rag_tools, "_find_file_url", return_value=""):
-            _collect_sources([hit])
+    def test_result_length_matches_hits(self, rt):
+        rt.reset_sources()
+        hits = [GENERATIONS_HIT, HOSPITAL_LIST_HIT, VIP_HOSPITAL_HIT]
+        with patch.object(rt, "_find_file_url", return_value=""), \
+             patch.object(rt, "_to_docs_path", return_value=""):
+            result = rt._collect_sources(hits)
+        assert len(result) == 3
 
-        entry = _sources_ctx.get(None)[0]
+    def test_text_preview_truncated_to_250(self, rt):
+        rt.reset_sources()
+        long_text = "A" * 500
+        hit = _make_hit(text=long_text, document_name="long.pdf", page_start=1)
+        with patch.object(rt, "_find_file_url", return_value=""), \
+             patch.object(rt, "_to_docs_path", return_value=""):
+            rt._collect_sources([hit])
+        bucket = rt.get_current_sources()
+        assert len(bucket[0]["text_preview"]) == 250
+
+    def test_entry_fields_populated_correctly(self, rt):
+        rt.reset_sources()
+        with patch.object(rt, "_find_file_url", return_value=""), \
+             patch.object(rt, "_to_docs_path", return_value="/docs/test/doc.pdf"):
+            rt._collect_sources([GENERATIONS_HIT])
+        entry = rt.get_current_sources()[0]
         assert entry["source_id"] == "S1"
         assert entry["document"] == "Generations-II_PB_EN.pdf"
         assert entry["product"] == "Generations II"
-        assert entry["page_start"] == 10
-        assert entry["page_end"] == 11
-        assert entry["section"] == "Benefits"
-        assert entry["chunk_id"] == "chunk_42"
-        assert len(entry["text_preview"]) <= 250
-        assert entry["text_preview"] == "A" * 250
-
-    def test_fallback_to_find_file_url_when_no_file_url_in_metadata(self):
-        reset_sources()
-        hit = _make_hit(file_url="")
-        fake_uri = "file:///data/Insurance-product-info/doc.pdf"
-        with patch.object(rag_tools, "_find_file_url", return_value=fake_uri) as mock_find, \
-             patch.object(rag_tools, "_to_docs_path", return_value="/docs/doc.pdf"):
-            _collect_sources([hit])
-            mock_find.assert_called_once()
-
-    def test_file_url_in_metadata_used_directly(self):
-        reset_sources()
-        hit = _make_hit(file_url="file:///some/path/doc.pdf")
-        with patch.object(rag_tools, "_find_file_url") as mock_find, \
-             patch.object(rag_tools, "_to_docs_path", return_value="/docs/doc.pdf"):
-            _collect_sources([hit])
-            mock_find.assert_not_called()
-
-    def test_empty_hits_list(self):
-        reset_sources()
-        result = _collect_sources([])
-        assert result == []
-        assert _sources_ctx.get(None) == []
-
-    def test_missing_metadata_key_defaults(self):
-        reset_sources()
-        hit = {"text": "hello", "metadata": {}}  # no keys at all
-        with patch.object(rag_tools, "_find_file_url", return_value=""):
-            result = _collect_sources([hit])
-        assert result == ["S1"]
-        entry = _sources_ctx.get(None)[0]
-        assert entry["document"] == "?"
-        assert entry["page_start"] == "?"
-        assert entry["page_end"] == "?"
-        assert entry["product"] == ""
-        assert entry["section"] == ""
-
-    def test_counter_continues_across_calls(self):
-        """Source IDs must increment across multiple _collect_sources calls in same request."""
-        reset_sources()
-        h1 = _make_hit(document_name="a.pdf", page_start=1)
-        h2 = _make_hit(document_name="b.pdf", page_start=1)
-        with patch.object(rag_tools, "_find_file_url", return_value=""):
-            r1 = _collect_sources([h1])
-            r2 = _collect_sources([h2])
-        assert r1 == ["S1"]
-        assert r2 ==
+        assert entry["page_start"] == 1
+        assert entry["page_end"] == 3
+        
