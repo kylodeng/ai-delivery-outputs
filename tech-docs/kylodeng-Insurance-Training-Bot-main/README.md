@@ -2,7 +2,7 @@
 
 ## 1. Project Overview
 
-Insurance Training Bot is an AI-powered training platform for insurance sales agents, built around a Retrieval-Augmented Generation (RAG) pipeline over Sun Life Hong Kong product PDFs. It provides two interaction modes: a **Teacher mode** for guided coaching and product Q&A, and a **Roleplay/Assessment mode** where the agent practises sales conversations against a simulated customer profile and receives structured feedback. The system is deployed as a FastAPI backend with a separate frontend, both hosted on Azure App Service.
+The Insurance Training Bot is an AI-powered training system designed to help new insurance agents in Hong Kong master product knowledge and sales techniques. It provides two modes: a **Teacher mode** for interactive coaching and guided learning, and a **Roleplay/Assessment mode** where the agent practises conversations with simulated customers and receives structured performance feedback. The system is backed by a RAG (Retrieval-Augmented Generation) pipeline that ingests Sun Life Hong Kong insurance product PDFs into a vector store, ensuring all product-specific answers are grounded in real documents.
 
 ---
 
@@ -10,120 +10,123 @@ Insurance Training Bot is an AI-powered training platform for insurance sales ag
 
 | Component | Technology | Version/Notes |
 |---|---|---|
-| Runtime language | Python | 3.13 (CI/CD), 3.12 (workflow scripts) |
-| Package manager | uv (Astral) | `uv sync` / `uv export` |
-| Web framework | FastAPI | With `asynccontextmanager` lifespan |
-| LLM provider | OpenRouter (configurable) | Default model: `openai/gpt-oss-20b:free` |
-| LLM client | `langchain-openai` / `ChatOpenAI` | Streaming enabled |
-| Agent framework | LangGraph | `create_agent` via `langchain.agents` |
-| Embedding / vector store | `core` library (local) | Supports ChromaDB, FAISS, Pinecone |
-| PDF parsing | `pdfplumber` | Custom chunker in `core/chunker.py` |
-| Document annotation | LLM-based (same model) | Cached to `.annot.json` sidecar files |
-| HTTP client | `httpx` | SSL verification disabled (see Known Issues) |
-| Environment config | `python-dotenv` | `.env` file |
-| AI delivery workflows | Anthropic Claude | `claude-sonnet-4-6` (via `anthropic` SDK) |
-| Email notifications | SendGrid | Via `SENDGRID_API_KEY` |
-| CI/CD | GitHub Actions | See `.github/workflows/` |
-| Deployment target | Azure App Service | Two apps: `training-bot-api`, `training-bot-frontend` |
-| Test runner | pytest | Run via `uv run pytest` |
+| Backend API | FastAPI | Python async |
+| LLM Orchestration | LangChain / LangGraph | `create_agent`, `astream_events`, `ainvoke` |
+| LLM Provider | OpenRouter (default) / Anthropic | Configurable via env vars |
+| LLM Model | `openai/gpt-oss-20b:free` (default) | Overridden by `OPENAI_MODEL` env var |
+| Embeddings / Vector Store | `core` RAG library | Supports ChromaDB, FAISS, Pinecone |
+| PDF Parsing | pdfplumber | Chunker + annotator pipeline |
+| Package Manager | uv | Python 3.13 (CI), 3.x local |
+| Frontend | [TODO: What framework is the frontend? A Vite dev server is referenced on port 5173 but no frontend source files were provided.] | Served on port 5173 (dev) |
+| HTTP Client | httpx | SSL verification disabled — see Known Issues |
+| CI/CD | GitHub Actions | 6 workflows |
+| Deployment | Azure App Service | Two apps: `training-bot-api`, `training-bot-frontend` |
+| AI Workflow Tooling | Anthropic Claude (`claude-sonnet-4-6`) | Used in `.github/scripts` tools only |
+| Email | SendGrid | Notification via `shared.py` |
+| Session Persistence | JSON file (`data/sessions.json`) | Survives server restarts |
 
 ---
 
 ## 3. Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                  Client / Chainlit UI                │
-│              (http://localhost:8000 or 5173)         │
-└────────────────────────┬────────────────────────────┘
-                         │ HTTP / SSE streaming
-┌────────────────────────▼────────────────────────────┐
-│              FastAPI Backend  (api/main.py)          │
-│  - Session management  (api/sessions.py)             │
-│  - Teacher agent       (api/agent.py)  ←─ streams   │
-│  - Assessor agent      (api/agent.py)  ←─ one-shot  │
-│  - Roleplay customer   (api/main.py _ROLEPLAY_SYSTEM)│
-│  - Static file mount   /docs → data/                │
-└──────┬──────────────────────┬───────────────────────┘
-       │ RAG tools             │ LLM calls
-┌──────▼──────────┐   ┌───────▼────────────────────────┐
-│  core/ library  │   │  OpenRouter / Anthropic API     │
-│  vector store   │   │  (ChatOpenAI with custom base   │
-│  (Chroma/FAISS/ │   │   URL)                         │
-│   Pinecone)     │   └────────────────────────────────┘
-│  PDF chunker    │
-│  LLM annotator  │
-└──────┬──────────┘
-       │
-┌──────▼──────────────────────────────────────────────┐
-│  data/Insurance-product-info/  (PDF knowledge base) │
-│  *.annot.json sidecar annotation cache              │
-│  data/sessions.json  (session persistence)          │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                        Frontend (Vite / Chainlit UI)         │
+│                    http://localhost:5173                      │
+└────────────────────────────┬────────────────────────────────┘
+                             │ HTTP / SSE (StreamingResponse)
+┌────────────────────────────▼────────────────────────────────┐
+│                     FastAPI Backend (api/main.py)            │
+│  /ingest  /chat (teacher)  /roleplay  /assess  /sessions    │
+│  Serves /docs/* → data/ directory (PDFs, data files)        │
+└──────┬───────────────────────────┬──────────────────────────┘
+       │                           │
+┌──────▼──────────┐   ┌───────────▼────────────────────────┐
+│  LangGraph      │   │  core RAG library                   │
+│  Agents         │   │  ┌────────────┐  ┌───────────────┐ │
+│  ┌───────────┐  │   │  │  Annotator │  │   Chunker     │ │
+│  │  Teacher  │  │   │  │  (LLM-based│  │  (pdfplumber) │ │
+│  │  Agent    │◄─┼───┼─►│  sidecar   │  │               │ │
+│  └───────────┘  │   │  │  .annot.   │  └───────┬───────┘ │
+│  ┌───────────┐  │   │  │  json)     │          │         │ │
+│  │ Assessor  │  │   │  └────────────┘          │         │ │
+│  │  Agent    │  │   │  ┌──────────────────────▼───────┐  │ │
+│  └───────────┘  │   │  │  Vector Store                 │  │ │
+└─────────────────┘   │  │  (Chroma / FAISS / Pinecone)  │  │ │
+                       │  └───────────────────────────────┘  │ │
+                       └────────────────────────────────────┘
 
-GitHub Actions (.github/workflows/)
-  ├── deploy.yml           → test + deploy to Azure on push to main
-  ├── tool1_code_review    → Claude PR/repo code review
-  ├── tool2_tech_docs      → Claude auto-documentation
-  ├── tool3_business_docs  → Claude business doc generation
-  ├── tool4_auto_testing   → Claude test generation / gap analysis
-  └── tool5_uat            → Claude UAT test pack / defect report
+GitHub Actions (5 AI delivery tools):
+  tool1: Claude code review → PR comments + output repo
+  tool2: Claude tech docs   → README, ARCHITECTURE, RUNBOOK
+  tool3: Claude biz docs    → Solution overview + gap questionnaire
+  tool4: Claude test gen    → pytest / jest test files
+  tool5: Claude UAT pack    → test scenarios + defect report
 ```
 
-**How components interact:**
+**Data flow (training session):**
 
-1. On startup, `api/main.py` loads the persisted vector store (`core/vector_store.py`) from disk and restores sessions from `data/sessions.json`.
-2. Incoming chat requests create or continue a **Session** (teacher or roleplay mode). Each request resets per-request source tracking (`api/rag_tools.py` context vars).
-3. The **Teacher agent** streams responses via `astream_events`; the **Assessor agent** is invoked once after a roleplay ends via `ainvoke`.
-4. Both agents call **RAG tools** (`api/rag_tools.py`) which query the vector store and annotate responses with inline source citations (`[[S1]]`, `[[S2]]`, …).
-5. PDFs are pre-processed by `core/ingest.py` → `core/chunker.py` → `core/annotator.py` (LLM-annotated, cached as `.annot.json`) → embedded into the vector store.
-6. The GitHub Actions AI-delivery tools (`tool1`–`tool5`) are independent Python scripts that use Anthropic Claude directly (not the app LLM) for repository-level automation.
+1. On startup, `lifespan()` loads the persisted vector store from disk.
+2. Insurance product PDFs in `data/` are pre-ingested via `POST /ingest` → `core/ingest.py` annotates pages with an LLM, chunks them with `pdfplumber`, and embeds chunks into the vector store.
+3. When a trainee sends a message, `api/main.py` routes to the Teacher or Assessor LangGraph agent.
+4. The agent calls RAG tools (`api/rag_tools.py`) which query the vector store and return source-attributed chunks.
+5. The Teacher agent streams the response back via `StreamingResponse` (SSE); the Assessor agent returns a structured JSON assessment via `ainvoke`.
+6. Sessions are stored in `data/sessions.json` for persistence across restarts.
 
 ---
 
 ## 4. Local Development Setup
 
+**Prerequisites:** Python 3.11+, `uv` installed (`pip install uv`), and a populated `data/` directory with PDF product files.
+
+1. **Clone the repository**
+
 ```bash
-# 1. Clone the repository
 git clone https://github.com/kylodeng/Insurance-Training-Bot-main.git
 cd Insurance-Training-Bot-main
 ```
 
-```bash
-# 2. Install uv (if not already installed)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
+2. **Install dependencies using uv**
 
 ```bash
-# 3. Install Python dependencies
 uv sync
 ```
 
-```bash
-# 4. Copy and fill in environment variables
-cp .env.example .env
-# Edit .env with your API keys and configuration (see Environment Variables section)
-```
+3. **Create a `.env` file** in the project root (see [Environment Variables](#5-environment-variables) section below):
 
 ```bash
-# 5. Ingest PDF documents into the vector store
-# Place your PDF files under data/Insurance-product-info/
+cp .env.example .env   # if available, otherwise create manually
+```
+
+4. **Ingest insurance product PDFs** into the vector store (PDFs must be placed under `data/Insurance-product-info/`):
+
+```bash
 uv run python -m core.ingest --pdf-dir data/Insurance-product-info
-# Or using the module directly:
-uv run python core/ingest.py --pdf-dir data/Insurance-product-info
 ```
 
-```bash
-# 6. Start the FastAPI backend
-uv run uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
-```
+Or via the API after starting the server:
 
 ```bash
-# 7. (Optional) Trigger a manual ingest via the API endpoint
 curl -X POST http://localhost:8000/ingest
 ```
 
-The Chainlit UI (frontend) is served separately. [TODO: What command starts the frontend — is there a Chainlit `app.py` or a Vite project? The frontend entrypoint is not present in the provided files.]
+5. **Start the FastAPI backend**
+
+```bash
+uv run uvicorn api.main:app --reload --port 8000
+```
+
+6. **Start the frontend** (development mode)
+
+```bash
+# [TODO: What is the frontend framework and start command? A Vite dev server on port 5173 is expected.]
+```
+
+7. **Verify the backend is running**
+
+```bash
+curl http://localhost:8000/docs
+```
 
 ---
 
@@ -132,104 +135,137 @@ The Chainlit UI (frontend) is served separately. [TODO: What command starts the 
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `API_KEY` | Yes | `""` | API key for the LLM provider (OpenRouter or Anthropic) |
-| `OPENAI_URL_BASE` | No | `https://openrouter.ai/api/v1` | Base URL for the OpenAI-compatible LLM endpoint |
-| `OPENAI_MODEL` | No | `openai/gpt-oss-20b:free` | LLM model name to use for chat and annotation |
-| `SHOW_TOOL_CALLS` | No | `true` | Log and stream tool call events (`true`/`false`); overridable per session in Chainlit UI |
-| `ANTHROPIC_API_KEY` | Yes (CI only) | — | Anthropic API key used by the GitHub Actions AI-delivery tools (tool1–tool5) |
-| `GH_TOKEN` | Yes (CI only) | — | GitHub personal access token for the AI-delivery workflow scripts |
-| `SENDGRID_API_KEY` | Yes (CI only) | — | SendGrid API key for email notifications from CI tools |
-| `OUTPUT_REPO` | No (CI only) | `ai-delivery-outputs` | GitHub repo name where CI tool outputs are written |
-| `OUTPUT_REPO_OWNER` | No (CI only) | `GITHUB_REPOSITORY_OWNER` | Owner of the output repo |
-| `NOTIFY_EMAIL` | No (CI only) | `kylo.deng@capco.com` | Recipient email for CI tool notifications |
-| `SENDER_EMAIL` | No (CI only) | `kylo.deng@capco.com` | Sender email for CI tool notifications |
-| `AZURE_WEBAPP_PUBLISH_PROFILE_API` | Yes (CI only) | — | Azure publish profile secret for `training-bot-api` App Service |
-| `AZURE_WEBAPP_PUBLISH_PROFILE_FRONTEND` | Yes (CI only) | — | Azure publish profile secret for `training-bot-frontend` App Service |
+| `OPENAI_URL_BASE` | No | `https://openrouter.ai/api/v1` | Base URL for the OpenAI-compatible API endpoint |
+| `OPENAI_MODEL` | No | `openai/gpt-oss-20b:free` | LLM model identifier |
+| `SHOW_TOOL_CALLS` | No | `true` | Log and stream tool call events; overridden per-session by UI toggle |
+| `ANTHROPIC_API_KEY` | Yes (CI tools only) | — | Anthropic API key used by `.github/scripts` AI delivery tools |
+| `GH_TOKEN` | Yes (CI tools only) | — | GitHub personal access token for API calls in CI scripts |
+| `SENDGRID_API_KEY` | Yes (CI tools only) | — | SendGrid API key for email notifications from CI tools |
+| `OUTPUT_REPO` | No (CI tools only) | `ai-delivery-outputs` | GitHub repo name where CI tool outputs are written |
+| `OUTPUT_REPO_OWNER` | No (CI tools only) | `GITHUB_REPOSITORY_OWNER` | GitHub owner of the output repo |
+| `NOTIFY_EMAIL` | No (CI tools only) | `kylo.deng@capco.com` | Email address for CI tool notifications |
+| `SENDER_EMAIL` | No (CI tools only) | `kylo.deng@capco.com` | Sender address for CI tool emails |
 
-> All CI-only variables are stored as GitHub Actions secrets and are not needed for local development of the application itself.
+**Azure deployment secrets** (set in GitHub repository secrets):
+
+| Secret | Description |
+|---|---|
+| `AZURE_WEBAPP_PUBLISH_PROFILE_API` | Azure publish profile for `training-bot-api` App Service |
+| `AZURE_WEBAPP_PUBLISH_PROFILE_FRONTEND` | Azure publish profile for `training-bot-frontend` App Service |
 
 ---
 
 ## 6. Running Tests
 
+Tests are located in the `tests/` directory. The CI pipeline uses Python 3.13 and `uv`.
+
 ```bash
-# Run the full test suite
+# Install dependencies (if not already done)
+uv sync
+
+# Run all tests with verbose output
 uv run pytest tests/ -v
 ```
 
+To run a specific test file:
+
 ```bash
-# Run with coverage (if pytest-cov is installed)
-uv run pytest tests/ -v --cov=api --cov=core
+uv run pytest tests/test_<module>.py -v
 ```
 
-> [TODO: Are there existing test files under `tests/`? No test files were present in the provided source listing.]
-
-The CI pipeline runs tests automatically on every push and pull request to `main` via `.github/workflows/deploy.yml` before any deployment proceeds.
+[TODO: What test files exist under `tests/`? No test source files were provided — confirm test coverage and any fixtures required.]
 
 ---
 
 ## 7. Deployment
 
-### Automatic (CI/CD)
+Deployment is handled automatically by the **Test & Deploy** GitHub Actions workflow (`.github/workflows/deploy.yml`) on every push to `main`.
 
-Deployment to Azure App Service is triggered automatically on every push to `main` after tests pass:
+### Automatic CI/CD (GitHub Actions)
 
+The workflow:
+1. Runs the full test suite.
+2. On success, exports `requirements.txt` from `uv` and deploys to two Azure App Service instances.
+
+```yaml
+# Triggered automatically on push to main
+# See .github/workflows/deploy.yml
 ```
-git push origin main
-# → GitHub Actions: test → deploy-api + deploy-frontend (parallel)
-```
 
-The workflow (`.github/workflows/deploy.yml`) performs:
-1. Runs `pytest` on Python 3.13
-2. Exports `requirements.txt` via `uv export --no-dev --format requirements-txt -o requirements.txt`
-3. Deploys to `training-bot-api` Azure App Service using the `AZURE_WEBAPP_PUBLISH_PROFILE_API` secret
-4. Deploys to `training-bot-frontend` Azure App Service using the `AZURE_WEBAPP_PUBLISH_PROFILE_FRONTEND` secret
+### Manual Deployment Steps
 
-### Manual PDF Ingestion
-
-After deployment, ingest documents by calling the ingestion endpoint:
+1. **Generate `requirements.txt`** from the `uv` lockfile:
 
 ```bash
-curl -X POST https://<your-api-app>.azurewebsites.net/ingest
+uv export --no-dev --format requirements-txt -o requirements.txt
 ```
 
-Or run locally against the data directory:
+2. **Deploy the API** to Azure App Service (`training-bot-api`):
 
 ```bash
-uv run python core/ingest.py --pdf-dir data/Insurance-product-info --verbose
+# Using Azure CLI
+az webapp deploy \
+  --resource-group <your-resource-group> \
+  --name training-bot-api \
+  --src-path . \
+  --type zip
 ```
 
-### GitHub Actions AI-Delivery Tools
+3. **Deploy the Frontend** to Azure App Service (`training-bot-frontend`):
 
-These run automatically based on their triggers but can also be dispatched manually from the GitHub Actions UI:
+```bash
+az webapp deploy \
+  --resource-group <your-resource-group> \
+  --name training-bot-frontend \
+  --src-path . \
+  --type zip
+```
 
-| Tool | Trigger | Manual dispatch |
+[TODO: What Azure resource group and region are used? These are not specified in any source file.]
+
+4. **Ingest PDFs** into the vector store after first deployment by calling:
+
+```bash
+curl -X POST https://<training-bot-api>.azurewebsites.net/ingest
+```
+
+### AI Delivery Workflow Tools
+
+Five additional GitHub Actions workflows are included for AI-assisted development operations:
+
+| Workflow | Trigger | Purpose |
 |---|---|---|
-| Tool 1 — Code Review | PR open/sync, Monday 08:00 UTC | ✅ (mode: `repo` or `pr`) |
-| Tool 2 — Tech Docs | Push to `main`, Sunday 06:00 UTC | ✅ |
-| Tool 3 — Business Docs | Push of version tag `v*` | ✅ (project name + version) |
-| Tool 4 — Auto Testing | PR open/sync on source files, Wednesday 07:00 UTC | ✅ (mode: `generate` or `gap-analysis`) |
-| Tool 5 — UAT | `release/*` branch creation | ✅ (mode: `generate` or `analyse`) |
+| `tool1_code_review.yml` | PR open/sync, Monday 08:00 UTC, manual | Claude code review → PR comments |
+| `tool2_tech_docs.yml` | Push to main, Sunday 06:00 UTC, manual | Generate README / ARCHITECTURE / RUNBOOK |
+| `tool3_business_docs.yml` | Version tag (`v*`), manual | Generate business solution overview |
+| `tool4_auto_testing.yml` | PR open/sync on src files, Wednesday 07:00 UTC, manual | Generate or gap-analyse tests |
+| `tool5_uat.yml` | `release/*` branch creation, manual | Generate UAT test pack or analyse results |
+
+These tools require `ANTHROPIC_API_KEY`, `GH_TOKEN`, and `SENDGRID_API_KEY` set as repository secrets.
 
 ---
 
 ## 8. Known Issues / TODOs
 
-### From source code comments
+The following are extracted directly from code comments and evident gaps in the source files:
 
 | Location | Issue / TODO |
 |---|---|
-| `api/main.py` | `httpx.Client(verify=False)` and `httpx.AsyncClient(verify=False)` — SSL certificate verification is disabled for all LLM HTTP calls. This is a security risk in production. |
-| `api/main.py` | `SHOW_TOOL_CALLS` print statement contains a logic bug: `os.getenv("SHOW_TOOL_CALLS"," ").lower()== "true"` has a space in the default value which will always evaluate to `False`, differing from the variable it is meant to debug. |
-| `api/agent.py` | `ASSESSOR_SYSTEM` prompt is truncated in the provided source — the tool list description is cut off at `get_cu...`. [TODO: Confirm assessor system prompt is complete in the actual file.] |
-| `core/chunker.py` | `split_by_words` function is truncated — implementation body not shown. [TODO: Confirm function is complete in the actual file.] |
-| `core/annotator.py` | Comment `# custom annotation logic` suggests the `annotate_document` function body is incomplete in the provided excerpt. [TODO: Confirm full implementation exists.] |
-| `core/ingest.py` | `argparse` block is truncated — `--pdf-dir` default path is cut off. [TODO: Confirm CLI arguments in the actual file.] |
-| `.github/scripts/tool2_tech_docs.py` | `build_index` function is truncated — references an undefined variable `r` (likely a typo for `repo`). |
+| `api/main.py` | `httpx.Client(verify=False)` and `httpx.AsyncClient(verify=False)` — SSL certificate verification is **disabled** for all LLM API calls. This is a security risk and should not be used in production. |
+| `api/main.py` | `SHOW_TOOL_CALLS` env var parsing has a debug `print()` statement left in production code: `print(f"SHOW_TOOL_CALLS=...")` |
+| `api/agent.py` | `ASSESSOR_SYSTEM` prompt is truncated in the source file — the full assessor system prompt and tool list are incomplete. |
+| `api/rag_tools.py` | Source file is truncated — the `_collect_sources` function body is cut off; full implementation not visible. |
+| `core/annotator.py` | Comment `# custom annotation logic` suggests the `annotate_document` function body is incomplete or placeholder. |
+| `core/chunker.py` | `split_by_words` function is truncated — implementation cut off. |
+| `core/ingest.py` | `--pdf-dir` argument default path is truncated. |
+| `.github/scripts/tool2_tech_docs.py` | `build_index` function is truncated mid-string (`{owner}/{r`). |
+| `.github/scripts/tool3_business_docs.py` | `build_full_output` function is truncated. |
 | `.github/scripts/tool4_auto_testing.py` | `build_test_report` function is truncated. |
-| `.github/scripts/tool5_uat.py` | `build_test_pack_csv` function signature is truncated (`list[d...`). |
-| `api/agent.py` | Uses `from langchain.agents import create_agent` — `create_agent` is not a standard LangChain export; may require a specific version or custom implementation. [TODO: Confirm correct import path.] |
-| `TEACHER_SYSTEM` / `ASSESSOR_SYSTEM` | Escalation path for operational issues: `[TODO: fill in team contacts]` (referenced in tool2 runbook template). |
-| General | No disaster recovery or cross-region failover is configured. Single Azure region deployment. |
-| General | No monitoring or alerting configuration is present in the provided files. [TODO: What APM/logging solution is used in production?] |
-| General | The frontend entrypoint is not present in the repository files provided. [TODO: Where is the Chainlit app or Vite frontend source?] |
-| `data/sessions.json` | Sessions are persisted to a local file — this will not survive Azure App Service restarts if the filesystem is ephemeral. [TODO: Should sessions be persisted to a database or Azure Blob Storage?] |
+| `.github/scripts/tool5_uat.py` | `build_test_pack_csv` function signature is truncated. |
+| `.github/scripts/shared.py` | `send_email` and `email_html` and `write_audit_entry` functions are referenced by all tool scripts but their implementations are truncated/missing from the file shown. |
+| `api/sessions.py` | `CustomerProfile.describe()` method is truncated. |
+| All tool workflows | `NOTIFY_EMAIL` and `SENDER_EMAIL` are hardcoded to `kylo.deng@capco.com` in workflow env blocks — should be parameterised as secrets. |
+| `tool5_uat.yml` | Escalation path in runbook: `[TODO: fill in team contacts]` |
+| General | No disaster recovery, monitoring, or alerting configuration is present in any source file. |
+| General | The frontend framework and start command are not evidenced in the provided source files. [TODO: What framework is used for the frontend served on port 5173?] |
+| `core/vector_store.py` | Not provided — `ChromaStore`, `LocalFAISSStore`, and `PineconeStore` implementations are not visible. [TODO: Which vector store backend is used by default in production?] |
