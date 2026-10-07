@@ -1,11 +1,11 @@
 # Auto-Generated Test Report
 **Repo:** kylodeng/Insurance-Training-Bot-main  
-**Generated:** 2026-09-30 13:31 UTC
+**Generated:** 2026-10-07 14:25 UTC
 
 ## Summary
 | Source File | Est. Coverage | Generated Test File | TODOs |
 |---|---|---|---|
-| `.github/scripts/shared.py` | ~70% | auto-tests/kylodeng-Insurance-Training-Bot-main/python/test_shared.py | 5 TODOs |
+| `.github/scripts/shared.py` | ~70% | auto-tests/kylodeng-Insurance-Training-Bot-main/python/test_shared.py | 4 TODOs |
 | `.github/scripts/tool1_code_review.py` | ~70% | auto-tests/kylodeng-Insurance-Training-Bot-main/python/test_tool1_code_review.py | 4 TODOs |
 | `.github/scripts/tool2_tech_docs.py` | ~70% | auto-tests/kylodeng-Insurance-Training-Bot-main/python/test_tool2_tech_docs.py | 4 TODOs |
 | `.github/scripts/tool3_business_docs.py` | ~70% | auto-tests/kylodeng-Insurance-Training-Bot-main/python/test_tool3_business_docs.py | 4 TODOs |
