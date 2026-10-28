@@ -2,336 +2,336 @@
 Test module for tool3_business_docs.py
 
 What is tested:
-    - generate_biz_doc(): happy path (with/without ---GAPS--- delimiter), error propagation
-    - build_full_output(): structure, content inclusion, edge cases (empty gaps, long strings)
-    - __main__ block behaviour via subprocess / monkeypatching (env vars, success, failure)
+    - generate_biz_doc(): happy path, missing delimiter, Claude errors
+    - build_full_output(): markdown construction, gap questionnaire, metadata embedding
+    - __main__ block behaviour (env-var driven entry point)
 
 Mocks used:
-    - shared.call_claude          → unittest.mock.patch
-    - shared.get_repo_files       → unittest.mock.patch
-    - shared.write_output_file    → unittest.mock.patch
-    - shared.send_email           → unittest.mock.patch
-    - shared.email_html           → unittest.mock.patch
-    - shared.write_audit_entry    → unittest.mock.patch
-    - datetime.datetime.utcnow    → unittest.mock.patch
+    - shared.call_claude          → prevents real Anthropic API calls
+    - shared.get_repo_files       → prevents real GitHub API calls
+    - shared.write_output_file    → prevents real GitHub commit/push
+    - shared.send_email           → prevents real SES/SMTP calls
+    - shared.email_html           → returns deterministic HTML string
+    - shared.write_audit_entry    → prevents real audit-log writes
+    - datetime.datetime.utcnow    → frozen to 2024-06-15 12:00:00 for determinism
 
 TODOs:
-    - TODO: Integration test that validates full Claude response parsing with a real prompt
-    - TODO: Test __main__ block failure branch once source file is syntactically complete
-            (the source has a truncated string literal at the end)
-    - TODO: Validate email HTML content structure against a schema/template
+    - TODO: test __main__ FAILED branch end-to-end (requires importlib.reload with mocked env)
+    - TODO: test write_output_file return-value propagation to send_email
+    - TODO: test behaviour when SOURCE_REPO_OWNER / SOURCE_REPO_NAME are None (unset env)
 """
 
-import importlib
 import sys
 import os
-import datetime
+import importlib
 import types
+import datetime
 from unittest.mock import patch, MagicMock, call
 
 import pytest
 
 # ---------------------------------------------------------------------------
-# Helpers to import the module under test with its `shared` dependency mocked
+# Helpers to build a minimal fake "shared" module so we can import the target
+# without having the real shared.py on the path.
 # ---------------------------------------------------------------------------
 
-FAKE_OUTPUT_REPO_OWNER = "test-owner"
+FAKE_OUTPUT_REPO_OWNER = "test-org"
 FAKE_OUTPUT_REPO = "test-output-repo"
 
 
-def _make_shared_mock():
-    """Return a MagicMock that stands in for the `shared` module."""
-    shared = MagicMock()
-    shared.OUTPUT_REPO_OWNER = FAKE_OUTPUT_REPO_OWNER
-    shared.OUTPUT_REPO = FAKE_OUTPUT_REPO
-    return shared
-
-
-def _import_module(shared_mock):
-    """
-    Import tool3_business_docs with a stubbed `shared` module.
-    Re-imports each time so patches are isolated.
-    """
-    # Inject our fake `shared` before the real import resolves it
-    sys.modules["shared"] = shared_mock
-
-    module_path = os.path.join(
-        os.path.dirname(__file__),
-        ".github",
-        "scripts",
-        "tool3_business_docs.py",
-    )
-
-    spec = importlib.util.spec_from_file_location("tool3_business_docs", module_path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+def _make_fake_shared():
+    """Return a types.ModuleType that satisfies all imports in the target file."""
+    mod = types.ModuleType("shared")
+    mod.call_claude = MagicMock(return_value="CLAUDE_OUTPUT")
+    mod.get_repo_files = MagicMock(return_value={})
+    mod.write_output_file = MagicMock(return_value="https://github.com/test-org/test-output-repo/blob/main/file.md")
+    mod.send_email = MagicMock(return_value=None)
+    mod.email_html = MagicMock(return_value="<html>mock</html>")
+    mod.write_audit_entry = MagicMock(return_value=None)
+    mod.OUTPUT_REPO_OWNER = FAKE_OUTPUT_REPO_OWNER
+    mod.OUTPUT_REPO = FAKE_OUTPUT_REPO
     return mod
 
 
 # ---------------------------------------------------------------------------
-# Fixtures
+# Fixture: import the module under test with a fresh fake shared each time.
 # ---------------------------------------------------------------------------
 
-FIXED_DATE = datetime.datetime(2024, 6, 15, 12, 0, 0)
-FIXED_DATE_STR = "2024-06-15"
-FIXED_DATETIME_STR = "2024-06-15 12:00 UTC"
-
-
 @pytest.fixture()
-def shared_mock():
-    mock = _make_shared_mock()
-    yield mock
-    # Clean up sys.modules so other tests get a fresh import
-    sys.modules.pop("shared", None)
-    sys.modules.pop("tool3_business_docs", None)
+def biz_docs_module():
+    """Import (or re-import) tool3_business_docs with a controlled fake shared module."""
+    fake_shared = _make_fake_shared()
+    with patch.dict(sys.modules, {"shared": fake_shared}):
+        # Make sure the scripts directory is on the path so the file can be found
+        scripts_dir = os.path.join(os.path.dirname(__file__), ".github", "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
 
+        # Remove any previously cached version so imports are clean
+        sys.modules.pop("tool3_business_docs", None)
 
-@pytest.fixture()
-def module(shared_mock):
-    return _import_module(shared_mock)
+        spec_path = os.path.join(
+            os.path.dirname(__file__), ".github", "scripts", "tool3_business_docs.py"
+        )
 
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("tool3_business_docs", spec_path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["tool3_business_docs"] = mod
+        spec.loader.exec_module(mod)
 
-@pytest.fixture()
-def frozen_utcnow(monkeypatch, module):
-    """Freeze datetime.datetime.utcnow inside the module under test."""
-    fake_dt = MagicMock(wraps=datetime.datetime)
-    fake_dt.utcnow.return_value = FIXED_DATE
-    monkeypatch.setattr(module.datetime, "datetime", fake_dt)
-    return fake_dt
+    return mod, fake_shared
 
 
 # ---------------------------------------------------------------------------
-# Sample repo files (drawn from synthetic data context)
+# Frozen datetime helper
 # ---------------------------------------------------------------------------
 
-SAMPLE_FILES = {
-    "README.md": "# Generations II Insurance platform\nProvides lifelong protection.",
-    "main.py": "import boto3\n\ndef handler(event, context):\n    return {'statusCode': 200}",
-    "infra/main.tf": 'resource "aws_s3_bucket" "docs" { bucket = "insurance-docs" }',
-}
+FROZEN_DT = datetime.datetime(2024, 6, 15, 12, 0, 0)
+FROZEN_DATE_STR = "2024-06-15"
+FROZEN_DATETIME_STR = "2024-06-15 12:00 UTC"
 
-SAMPLE_DOC = """# Solution overview: MyProject
 
-**Version:** 1.0.0 | **Date:** 2024-06-15 | **Status:** Draft
-
-## Executive summary
-This tool automates business documentation.
-
-## What it does NOT do (out of scope)
-- No manual editing
-- No real-time updates
-- No multi-language support
-"""
-
-SAMPLE_GAPS = """1. Who is the business sponsor?
-2. What is the target go-live date?
-3. What SLA is expected for document generation?
-"""
-
-SAMPLE_RAW_WITH_GAPS = f"{SAMPLE_DOC}\n---GAPS---\n{SAMPLE_GAPS}"
-SAMPLE_RAW_WITHOUT_GAPS = SAMPLE_DOC  # no delimiter
+class _FakeDatetime(datetime.datetime):
+    @classmethod
+    def utcnow(cls):
+        return FROZEN_DT
 
 
 # ===========================================================================
 # Tests for generate_biz_doc()
 # ===========================================================================
 
-
 class TestGenerateBizDoc:
-    """Tests for the generate_biz_doc() function."""
 
-    def test_happy_path_with_gaps_delimiter(self, module, shared_mock, frozen_utcnow):
-        """Claude returns well-formed output with ---GAPS--- delimiter."""
-        shared_mock.get_repo_files.return_value = SAMPLE_FILES
-        shared_mock.call_claude.return_value = SAMPLE_RAW_WITH_GAPS
+    def test_happy_path_with_delimiter(self, biz_docs_module):
+        """Claude returns both sections separated by ---GAPS---."""
+        mod, shared = biz_docs_module
 
-        doc, gaps = module.generate_biz_doc(
-            "acme", "platform", "MyProject", "1.0.0", "https://github.com/run/1"
+        repo_files = {
+            "main.py": "print('hello')",
+            "README.md": "# My project",
+        }
+        shared.get_repo_files.return_value = repo_files
+        shared.call_claude.return_value = (
+            "# Solution overview: MyProject\nSome content."
+            "\n---GAPS---\n"
+            "1. What is the go-live date?\n2. Who is the sponsor?"
         )
 
-        assert "Solution overview" in doc
-        assert "Who is the business sponsor" in gaps
-        # Ensure the delimiter itself is NOT present in either part
+        with patch("datetime.datetime", _FakeDatetime):
+            doc, gaps = mod.generate_biz_doc("my-org", "my-repo", "MyProject", "1.0.0", "https://run-url")
+
+        assert "Solution overview: MyProject" in doc
+        assert "Some content." in doc
+        assert "What is the go-live date?" in gaps
+        assert "Who is the sponsor?" in gaps
         assert "---GAPS---" not in doc
         assert "---GAPS---" not in gaps
 
-    def test_happy_path_without_gaps_delimiter(self, module, shared_mock, frozen_utcnow):
-        """Claude returns output without ---GAPS--- delimiter → fallback message."""
-        shared_mock.get_repo_files.return_value = SAMPLE_FILES
-        shared_mock.call_claude.return_value = SAMPLE_RAW_WITHOUT_GAPS
+    def test_missing_delimiter_falls_back_gracefully(self, biz_docs_module):
+        """When Claude omits ---GAPS---, doc_part = full response, gaps_part = fallback message."""
+        mod, shared = biz_docs_module
 
-        doc, gaps = module.generate_biz_doc(
-            "acme", "platform", "MyProject", "1.0.0", "https://github.com/run/1"
+        shared.get_repo_files.return_value = {"app.ts": "const x = 1;"}
+        shared.call_claude.return_value = "Just a plain document with no delimiter."
+
+        doc, gaps = mod.generate_biz_doc("org", "repo", "Proj", "0.0.1", "https://run")
+
+        assert doc == "Just a plain document with no delimiter."
+        assert "Claude could not extract gap questions" in gaps
+
+    def test_empty_repo_files(self, biz_docs_module):
+        """No files returned from repo — call_claude still called with empty files section."""
+        mod, shared = biz_docs_module
+
+        shared.get_repo_files.return_value = {}
+        shared.call_claude.return_value = "Doc\n---GAPS---\n1. Question?"
+
+        doc, gaps = mod.generate_biz_doc("org", "repo", "Proj", "1.2.3", "https://run")
+
+        assert doc == "Doc"
+        assert "Question?" in gaps
+
+        # Verify call_claude was called
+        shared.call_claude.assert_called_once()
+        call_args = shared.call_claude.call_args
+        assert "org/repo" in call_args[0][1]
+
+    def test_file_content_truncated_to_3000_chars(self, biz_docs_module):
+        """File content longer than 3000 chars should be truncated in the prompt."""
+        mod, shared = biz_docs_module
+
+        long_content = "x" * 5000
+        shared.get_repo_files.return_value = {"big_file.py": long_content}
+        shared.call_claude.return_value = "Doc\n---GAPS---\n1. Q?"
+
+        mod.generate_biz_doc("org", "repo", "P", "1.0", "url")
+
+        call_args = shared.call_claude.call_args
+        files_str_arg = call_args[0][1]
+        # The truncated content slice [:3000] means "x"*3000, not 5000
+        assert "x" * 3001 not in files_str_arg
+        assert "x" * 3000 in files_str_arg
+
+    def test_get_repo_files_called_with_correct_extensions(self, biz_docs_module):
+        """get_repo_files must be called with the expected extension list."""
+        mod, shared = biz_docs_module
+
+        shared.get_repo_files.return_value = {}
+        shared.call_claude.return_value = "D\n---GAPS---\nQ"
+
+        mod.generate_biz_doc("owner", "repo", "P", "v1", "url")
+
+        shared.get_repo_files.assert_called_once()
+        call_args = shared.get_repo_files.call_args
+        extensions = call_args[0][2]
+        for ext in [".py", ".js", ".ts", ".tf", ".yaml", ".md"]:
+            assert ext in extensions
+
+    def test_prompt_contains_project_name_version_date(self, biz_docs_module):
+        """The formatted SYSTEM prompt sent to Claude must contain project_name, version, date."""
+        mod, shared = biz_docs_module
+
+        shared.get_repo_files.return_value = {}
+        shared.call_claude.return_value = "D\n---GAPS---\nQ"
+
+        with patch("datetime.datetime", _FakeDatetime):
+            mod.generate_biz_doc("org", "repo", "InsuranceApp", "2.3.4", "url")
+
+        system_prompt = shared.call_claude.call_args[0][0]
+        assert "InsuranceApp" in system_prompt
+        assert "2.3.4" in system_prompt
+        assert FROZEN_DATE_STR in system_prompt
+
+    def test_multiple_files_joined_in_prompt(self, biz_docs_module):
+        """Multiple repo files should each appear in the user message."""
+        mod, shared = biz_docs_module
+
+        shared.get_repo_files.return_value = {
+            "file_a.py": "code_a",
+            "file_b.tf": "resource {}",
+        }
+        shared.call_claude.return_value = "D\n---GAPS---\nQ"
+
+        mod.generate_biz_doc("org", "repo", "P", "1", "url")
+
+        user_msg = shared.call_claude.call_args[0][1]
+        assert "file_a.py" in user_msg
+        assert "file_b.tf" in user_msg
+        assert "code_a" in user_msg
+
+    def test_only_first_delimiter_is_used(self, biz_docs_module):
+        """Only the first ---GAPS--- should split the response."""
+        mod, shared = biz_docs_module
+
+        shared.get_repo_files.return_value = {}
+        shared.call_claude.return_value = (
+            "Part one\n---GAPS---\nGap section\n---GAPS---\nExtra junk"
         )
 
-        assert "Solution overview" in doc
-        assert "review the document manually" in gaps.lower() or "could not extract" in gaps.lower()
+        doc, gaps = mod.generate_biz_doc("o", "r", "P", "1", "u")
 
-    def test_get_repo_files_called_with_correct_extensions(self, module, shared_mock, frozen_utcnow):
-        """get_repo_files is called with expected file extensions and max_files."""
-        shared_mock.get_repo_files.return_value = {}
-        shared_mock.call_claude.return_value = "no gaps here"
+        assert doc == "Part one"
+        assert "Extra junk" in gaps  # everything after first split stays in gaps
 
-        module.generate_biz_doc("owner", "repo", "Proj", "0.1.0", "")
+    def test_whitespace_stripped_from_parts(self, biz_docs_module):
+        """Leading/trailing whitespace in both parts should be stripped."""
+        mod, shared = biz_docs_module
 
-        shared_mock.get_repo_files.assert_called_once()
-        args, kwargs = shared_mock.get_repo_files.call_args
-        extensions = args[2] if len(args) > 2 else kwargs.get("extensions", [])
-        assert ".py" in extensions
-        assert ".tf" in extensions
-        assert ".md" in extensions
-        assert kwargs.get("max_files", args[3] if len(args) > 3 else None) == 20
+        shared.get_repo_files.return_value = {}
+        shared.call_claude.return_value = "   Doc content   \n---GAPS---\n   Gap content   \n"
 
-    def test_call_claude_receives_formatted_prompt(self, module, shared_mock, frozen_utcnow):
-        """call_claude is invoked with the project_name and version inserted."""
-        shared_mock.get_repo_files.return_value = SAMPLE_FILES
-        shared_mock.call_claude.return_value = "doc---GAPS---gaps"
+        doc, gaps = mod.generate_biz_doc("o", "r", "P", "1", "u")
 
-        module.generate_biz_doc("owner", "repo", "InsuranceBot", "2.3.0", "")
+        assert doc == "Doc content"
+        assert gaps == "Gap content"
 
-        args, _ = shared_mock.call_claude.call_args
-        prompt_arg = args[0]
-        assert "InsuranceBot" in prompt_arg
-        assert "2.3.0" in prompt_arg
-        assert FIXED_DATE_STR in prompt_arg
+    def test_call_claude_raises_propagates(self, biz_docs_module):
+        """If call_claude raises, generate_biz_doc should propagate the exception."""
+        mod, shared = biz_docs_module
 
-    def test_files_content_passed_to_claude(self, module, shared_mock, frozen_utcnow):
-        """File contents appear in the user message sent to Claude."""
-        shared_mock.get_repo_files.return_value = SAMPLE_FILES
-        shared_mock.call_claude.return_value = "doc---GAPS---gaps"
+        shared.get_repo_files.return_value = {}
+        shared.call_claude.side_effect = RuntimeError("API quota exceeded")
 
-        module.generate_biz_doc("owner", "repo", "Proj", "1.0.0", "")
+        with pytest.raises(RuntimeError, match="API quota exceeded"):
+            mod.generate_biz_doc("o", "r", "P", "1", "u")
 
-        _, user_msg = shared_mock.call_claude.call_args[0]
-        assert "README.md" in user_msg
-        assert "Generations II" in user_msg
+    def test_get_repo_files_raises_propagates(self, biz_docs_module):
+        """If get_repo_files raises, generate_biz_doc should propagate the exception."""
+        mod, shared = biz_docs_module
 
-    def test_empty_repo_files(self, module, shared_mock, frozen_utcnow):
-        """Empty repo dict still results in a call to Claude."""
-        shared_mock.get_repo_files.return_value = {}
-        shared_mock.call_claude.return_value = SAMPLE_RAW_WITH_GAPS
+        shared.get_repo_files.side_effect = ConnectionError("GitHub unreachable")
 
-        doc, gaps = module.generate_biz_doc("o", "r", "P", "0.0.1", "")
-
-        shared_mock.call_claude.assert_called_once()
-        assert doc  # not empty
-        assert gaps
-
-    def test_multiple_gaps_delimiters_splits_on_first(self, module, shared_mock, frozen_utcnow):
-        """Only the first ---GAPS--- delimiter is used as the split point."""
-        raw = "DOC_PART---GAPS---FIRST_GAPS---GAPS---SECOND_GAPS"
-        shared_mock.get_repo_files.return_value = {}
-        shared_mock.call_claude.return_value = raw
-
-        doc, gaps = module.generate_biz_doc("o", "r", "P", "1.0.0", "")
-
-        assert doc.strip() == "DOC_PART"
-        assert "FIRST_GAPS" in gaps
-        assert "SECOND_GAPS" in gaps  # remainder stays in gaps section
-
-    def test_call_claude_exception_propagates(self, module, shared_mock):
-        """Exceptions raised by call_claude are not swallowed."""
-        shared_mock.get_repo_files.return_value = {}
-        shared_mock.call_claude.side_effect = RuntimeError("Claude API down")
-
-        with pytest.raises(RuntimeError, match="Claude API down"):
-            module.generate_biz_doc("o", "r", "P", "1.0.0", "")
-
-    def test_get_repo_files_exception_propagates(self, module, shared_mock):
-        """Exceptions from get_repo_files propagate to the caller."""
-        shared_mock.get_repo_files.side_effect = ConnectionError("GitHub timeout")
-
-        with pytest.raises(ConnectionError, match="GitHub timeout"):
-            module.generate_biz_doc("o", "r", "P", "1.0.0", "")
-
-    def test_large_file_content_truncated_in_prompt(self, module, shared_mock, frozen_utcnow):
-        """Files with >3000 chars are sliced to 3000 chars in the prompt."""
-        long_content = "x" * 5000
-        shared_mock.get_repo_files.return_value = {"big.py": long_content}
-        shared_mock.call_claude.return_value = "doc---GAPS---gaps"
-
-        module.generate_biz_doc("o", "r", "P", "1.0.0", "")
-
-        _, user_msg = shared_mock.call_claude.call_args[0]
-        # The truncated block should contain exactly 3000 x's, not 5000
-        assert "x" * 3000 in user_msg
-        assert "x" * 3001 not in user_msg
-
-    @pytest.mark.parametrize("owner,repo,project_name,version", [
-        ("sun-life", "generations-ii", "Generations II", "2.0.0"),
-        ("acme", "hospital-list", "Designated Hospitals", "1.5.3"),
-        ("org", "cashless", "Cashless Network", "0.9.1"),
-    ])
-    def test_parametrised_inputs(
-        self, module, shared_mock, frozen_utcnow,
-        owner, repo, project_name, version
-    ):
-        """generate_biz_doc works for various owner/repo/project/version combos."""
-        shared_mock.get_repo_files.return_value = SAMPLE_FILES
-        shared_mock.call_claude.return_value = SAMPLE_RAW_WITH_GAPS
-
-        doc, gaps = module.generate_biz_doc(owner, repo, project_name, version, "")
-
-        assert isinstance(doc, str) and doc
-        assert isinstance(gaps, str) and gaps
+        with pytest.raises(ConnectionError, match="GitHub unreachable"):
+            mod.generate_biz_doc("o", "r", "P", "1", "u")
 
 
 # ===========================================================================
 # Tests for build_full_output()
 # ===========================================================================
 
-
 class TestBuildFullOutput:
-    """Tests for the build_full_output() function."""
 
-    def test_full_md_contains_doc(self, module, frozen_utcnow):
-        full_md, _ = module.build_full_output(
-            SAMPLE_DOC, SAMPLE_GAPS, "acme", "platform", "MyProject", "1.0.0"
+    @pytest.fixture()
+    def sample_inputs(self):
+        return dict(
+            doc="# Solution overview: TestProject\nSome body text.",
+            gaps="1. What is the go-live date?\n2. Who is the business sponsor?",
+            owner="my-org",
+            repo="my-repo",
+            project_name="TestProject",
+            version="1.0.0",
         )
-        assert "Solution overview" in full_md
 
-    def test_full_md_contains_gaps(self, module, frozen_utcnow):
-        full_md, _ = module.build_full_output(
-            SAMPLE_DOC, SAMPLE_GAPS, "acme", "platform", "MyProject", "1.0.0"
-        )
-        assert "Who is the business sponsor" in full_md
+    def test_full_md_contains_doc_content(self, biz_docs_module, sample_inputs):
+        mod, _ = biz_docs_module
+        with patch("datetime.datetime", _FakeDatetime):
+            full_md, _ = mod.build_full_output(**sample_inputs)
+        assert "Solution overview: TestProject" in full_md
+        assert "Some body text." in full_md
 
-    def test_full_md_contains_gap_questionnaire_heading(self, module, frozen_utcnow):
-        full_md, _ = module.build_full_output(
-            SAMPLE_DOC, SAMPLE_GAPS, "acme", "platform", "MyProject", "1.0.0"
-        )
-        assert "## Gap Questionnaire" in full_md
+    def test_full_md_contains_gaps(self, biz_docs_module, sample_inputs):
+        mod, _ = biz_docs_module
+        with patch("datetime.datetime", _FakeDatetime):
+            full_md, _ = mod.build_full_output(**sample_inputs)
+        assert "What is the go-live date?" in full_md
+        assert "Who is the business sponsor?" in full_md
 
-    def test_full_md_contains_source_attribution(self, module, frozen_utcnow):
-        full_md, _ = module.build_full_output(
-            SAMPLE_DOC, SAMPLE_GAPS, "acme", "platform", "MyProject", "1.0.0"
-        )
-        assert "acme/platform" in full_md
+    def test_full_md_contains_metadata_footer(self, biz_docs_module, sample_inputs):
+        mod, _ = biz_docs_module
+        with patch("datetime.datetime", _FakeDatetime):
+            full_md, _ = mod.build_full_output(**sample_inputs)
+        assert "my-org/my-repo" in full_md
         assert "1.0.0" in full_md
+        assert "AI Delivery Bot" in full_md
 
-    def test_gap_only_md_contains_project_name(self, module, frozen_utcnow):
-        _, gap_only_md = module.build_full_output(
-            SAMPLE_DOC, SAMPLE_GAPS, "acme", "platform", "MyProject", "1.0.0"
-        )
-        assert "MyProject" in gap_only_md
+    def test_gap_only_md_contains_project_and_version(self, biz_docs_module, sample_inputs):
+        mod, _ = biz_docs_module
+        with patch("datetime.datetime", _FakeDatetime):
+            _, gap_only_md = mod.build_full_output(**sample_inputs)
+        assert "TestProject" in gap_only_md
+        assert "v1.0.0" in gap_only_md
 
-    def test_gap_only_md_contains_version(self, module, frozen_utcnow):
-        _, gap_only_md = module.build_full_output(
-            SAMPLE_DOC, SAMPLE_GAPS, "acme", "platform", "MyProject", "1.0.0"
-        )
-        assert "1.0.0" in gap_only_md
+    def test_gap_only_md_contains_gap_questions(self, biz_docs_module, sample_inputs):
+        mod, _ = biz_docs_module
+        with patch("datetime.datetime", _FakeDatetime):
+            _, gap_only_md = mod.build_full_output(**sample_inputs)
+        assert "What is the go-live date?" in gap_only_md
+        assert "Who is the business sponsor?" in gap_only_md
 
-    def test_gap_only_md_contains_output_repo_link(self, module, frozen_utcnow):
-        _, gap_only_md = module.build_full_output(
-            SAMPLE_DOC, SAMPLE_GAPS, "acme", "platform", "MyProject", "1.0.0"
-        )
+    def test_gap_only_md_links_to_output_repo(self, biz_docs_module, sample_inputs):
+        """The standalone gap questionnaire should link back to the output repo."""
+        mod, _ = biz_docs_module
+        with patch("datetime.datetime", _FakeDatetime):
+            _, gap_only_md = mod.build_full_output(**sample_inputs)
         assert FAKE_OUTPUT_REPO_OWNER in gap_only_md
         assert FAKE_OUTPUT_REPO in gap_only_md
 
-    def test_gap_only_md_contains_gaps_content(self, module, frozen_utcnow):
-        _, gap_only_md = module.build_full_output(
-            SAMPLE_DOC, SAMPLE_GAPS, "acme", "platform", "MyProject", "1.0.0"
-        )
-        assert "Who is the business sponsor" in gap_only_md
+    def test_full_md_contains_gap_questionnaire_section_header(self, biz_docs_module, sample_inputs):
+        mod, _ = biz_docs_module
+        with patch("datetime.datetime", _FakeDatetime):
+            full_md, _ = mod.build_full_output(**sample_inputs)
+        assert "Gap Questionnaire" in full_md
 
-    def test_frozen_timestamp_appears_in_full_md(self, module, frozen
+    def test_
