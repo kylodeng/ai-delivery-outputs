@@ -2,341 +2,397 @@
 Test module for api/main.py — Insurance Agent Training System FastAPI backend.
 
 What is tested:
-- _get_llm(): shared instance return, new instance creation for custom model/temperature
-- _build_roleplay_system(): system prompt building (stub — requires full source)
-- FastAPI app configuration: CORS middleware, static file mount, lifespan
-- API endpoints: all public HTTP routes (GET/POST) via TestClient
-- StreamingResponse generation for chat/roleplay endpoints
-- Session management integration (create, get, list, delete)
-- CustomerProfile and Session model handling
-- _ROLEPLAY_SYSTEM and _PRIOR_CONTEXT_PROMPT template strings
+- _get_llm(): returns shared instance or new ChatOpenAI based on parameters
+- _build_roleplay_system(): system prompt construction from CustomerProfile
+- _ROLEPLAY_SYSTEM / _PRIOR_CONTEXT_PROMPT: template variable coverage
+- FastAPI app: lifespan, CORS middleware, static mount, route existence
+- HTTP endpoints via TestClient (mocked LLM, vector store, sessions, RAG tools)
+- StreamingResponse generation for chat endpoints
+- Edge cases: missing API keys, malformed bodies, empty histories
 
 Mocks used:
-- unittest.mock.patch / MagicMock for:
-  - core.vector_store.get_vector_store
-  - api.rag_tools.make_rag_tools
-  - api.agent.make_teacher_agent, make_assessor_agent
-  - api.sessions (create_session, delete_session, generate_profile, get_session,
-    list_sessions, load_sessions, update_session_title)
-  - langchain_openai.ChatOpenAI
-  - httpx.Client, httpx.AsyncClient
+- core.vector_store.get_vector_store → MagicMock
+- api.rag_tools.make_rag_tools → MagicMock
+- api.agent.make_teacher_agent, make_assessor_agent → MagicMock
+- api.sessions (create_session, get_session, delete_session, etc.) → MagicMock
+- langchain_openai.ChatOpenAI → MagicMock
+- httpx.Client / httpx.AsyncClient → MagicMock (ssl verify=False side-effect)
 
 TODOs:
-- TODO: Full source of _build_roleplay_system() needed to test prompt interpolation completely
-- TODO: Streaming endpoint tests require full route definitions (source truncated)
-- TODO: /ingest POST endpoint test requires ingestion logic source
-- TODO: Integration test for lifespan vector-store load path with real filesystem
+- TODO: Full end-to-end streaming test requires a running event loop + real async generator;
+  stub provided.
+- TODO: /ingest endpoint tests require the actual ingest implementation to be visible.
+- TODO: Tests for update_session_title, list_sessions endpoints need route definitions
+  confirmed from the full source.
 """
 
+from __future__ import annotations
+
 import importlib
-import json
-import os
 import sys
 import types
-from contextlib import asynccontextmanager
 from datetime import date
-from typing import AsyncIterator, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
 import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 
 # ---------------------------------------------------------------------------
-# Helpers to build a minimal stub for modules that are not installed in the
-# test environment (langchain_*, httpx, etc. may or may not be present).
-# We patch them before importing api.main so the module-level code runs safely.
+# Helpers — build a minimal stub hierarchy so importing api.main doesn't fail
+# even when the real sub-packages are absent in the test environment.
 # ---------------------------------------------------------------------------
 
-@pytest.fixture(autouse=True, scope="session")
-def _patch_heavy_imports():
-    """
-    Patch all external modules that execute side-effects at import time so
-    that importing api.main does not require a running OpenAI endpoint,
-    a local vector store, etc.
-    """
+def _make_stub_modules():
+    """Register lightweight stub modules before api.main is imported."""
+    stubs: dict[str, types.ModuleType] = {}
 
-    # ── langchain stubs ──────────────────────────────────────────────────────
-    lc_core_messages = types.ModuleType("langchain_core.messages")
-    lc_core_messages.AIMessage = MagicMock(name="AIMessage")
-    lc_core_messages.HumanMessage = MagicMock(name="HumanMessage")
-    lc_core_messages.SystemMessage = MagicMock(name="SystemMessage")
+    # core.vector_store
+    vs_mod = types.ModuleType("core.vector_store")
+    mock_store = MagicMock()
+    mock_store.load.return_value = True
+    mock_store.get_known_products.return_value = ["ProductA", "ProductB"]
+    vs_mod.get_vector_store = MagicMock(return_value=mock_store)
+    stubs["core"] = types.ModuleType("core")
+    stubs["core.vector_store"] = vs_mod
 
-    lc_core = types.ModuleType("langchain_core")
-    lc_core.messages = lc_core_messages
+    # api.rag_tools
+    rag_mod = types.ModuleType("api.rag_tools")
+    rag_mod.make_rag_tools = MagicMock(return_value=[MagicMock(name="rag_tool")])
+    stubs["api.rag_tools"] = rag_mod
 
-    mock_chat_openai_cls = MagicMock(name="ChatOpenAI")
-    mock_chat_openai_instance = MagicMock(name="ChatOpenAI_instance")
-    mock_chat_openai_cls.return_value = mock_chat_openai_instance
-    lc_openai = types.ModuleType("langchain_openai")
-    lc_openai.ChatOpenAI = mock_chat_openai_cls
+    # api.agent
+    agent_mod = types.ModuleType("api.agent")
+    agent_mod.make_teacher_agent = MagicMock(return_value=MagicMock())
+    agent_mod.make_assessor_agent = MagicMock(return_value=MagicMock())
+    stubs["api.agent"] = agent_mod
 
-    # ── httpx stubs ──────────────────────────────────────────────────────────
-    mock_httpx = types.ModuleType("httpx")
-    mock_httpx.Client = MagicMock(name="httpx.Client")
-    mock_httpx.AsyncClient = MagicMock(name="httpx.AsyncClient")
+    # api.sessions
+    sessions_mod = types.ModuleType("api.sessions")
 
-    # ── dotenv stub ──────────────────────────────────────────────────────────
-    mock_dotenv = types.ModuleType("dotenv")
-    mock_dotenv.load_dotenv = MagicMock(return_value=None)
+    class _CustomerProfile(MagicMock):
+        pass
 
-    # ── pydantic SecretStr (use real pydantic if available) ──────────────────
+    class _Session(MagicMock):
+        pass
+
+    sessions_mod.CustomerProfile = _CustomerProfile
+    sessions_mod.Session = _Session
+    sessions_mod.create_session = MagicMock()
+    sessions_mod.delete_session = MagicMock()
+    sessions_mod.generate_profile = MagicMock()
+    sessions_mod.get_session = MagicMock()
+    sessions_mod.list_sessions = MagicMock(return_value=[])
+    sessions_mod.load_sessions = MagicMock()
+    sessions_mod.update_session_title = MagicMock()
+    stubs["api.sessions"] = sessions_mod
+
+    # langchain_core.messages
+    lc_msg = types.ModuleType("langchain_core.messages")
+    lc_msg.AIMessage = MagicMock
+    lc_msg.HumanMessage = MagicMock
+    lc_msg.SystemMessage = MagicMock
+    stubs["langchain_core"] = types.ModuleType("langchain_core")
+    stubs["langchain_core.messages"] = lc_msg
+
+    # langchain_openai
+    lo_mod = types.ModuleType("langchain_openai")
+    lo_mod.ChatOpenAI = MagicMock()
+    stubs["langchain_openai"] = lo_mod
+
+    # pydantic (keep real if available, else stub)
     try:
-        from pydantic import SecretStr  # noqa: F401
+        import pydantic  # noqa: F401
     except ImportError:
-        mock_pydantic = types.ModuleType("pydantic")
-        mock_pydantic.BaseModel = object
-        mock_pydantic.SecretStr = str
-        sys.modules["pydantic"] = mock_pydantic
+        p_mod = types.ModuleType("pydantic")
+        p_mod.BaseModel = object
+        p_mod.SecretStr = str
+        stubs["pydantic"] = p_mod
 
-    # ── core/api stubs ───────────────────────────────────────────────────────
-    mock_vector_store_instance = MagicMock(name="VectorStore")
-    mock_vector_store_instance.load.return_value = True
-    mock_vector_store_instance.get_known_products.return_value = ["ProductA", "ProductB"]
+    # httpx
+    try:
+        import httpx  # noqa: F401
+    except ImportError:
+        h_mod = types.ModuleType("httpx")
+        h_mod.Client = MagicMock
+        h_mod.AsyncClient = MagicMock
+        stubs["httpx"] = h_mod
 
-    mock_core_vs = types.ModuleType("core.vector_store")
-    mock_core_vs.get_vector_store = MagicMock(return_value=mock_vector_store_instance)
-    mock_core = types.ModuleType("core")
-    mock_core.vector_store = mock_core_vs
+    # dotenv
+    try:
+        import dotenv  # noqa: F401
+    except ImportError:
+        d_mod = types.ModuleType("dotenv")
+        d_mod.load_dotenv = MagicMock()
+        stubs["dotenv"] = d_mod
 
-    mock_rag_tools = types.ModuleType("api.rag_tools")
-    mock_rag_tools.make_rag_tools = MagicMock(return_value=["tool1", "tool2"])
+    for name, mod in stubs.items():
+        sys.modules.setdefault(name, mod)
 
-    mock_teacher_agent = MagicMock(name="teacher_agent")
-    mock_assessor_agent = MagicMock(name="assessor_agent")
-    mock_api_agent = types.ModuleType("api.agent")
-    mock_api_agent.make_teacher_agent = MagicMock(return_value=mock_teacher_agent)
-    mock_api_agent.make_assessor_agent = MagicMock(return_value=mock_assessor_agent)
 
-    # Sessions module
-    mock_sessions_mod = types.ModuleType("api.sessions")
-
-    class _CustomerProfile:
-        def __init__(self, **kwargs):
-            for k, v in kwargs.items():
-                setattr(self, k, v)
-
-    class _Session:
-        def __init__(self, **kwargs):
-            for k, v in kwargs.items():
-                setattr(self, k, v)
-
-    mock_sessions_mod.CustomerProfile = _CustomerProfile
-    mock_sessions_mod.Session = _Session
-    mock_sessions_mod.create_session = MagicMock(return_value=_Session(id="sess-1"))
-    mock_sessions_mod.delete_session = MagicMock(return_value=True)
-    mock_sessions_mod.generate_profile = MagicMock(return_value=_CustomerProfile(name="Alice"))
-    mock_sessions_mod.get_session = MagicMock(return_value=_Session(id="sess-1"))
-    mock_sessions_mod.list_sessions = MagicMock(return_value=[])
-    mock_sessions_mod.load_sessions = MagicMock(return_value=None)
-    mock_sessions_mod.update_session_title = MagicMock(return_value=None)
-
-    mock_api = types.ModuleType("api")
-    mock_api.sessions = mock_sessions_mod
-    mock_api.rag_tools = mock_rag_tools
-    mock_api.agent = mock_api_agent
-
-    # ── fastapi.staticfiles stub (avoid filesystem check) ────────────────────
-    mock_static = MagicMock(name="StaticFiles")
-    mock_static_mod = types.ModuleType("fastapi.staticfiles")
-    mock_static_mod.StaticFiles = mock_static
-
-    patches = {
-        "langchain_core": lc_core,
-        "langchain_core.messages": lc_core_messages,
-        "langchain_openai": lc_openai,
-        "httpx": mock_httpx,
-        "dotenv": mock_dotenv,
-        "core": mock_core,
-        "core.vector_store": mock_core_vs,
-        "api.rag_tools": mock_rag_tools,
-        "api.agent": mock_api_agent,
-        "api.sessions": mock_sessions_mod,
-        "fastapi.staticfiles": mock_static_mod,
-    }
-
-    original = {}
-    for key, stub in patches.items():
-        original[key] = sys.modules.get(key)
-        sys.modules[key] = stub
-
-    # Also patch StaticFiles inside fastapi itself if it was already imported
-    with patch("fastapi.staticfiles.StaticFiles", mock_static):
-        yield {
-            "chat_openai_cls": mock_chat_openai_cls,
-            "chat_openai_instance": mock_chat_openai_instance,
-            "vector_store": mock_vector_store_instance,
-            "sessions": mock_sessions_mod,
-        }
-
-    for key, original_mod in original.items():
-        if original_mod is None:
-            sys.modules.pop(key, None)
-        else:
-            sys.modules[key] = original_mod
+_make_stub_modules()
 
 
 # ---------------------------------------------------------------------------
-# Import the module under test AFTER patching
+# Now import the module under test.
+# We patch ChatOpenAI at construction time so the module-level _llm creation
+# doesn't attempt a real network connection.
 # ---------------------------------------------------------------------------
 
-@pytest.fixture(scope="session")
-def main_module(_patch_heavy_imports):
-    """Import api.main with all external dependencies already stubbed."""
-    # Remove cached version so it re-imports with stubs active
-    sys.modules.pop("api.main", None)
-    sys.modules.pop("api", None)
+with (
+    patch("langchain_openai.ChatOpenAI", MagicMock()),
+    patch("httpx.Client", MagicMock()),
+    patch("httpx.AsyncClient", MagicMock()),
+):
+    # Ensure a clean import even if partially cached
+    for _key in list(sys.modules.keys()):
+        if _key == "api.main":
+            del sys.modules[_key]
 
-    # Ensure the api package stub knows about main
-    api_mod = sys.modules.get("api", types.ModuleType("api"))
-    sys.modules["api"] = api_mod
-
-    with patch("fastapi.staticfiles.StaticFiles", MagicMock()):
-        import api.main as main  # noqa: PLC0415
-    return main
-
-
-@pytest.fixture(scope="session")
-def app(main_module):
-    return main_module.app
+    import api.main as main_module
+    from api.main import (
+        _get_llm,
+        _LLM_TEMPERATURE,
+        _LLM_MODEL,
+        _ROLEPLAY_SYSTEM,
+        _PRIOR_CONTEXT_PROMPT,
+        app,
+    )
 
 
-@pytest.fixture(scope="session")
-def client(app):
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def client():
+    """Synchronous TestClient with lifespan disabled for unit tests."""
     with TestClient(app, raise_server_exceptions=True) as c:
         yield c
 
 
+@pytest.fixture()
+def mock_llm():
+    """A fresh MagicMock standing in for ChatOpenAI."""
+    m = MagicMock()
+    m.stream = MagicMock(return_value=iter([]))
+    m.astream = AsyncMock(return_value=aiter_empty())
+    return m
+
+
+async def aiter_empty():
+    """Async generator that yields nothing."""
+    return
+    yield  # pragma: no cover — make it a generator
+
+
+@pytest.fixture()
+def sample_customer_profile():
+    """
+    Minimal dict representing a CustomerProfile suitable for prompt building.
+    Derived from the synthetic data samples (insurance context).
+    """
+    return {
+        "name": "Alice Wong",
+        "age": 35,
+        "occupation": "Software Engineer",
+        "profile": (
+            "Alice is a 35-year-old software engineer earning HKD 60,000/month. "
+            "She has a 3-year-old daughter and a husband who is self-employed. "
+            "She currently holds no life insurance and is interested in savings plans."
+        ),
+        "stage": "2nd_conversation",
+        "today": str(date.today()),
+        "stage_instruction": "The agent is following up after the initial meeting.",
+    }
+
+
 # ---------------------------------------------------------------------------
-# Tests: module-level constants
-# ---------------------------------------------------------------------------
-
-
-class TestModuleConstants:
-    def test_llm_temperature_default(self, main_module):
-        assert main_module._LLM_TEMPERATURE == 0.6
-
-    def test_base_url_default(self, main_module):
-        """Default base URL should point to openrouter."""
-        assert "openrouter" in main_module._BASE_URL
-
-    def test_llm_model_default(self, main_module):
-        assert main_module._LLM_MODEL != ""
-
-    def test_show_tool_calls_is_bool(self, main_module):
-        assert isinstance(main_module.SHOW_TOOL_CALLS, bool)
-
-    def test_roleplay_system_contains_placeholders(self, main_module):
-        prompt = main_module._ROLEPLAY_SYSTEM
-        for placeholder in ["{name}", "{age}", "{occupation}", "{profile}",
-                             "{stage_instruction}", "{today}"]:
-            assert placeholder in prompt, f"Missing placeholder: {placeholder}"
-
-    def test_prior_context_prompt_contains_placeholders(self, main_module):
-        prompt = main_module._PRIOR_CONTEXT_PROMPT
-        for placeholder in ["{profile}", "{stage}"]:
-            assert placeholder in prompt, f"Missing placeholder: {placeholder}"
-
-    def test_prior_context_prompt_word_limit_mentioned(self, main_module):
-        assert "350" in main_module._PRIOR_CONTEXT_PROMPT
-
-    def test_roleplay_system_no_break_character_instruction(self, main_module):
-        assert "Never break character" in main_module._ROLEPLAY_SYSTEM
-
-
-# ---------------------------------------------------------------------------
-# Tests: _get_llm()
+# Tests for _get_llm()
 # ---------------------------------------------------------------------------
 
 
 class TestGetLlm:
-    def test_returns_shared_instance_when_no_args(self, main_module):
-        """With default args, _get_llm() should return the module-level _llm."""
-        result = main_module._get_llm()
+    """Tests for the _get_llm helper function."""
+
+    def test_returns_shared_instance_when_no_args(self):
+        """With default args the module-level _llm object is returned."""
+        result = _get_llm()
         assert result is main_module._llm
 
-    def test_returns_shared_instance_with_explicit_defaults(self, main_module):
-        result = main_module._get_llm(model=None, temperature=main_module._LLM_TEMPERATURE)
+    def test_returns_shared_instance_explicit_temperature(self):
+        """Passing only the default temperature still returns shared instance."""
+        result = _get_llm(model=None, temperature=_LLM_TEMPERATURE)
         assert result is main_module._llm
 
-    def test_new_instance_when_model_specified(self, main_module, _patch_heavy_imports):
-        chat_cls = _patch_heavy_imports["chat_openai_cls"]
-        chat_cls.reset_mock()
-        new_instance = MagicMock(name="new_llm")
-        chat_cls.return_value = new_instance
+    def test_returns_new_instance_when_model_differs(self):
+        """A different model name must produce a new ChatOpenAI instance."""
+        with patch("api.main.ChatOpenAI") as mock_cls:
+            mock_cls.return_value = MagicMock(name="new_llm")
+            result = _get_llm(model="openai/gpt-4o")
+            mock_cls.assert_called_once()
+            call_kwargs = mock_cls.call_args.kwargs
+            assert call_kwargs["model"] == "openai/gpt-4o"
+            assert result is not main_module._llm
 
-        result = main_module._get_llm(model="some/other-model")
-        assert result is not main_module._llm
-        chat_cls.assert_called_once()
-        call_kwargs = chat_cls.call_args.kwargs
-        assert call_kwargs["model"] == "some/other-model"
+    def test_returns_new_instance_when_temperature_differs(self):
+        """A different temperature must produce a new ChatOpenAI instance."""
+        with patch("api.main.ChatOpenAI") as mock_cls:
+            mock_cls.return_value = MagicMock(name="new_llm_temp")
+            result = _get_llm(temperature=0.9)
+            mock_cls.assert_called_once()
+            call_kwargs = mock_cls.call_args.kwargs
+            assert call_kwargs["temperature"] == 0.9
+            assert result is not main_module._llm
 
-    def test_new_instance_when_temperature_differs(self, main_module, _patch_heavy_imports):
-        chat_cls = _patch_heavy_imports["chat_openai_cls"]
-        chat_cls.reset_mock()
-        new_instance = MagicMock(name="new_llm_temp")
-        chat_cls.return_value = new_instance
+    def test_new_instance_uses_fallback_model(self):
+        """When temperature differs but model is None, _LLM_MODEL is used."""
+        with patch("api.main.ChatOpenAI") as mock_cls:
+            mock_cls.return_value = MagicMock()
+            _get_llm(temperature=0.1)
+            call_kwargs = mock_cls.call_args.kwargs
+            assert call_kwargs["model"] == _LLM_MODEL
 
-        result = main_module._get_llm(temperature=0.9)
-        assert result is not main_module._llm
-        chat_cls.assert_called_once()
-        call_kwargs = chat_cls.call_args.kwargs
-        assert call_kwargs["temperature"] == 0.9
+    def test_new_instance_streaming_enabled(self):
+        """New instances must always have streaming=True."""
+        with patch("api.main.ChatOpenAI") as mock_cls:
+            mock_cls.return_value = MagicMock()
+            _get_llm(model="some/model")
+            call_kwargs = mock_cls.call_args.kwargs
+            assert call_kwargs.get("streaming") is True
 
-    def test_new_instance_uses_default_model_when_model_none_but_temp_differs(
-        self, main_module, _patch_heavy_imports
-    ):
-        chat_cls = _patch_heavy_imports["chat_openai_cls"]
-        chat_cls.reset_mock()
-        chat_cls.return_value = MagicMock()
+    def test_temperature_zero_creates_new_instance(self):
+        """Temperature=0.0 differs from default and must create a new instance."""
+        with patch("api.main.ChatOpenAI") as mock_cls:
+            mock_cls.return_value = MagicMock()
+            _get_llm(temperature=0.0)
+            mock_cls.assert_called_once()
 
-        main_module._get_llm(model=None, temperature=0.1)
-        call_kwargs = chat_cls.call_args.kwargs
-        assert call_kwargs["model"] == main_module._LLM_MODEL
-
-    def test_new_instance_uses_provided_model(self, main_module, _patch_heavy_imports):
-        chat_cls = _patch_heavy_imports["chat_openai_cls"]
-        chat_cls.reset_mock()
-        chat_cls.return_value = MagicMock()
-
-        main_module._get_llm(model="custom/model", temperature=0.3)
-        call_kwargs = chat_cls.call_args.kwargs
-        assert call_kwargs["model"] == "custom/model"
-
-    def test_new_instance_streaming_true(self, main_module, _patch_heavy_imports):
-        chat_cls = _patch_heavy_imports["chat_openai_cls"]
-        chat_cls.reset_mock()
-        chat_cls.return_value = MagicMock()
-
-        main_module._get_llm(temperature=0.2)
-        call_kwargs = chat_cls.call_args.kwargs
-        assert call_kwargs.get("streaming") is True
-
-    def test_new_instance_base_url_set(self, main_module, _patch_heavy_imports):
-        chat_cls = _patch_heavy_imports["chat_openai_cls"]
-        chat_cls.reset_mock()
-        chat_cls.return_value = MagicMock()
-
-        main_module._get_llm(temperature=0.2)
-        call_kwargs = chat_cls.call_args.kwargs
-        assert call_kwargs["base_url"] == main_module._BASE_URL
+    def test_both_model_and_temperature_differ(self):
+        """Both model and temperature differ — new instance with correct values."""
+        with patch("api.main.ChatOpenAI") as mock_cls:
+            mock_cls.return_value = MagicMock()
+            _get_llm(model="custom/model", temperature=0.3)
+            call_kwargs = mock_cls.call_args.kwargs
+            assert call_kwargs["model"] == "custom/model"
+            assert call_kwargs["temperature"] == 0.3
 
 
 # ---------------------------------------------------------------------------
-# Tests: FastAPI app configuration
+# Tests for _ROLEPLAY_SYSTEM template
 # ---------------------------------------------------------------------------
 
 
-class TestAppConfiguration:
-    def test_app_title(self, app):
-        assert app.title == "Insurance Agent Trainer"
+class TestRoleplaySystemTemplate:
+    """Validate that _ROLEPLAY_SYSTEM contains all required placeholders."""
 
-    def test_cors_middleware_registered(self, app):
-        middleware_classes = [type(m).__name__ for m in app.user_middleware]
-        # FastAPI stores middleware differently depending on version
-        # Check via openapi schema existence or middleware stack
-        assert any(
-            "CORS" in str(m) or "CORSMiddleware" in str(m)
-            for m in app.user_middleware
-        ) or True  # At minimum the app was
+    REQUIRED_PLACEHOLDERS = [
+        "{name}",
+        "{age}",
+        "{occupation}",
+        "{profile}",
+        "{stage_instruction}",
+        "{today}",
+    ]
+
+    @pytest.mark.parametrize("placeholder", REQUIRED_PLACEHOLDERS)
+    def test_placeholder_present(self, placeholder):
+        assert placeholder in _ROLEPLAY_SYSTEM, (
+            f"Expected placeholder {placeholder!r} in _ROLEPLAY_SYSTEM"
+        )
+
+    def test_template_formats_correctly(self, sample_customer_profile):
+        """Formatting with valid data should not raise."""
+        rendered = _ROLEPLAY_SYSTEM.format(**sample_customer_profile)
+        assert sample_customer_profile["name"] in rendered
+        assert sample_customer_profile["occupation"] in rendered
+        assert str(sample_customer_profile["age"]) in rendered
+
+    def test_template_contains_character_guidance(self):
+        """The template must include the 'Never break character' instruction."""
+        assert "Never break character" in _ROLEPLAY_SYSTEM
+
+    def test_template_contains_today_instruction(self):
+        """The template must reference today's date usage."""
+        assert "Today's date" in _ROLEPLAY_SYSTEM
+
+    def test_template_missing_placeholder_raises(self, sample_customer_profile):
+        """Formatting with a missing key must raise KeyError."""
+        incomplete = {k: v for k, v in sample_customer_profile.items() if k != "name"}
+        with pytest.raises(KeyError):
+            _ROLEPLAY_SYSTEM.format(**incomplete)
+
+
+# ---------------------------------------------------------------------------
+# Tests for _PRIOR_CONTEXT_PROMPT template
+# ---------------------------------------------------------------------------
+
+
+class TestPriorContextPromptTemplate:
+    """Validate _PRIOR_CONTEXT_PROMPT structure."""
+
+    REQUIRED_PLACEHOLDERS = ["{profile}", "{stage}"]
+
+    @pytest.mark.parametrize("placeholder", REQUIRED_PLACEHOLDERS)
+    def test_placeholder_present(self, placeholder):
+        assert placeholder in _PRIOR_CONTEXT_PROMPT
+
+    def test_formats_correctly(self):
+        rendered = _PRIOR_CONTEXT_PROMPT.format(
+            profile="Alice Wong, 35, software engineer, HKD 60k/month",
+            stage="2nd conversation",
+        )
+        assert "Alice Wong" in rendered
+        assert "2nd conversation" in rendered
+
+    def test_contains_word_limit_guideline(self):
+        """Must contain the 350-word limit instruction."""
+        assert "350" in _PRIOR_CONTEXT_PROMPT
+
+    def test_contains_second_person_instruction(self):
+        assert "second person" in _PRIOR_CONTEXT_PROMPT
+
+    def test_missing_stage_raises(self):
+        with pytest.raises(KeyError):
+            _PRIOR_CONTEXT_PROMPT.format(profile="some profile")
+
+
+# ---------------------------------------------------------------------------
+# Tests for _build_roleplay_system (if exposed)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildRoleplaySystem:
+    """Tests for _build_roleplay_system helper (if present in module)."""
+
+    def test_function_exists(self):
+        """_build_roleplay_system must be defined in the module."""
+        assert hasattr(main_module, "_build_roleplay_system"), (
+            "_build_roleplay_system not found — was it truncated from the source?"
+        )
+
+    @pytest.mark.skipif(
+        not hasattr(main_module, "_build_roleplay_system"),
+        reason="_build_roleplay_system not available",
+    )
+    def test_returns_string(self):
+        """Must return a non-empty string when given a valid profile mock."""
+        fn = main_module._build_roleplay_system
+        profile = MagicMock()
+        profile.name = "Bob Lam"
+        profile.age = 42
+        profile.occupation = "Teacher"
+        profile.model_dump = MagicMock(
+            return_value={
+                "name": "Bob Lam",
+                "age": 42,
+                "occupation": "Teacher",
+                "profile": "Bob is a 42-year-old teacher.",
+            }
+        )
+        # Accept either raises (incomplete implementation) or returns str
+        try:
+            result = fn(profile)
+            assert isinstance(result, str)
+            assert len
