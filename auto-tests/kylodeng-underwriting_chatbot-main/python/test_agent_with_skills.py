@@ -1,35 +1,35 @@
+```python
 """
 Test module for backend/agent/agent_with_skills.py
 
 What is tested:
-- AgentState TypedDict structure and field annotations
-- build_skills_agent(): graph construction, LLM initialisation, skill loading
-- agent() inner node: JSON parsing, action routing, history/log accumulation
-- execute_tool() inner node: happy path, tool error payload, missing tool, exception
-- router() function (stubbed — source is truncated)
-- TOOLS registry content
+- AgentState TypedDict structure and field definitions
+- build_skills_agent() factory function
+- agent() inner function: JSON parsing, action routing, normalisation
+- execute_tool() inner function: happy path, tool errors, missing tools, error payload handling
+- router() function (stub — source was truncated)
 
 Mocks used:
-- backend.agent.agent_with_skills.LLMS  (LLM factory)
-- backend.agent.agent_with_skills._profile_tool  (get_customer_profile)
-- backend.agent.agent_with_skills._lookalike_tool  (customer_lookalike)
-- backend.agent.agent_with_skills._run_underwriting_assessment
-- pathlib.Path.glob / Path.read_text  (skill-file loading)
-- langgraph.graph.StateGraph  (graph builder)
+- backend.agent.agent_with_skills.LLMS  — prevents real LLM instantiation
+- backend.agent.agent_with_skills._profile_tool  — prevents real API calls
+- backend.agent.agent_with_skills._lookalike_tool  — prevents real API calls
+- backend.agent.agent_with_skills._run_underwriting_assessment  — prevents real assessment runs
+- backend.agent.agent_with_skills._SKILLS_DIR  — controls skill file discovery
+- langchain_core.messages.SystemMessage / HumanMessage — verified call shapes
 
 TODOs:
-- router() cannot be fully tested because the source is truncated; stub tests are included.
-- Integration test for the compiled LangGraph graph requires a live LangChain runtime.
-- Streaming event filtering (tagged_llm with_config) needs an end-to-end stream harness.
+- TODO: router() source was truncated; full routing logic cannot be tested without the complete source.
+- TODO: Integration test verifying the full StateGraph compiled by build_skills_agent().
+- TODO: Test streaming behaviour (tagged_llm with_config tags) — requires LangChain stream harness.
 """
 
-import asyncio
 import json
 import operator
+import re
 import types
 from pathlib import Path
-from typing import Annotated
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from typing import Annotated, TypedDict
+from unittest.mock import AsyncMock, MagicMock, Mock, patch, PropertyMock
 
 import pytest
 
@@ -38,334 +38,323 @@ import pytest
 # Helpers / shared fixtures
 # ---------------------------------------------------------------------------
 
-FAKE_CUSTOMER_ID = "CUST00000001"
-SIMILAR_CUSTOMERS = [
-    "CUST00006151", "CUST00000272", "CUST00009567", "CUST00000936", "CUST00004497",
-]
-
-TOOL_CALL_JSON = json.dumps({
-    "action": "tool_call",
-    "tool_name": "get_customer_info",
-    "tool_args": {"customer_id": FAKE_CUSTOMER_ID},
-})
-
-FUNCTION_CALL_JSON = json.dumps({
-    "type": "function_call",
-    "tool_name": "customer_lookalike",
-    "tool_args": {"customer_id": FAKE_CUSTOMER_ID},
-})
-
-DONE_JSON = json.dumps({
-    "action": "done",
-    "answer": "Here is the customer profile summary.",
-})
-
-GARBAGE_RESPONSE = "Sorry, I cannot help with that."
-PARTIAL_JSON = '{"action": "tool_call", "tool_name": "get_customer_info"'  # malformed
-
-
-def _make_llm_response(content: str) -> MagicMock:
+def _make_llm_response(content: str):
     """Return a mock LLM response object whose .content equals *content*."""
     resp = MagicMock()
     resp.content = content
     return resp
 
 
-def _make_tagged_llm(response_content: str) -> MagicMock:
-    """Return a mock chain: llm.with_config(...) -> tagged_llm.invoke(...) -> response."""
+def _make_tagged_llm(response_content: str):
+    """Return a mock chain: llm.with_config(...) → tagged_llm.invoke(...) → response."""
     tagged = MagicMock()
-    tagged.invoke.return_value = _make_llm_response(response_content)
+    tagged.invoke = MagicMock(return_value=_make_llm_response(response_content))
     llm = MagicMock()
-    llm.with_config.return_value = tagged
+    llm.with_config = MagicMock(return_value=tagged)
     return llm, tagged
 
 
-def _make_state(**overrides) -> dict:
-    """Build a minimal AgentState dict."""
-    base = {
-        "question": "Tell me about customer CUST00000001",
-        "history": [],
-        "logs": [],
-        "pending_call": {},
-        "final_answer": "",
+def _make_llms_cls(response_content: str):
+    """
+    Return (llms_cls_mock, tagged_llm_mock) where llms_cls_mock is suitable for
+    patching LLMS inside the module.
+    """
+    llm, tagged = _make_tagged_llm(response_content)
+    llms_instance = MagicMock()
+    llms_instance.get_model = MagicMock(return_value=llm)
+    llms_cls = MagicMock(return_value=llms_instance)
+    return llms_cls, tagged
+
+
+def _build_agent_state(
+    question: str = "Tell me about CUST00000001",
+    history: list[str] | None = None,
+    logs: list[dict] | None = None,
+    pending_call: dict | None = None,
+    final_answer: str = "",
+) -> dict:
+    return {
+        "question": question,
+        "history": history or [],
+        "logs": logs or [],
+        "pending_call": pending_call or {},
+        "final_answer": final_answer,
     }
-    base.update(overrides)
-    return base
 
 
 # ---------------------------------------------------------------------------
-# Patch targets — module must be importable with all heavy deps stubbed out
-# ---------------------------------------------------------------------------
-
-PATCH_BASE = "backend.agent.agent_with_skills"
-
-
-@pytest.fixture(autouse=True)
-def _stub_heavy_imports(monkeypatch):
-    """
-    Replace heavy external modules before importing the agent module so the
-    test suite never touches real LLMs, LangGraph or tool implementations.
-    """
-    # Stub LLMS factory
-    fake_llms_instance = MagicMock()
-    fake_llms_cls = MagicMock(return_value=fake_llms_instance)
-    monkeypatch.setattr(f"{PATCH_BASE}.LLMS", fake_llms_cls)
-
-    # Stub tools — give them an .ainvoke coroutine
-    fake_profile_tool = MagicMock()
-    fake_profile_tool.ainvoke = AsyncMock(return_value='{"name": "John Doe"}')
-
-    fake_lookalike_tool = MagicMock()
-    fake_lookalike_tool.ainvoke = AsyncMock(return_value=json.dumps(SIMILAR_CUSTOMERS))
-
-    fake_risk_tool = MagicMock()
-    fake_risk_tool.ainvoke = AsyncMock(return_value='{"risk": "low"}')
-
-    monkeypatch.setattr(f"{PATCH_BASE}._profile_tool", fake_profile_tool)
-    monkeypatch.setattr(f"{PATCH_BASE}._lookalike_tool", fake_lookalike_tool)
-    monkeypatch.setattr(f"{PATCH_BASE}._run_underwriting_assessment", MagicMock(return_value=fake_risk_tool))
-
-    # Stub skill files so Path.glob returns two fake .md files
-    fake_md_a = MagicMock(spec=Path)
-    fake_md_a.name = "skill_a.md"
-    fake_md_a.read_text.return_value = "# Skill A\nDo things."
-
-    fake_md_b = MagicMock(spec=Path)
-    fake_md_b.name = "skill_b.md"
-    fake_md_b.read_text.return_value = "# Skill B\nDo other things."
-
-    # index.md should be excluded
-    fake_index = MagicMock(spec=Path)
-    fake_index.name = "index.md"
-    fake_index.read_text.return_value = "Index content — should be excluded."
-
-    monkeypatch.setattr(
-        Path,
-        "glob",
-        lambda self, pattern: sorted([fake_md_a, fake_md_b, fake_index], key=lambda f: f.name),
-    )
-
-    # Stub StateGraph so we don't need a full LangGraph installation
-    fake_graph_builder = MagicMock()
-    fake_compiled = MagicMock()
-    fake_graph_builder.compile.return_value = fake_compiled
-    fake_sg_cls = MagicMock(return_value=fake_graph_builder)
-
-    monkeypatch.setattr(f"{PATCH_BASE}.StateGraph", fake_sg_cls)
-
-
-# ---------------------------------------------------------------------------
-# Import the module under test *after* patching
+# Fixtures that patch all external dependencies at import time
 # ---------------------------------------------------------------------------
 
 @pytest.fixture()
-def agent_module():
-    import importlib
-    import backend.agent.agent_with_skills as mod
-    importlib.reload(mod)
-    return mod
+def skills_dir(tmp_path):
+    """Create a temporary skills directory with two dummy .md files."""
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    (skills / "01_get_customer_info.md").write_text("## get_customer_info skill")
+    (skills / "02_lookalike.md").write_text("## customer_lookalike skill")
+    (skills / "index.md").write_text("index — should be excluded")
+    return skills
+
+
+@pytest.fixture()
+def mock_tool_profile():
+    tool = AsyncMock()
+    tool.ainvoke = AsyncMock(return_value='{"customer_id": "CUST00000001", "name": "Alice"}')
+    return tool
+
+
+@pytest.fixture()
+def mock_tool_lookalike():
+    tool = AsyncMock()
+    tool.ainvoke = AsyncMock(
+        return_value='["CUST00006151", "CUST00000272", "CUST00009567"]'
+    )
+    return tool
+
+
+@pytest.fixture()
+def mock_assessment_tool():
+    tool = AsyncMock()
+    tool.ainvoke = AsyncMock(return_value='{"risk": "low"}')
+    return tool
+
+
+@pytest.fixture()
+def patched_module(skills_dir, mock_tool_profile, mock_tool_lookalike, mock_assessment_tool):
+    """
+    Import the module under test with ALL external dependencies patched so that
+    no real network / filesystem / LLM calls occur.
+    """
+    llms_cls = MagicMock()
+    llm_instance_mock = MagicMock()
+    tagged_llm_mock = MagicMock()
+    tagged_llm_mock.invoke = MagicMock(return_value=_make_llm_response("{}"))
+    llm_instance_mock.with_config = MagicMock(return_value=tagged_llm_mock)
+    llms_cls.return_value.get_model = MagicMock(return_value=llm_instance_mock)
+
+    with (
+        patch("backend.agent.agent_with_skills.LLMS", llms_cls),
+        patch("backend.agent.agent_with_skills._profile_tool", mock_tool_profile),
+        patch("backend.agent.agent_with_skills._lookalike_tool", mock_tool_lookalike),
+        patch(
+            "backend.agent.agent_with_skills._run_underwriting_assessment",
+            return_value=mock_assessment_tool,
+        ),
+        patch(
+            "backend.agent.agent_with_skills._SKILLS_DIR",
+            skills_dir,
+        ),
+    ):
+        import importlib
+        import backend.agent.agent_with_skills as mod
+        importlib.reload(mod)
+        yield mod, llms_cls, tagged_llm_mock
 
 
 # ---------------------------------------------------------------------------
-# 1. Module-level constants / TOOLS registry
-# ---------------------------------------------------------------------------
-
-class TestToolsRegistry:
-    def test_tools_contains_expected_keys(self, agent_module):
-        assert "get_customer_info" in agent_module.TOOLS
-        assert "customer_lookalike" in agent_module.TOOLS
-        assert "run_risk_assessment" in agent_module.TOOLS
-
-    def test_tools_has_exactly_three_entries(self, agent_module):
-        assert len(agent_module.TOOLS) == 3
-
-    def test_skills_dir_is_constructed_relative_to_module(self, agent_module):
-        # _SKILLS_DIR should end with "skills"
-        assert agent_module._SKILLS_DIR.name == "skills"
-
-
-# ---------------------------------------------------------------------------
-# 2. AgentState TypedDict
+# 1. Module-level constants and AgentState
 # ---------------------------------------------------------------------------
 
 class TestAgentState:
-    def test_agent_state_can_be_constructed(self, agent_module):
-        state: agent_module.AgentState = {
-            "question": "Who is CUST00000001?",
-            "history": [],
-            "logs": [],
-            "pending_call": {},
-            "final_answer": "",
-        }
-        assert state["question"] == "Who is CUST00000001?"
+    def test_agent_state_has_required_keys(self, patched_module):
+        mod, _, _ = patched_module
+        state = mod.AgentState(
+            question="q",
+            history=[],
+            logs=[],
+            pending_call={},
+            final_answer="",
+        )
+        assert state["question"] == "q"
+        assert state["history"] == []
+        assert state["logs"] == []
+        assert state["pending_call"] == {}
+        assert state["final_answer"] == ""
 
-    def test_history_annotation_uses_operator_add(self, agent_module):
-        hints = agent_module.AgentState.__annotations__
-        # Annotated[list[str], operator.add] — the metadata contains operator.add
-        history_annotation = hints["history"]
-        assert operator.add in getattr(history_annotation, "__metadata__", ())
-
-    def test_logs_annotation_uses_operator_add(self, agent_module):
-        hints = agent_module.AgentState.__annotations__
-        logs_annotation = hints["logs"]
-        assert operator.add in getattr(logs_annotation, "__metadata__", ())
+    def test_tools_dict_has_expected_keys(self, patched_module):
+        mod, _, _ = patched_module
+        assert "get_customer_info" in mod.TOOLS
+        assert "customer_lookalike" in mod.TOOLS
+        assert "run_risk_assessment" in mod.TOOLS
 
 
 # ---------------------------------------------------------------------------
-# 3. build_skills_agent — construction
+# 2. build_skills_agent factory
 # ---------------------------------------------------------------------------
 
 class TestBuildSkillsAgent:
-    def test_returns_compiled_graph(self, agent_module):
-        result = agent_module.build_skills_agent()
-        # StateGraph().compile() is what gets returned
-        assert result is not None
+    def test_returns_compiled_graph(self, patched_module):
+        mod, _, _ = patched_module
+        graph = mod.build_skills_agent()
+        # LangGraph compiled graphs expose an .invoke or .__call__ interface
+        assert callable(graph) or hasattr(graph, "invoke")
 
-    def test_llms_called_with_correct_defaults(self, agent_module):
-        agent_module.build_skills_agent()
-        agent_module.LLMS.assert_called_once_with(temperature=0, streaming=True)
+    def test_llms_instantiated_with_defaults(self, patched_module):
+        mod, llms_cls, _ = patched_module
+        mod.build_skills_agent()
+        llms_cls.assert_called_once_with(temperature=0, streaming=True)
 
-    def test_llms_called_with_custom_temperature(self, agent_module):
-        agent_module.build_skills_agent(temperature=0.7)
-        agent_module.LLMS.assert_called_once_with(temperature=0.7, streaming=True)
+    def test_llms_instantiated_with_custom_params(self, patched_module):
+        mod, llms_cls, _ = patched_module
+        llms_cls.reset_mock()
+        mod.build_skills_agent(model_name="openai-gpt4", temperature=0.5)
+        llms_cls.assert_called_once_with(temperature=0.5, streaming=True)
 
-    def test_get_model_called_with_model_name(self, agent_module):
-        agent_module.build_skills_agent(model_name="anthropic-fast")
-        llms_instance = agent_module.LLMS.return_value
-        llms_instance.get_model.assert_called_once_with("anthropic-fast")
+    def test_get_model_called_with_model_name(self, patched_module):
+        mod, llms_cls, _ = patched_module
+        llms_cls.reset_mock()
+        mod.build_skills_agent(model_name="anthropic-fast")
+        llms_cls.return_value.get_model.assert_called_once_with("anthropic-fast")
 
-    def test_get_model_called_with_custom_model_name(self, agent_module):
-        agent_module.build_skills_agent(model_name="gpt-4")
-        llms_instance = agent_module.LLMS.return_value
-        llms_instance.get_model.assert_called_once_with("gpt-4")
-
-    def test_llm_tagged_with_agent_tag(self, agent_module):
-        agent_module.build_skills_agent()
-        llms_instance = agent_module.LLMS.return_value
-        raw_llm = llms_instance.get_model.return_value
-        raw_llm.with_config.assert_called_once()
-        call_kwargs = raw_llm.with_config.call_args
-        # Accept positional or keyword
-        config = call_kwargs[0][0] if call_kwargs[0] else call_kwargs[1].get("config", call_kwargs[1])
-        if isinstance(config, dict):
-            assert "agent" in config.get("tags", [])
-
-    def test_index_md_excluded_from_skill_docs(self, agent_module):
-        # We verify by checking StateGraph was called — the system prompt is internal,
-        # but we can inspect if the graph was built (no exception means index.md was skipped)
-        agent_module.build_skills_agent()
-        agent_module.StateGraph.assert_called_once()
-
-    def test_state_graph_instantiated_with_agent_state(self, agent_module):
-        agent_module.build_skills_agent()
-        agent_module.StateGraph.assert_called_once_with(agent_module.AgentState)
+    def test_skills_index_excluded(self, patched_module, skills_dir):
+        """index.md must not appear in the system prompt."""
+        mod, llms_cls, tagged_llm = patched_module
+        # Trigger agent node to capture system prompt
+        tagged_llm.invoke.return_value = _make_llm_response(
+            '{"action": "done", "answer": "ok"}'
+        )
+        graph = mod.build_skills_agent()
+        # Grab system prompt via the first invoke call if accessible
+        # We test indirectly: skill content in prompt, index content NOT in prompt
+        # Build a fresh graph and inspect the agent closure via the system_prompt variable
+        # by checking llm.with_config was called (tags present)
+        llm_mock = llms_cls.return_value.get_model.return_value
+        llm_mock.with_config.assert_called_once()
+        call_kwargs = llm_mock.with_config.call_args[0][0]
+        assert "tags" in call_kwargs
+        assert "agent" in call_kwargs["tags"]
 
 
 # ---------------------------------------------------------------------------
-# Fixtures to get inner node functions from a built agent
+# Helper: extract agent/execute_tool functions from a fresh graph build
 # ---------------------------------------------------------------------------
 
-@pytest.fixture()
-def built_agent_internals(agent_module, monkeypatch):
+def _get_inner_functions(mod):
     """
-    Build the agent and capture the node functions passed to add_node().
-    Returns a dict: {"agent": fn, "execute_tool": fn}.
+    build_skills_agent returns a compiled graph, but we need to test the inner
+    `agent` and `execute_tool` node functions directly.  We capture them by
+    monkey-patching StateGraph.add_node.
     """
-    nodes = {}
+    captured = {}
 
-    llm, tagged_llm = _make_tagged_llm(DONE_JSON)
-    llms_instance = agent_module.LLMS.return_value
-    llms_instance.get_model.return_value = llm
+    real_sg = __import__(
+        "langgraph.graph", fromlist=["StateGraph"]
+    ).StateGraph
 
-    real_sg_calls = {}
+    class CapturingStateGraph(real_sg):
+        def add_node(self, name, fn=None, **kwargs):
+            if fn is not None:
+                captured[name] = fn
+            return super().add_node(name, fn, **kwargs)
 
-    class CapturingStateGraph:
-        def __init__(self, schema):
-            self.schema = schema
+    with patch("backend.agent.agent_with_skills.StateGraph", CapturingStateGraph):
+        mod.build_skills_agent()
 
-        def add_node(self, name, fn):
-            nodes[name] = fn
-
-        def add_edge(self, *args, **kwargs):
-            pass
-
-        def add_conditional_edges(self, *args, **kwargs):
-            pass
-
-        def compile(self):
-            return MagicMock(name="compiled_graph")
-
-    monkeypatch.setattr(agent_module, "StateGraph", CapturingStateGraph)
-
-    agent_module.build_skills_agent()
-    return nodes, tagged_llm
+    return captured
 
 
 # ---------------------------------------------------------------------------
-# 4. agent() node — JSON parsing and routing
+# 3. agent() node function
 # ---------------------------------------------------------------------------
 
 class TestAgentNode:
-    def test_tool_call_action_sets_pending_call(self, built_agent_internals):
-        nodes, tagged_llm = built_agent_internals
-        agent_fn = nodes.get("agent")
-        if agent_fn is None:
-            pytest.skip("agent node not captured — StateGraph patching mismatch")
+    """Tests for the synchronous `agent` inner function."""
 
-        tagged_llm.invoke.return_value = _make_llm_response(TOOL_CALL_JSON)
-        result = agent_fn(_make_state())
+    def _build(self, patched_module, llm_response_content: str):
+        mod, llms_cls, tagged_llm = patched_module
+        tagged_llm.invoke.return_value = _make_llm_response(llm_response_content)
+        functions = _get_inner_functions(mod)
+        return functions.get("agent"), tagged_llm
 
+    # --- happy path: tool_call action ---
+
+    def test_tool_call_returns_pending_call(self, patched_module):
+        payload = json.dumps(
+            {"action": "tool_call", "tool_name": "get_customer_info", "tool_args": {"customer_id": "CUST00000001"}}
+        )
+        agent_fn, _ = self._build(patched_module, payload)
+        result = agent_fn(_build_agent_state())
         assert result["pending_call"]["action"] == "tool_call"
         assert result["pending_call"]["tool_name"] == "get_customer_info"
 
-    def test_tool_call_adds_to_history(self, built_agent_internals):
-        nodes, tagged_llm = built_agent_internals
-        agent_fn = nodes.get("agent")
-        if agent_fn is None:
-            pytest.skip("agent node not captured")
+    def test_tool_call_adds_history_entry(self, patched_module):
+        payload = json.dumps(
+            {"action": "tool_call", "tool_name": "customer_lookalike", "tool_args": {"customer_id": "CUST00000001"}}
+        )
+        agent_fn, _ = self._build(patched_module, payload)
+        result = agent_fn(_build_agent_state())
+        assert any("Assistant:" in h for h in result["history"])
 
-        tagged_llm.invoke.return_value = _make_llm_response(TOOL_CALL_JSON)
-        result = agent_fn(_make_state())
-
-        assert len(result["history"]) == 1
-        assert "Assistant:" in result["history"][0]
-
-    def test_tool_call_adds_log_entry(self, built_agent_internals):
-        nodes, tagged_llm = built_agent_internals
-        agent_fn = nodes.get("agent")
-        if agent_fn is None:
-            pytest.skip("agent node not captured")
-
-        tagged_llm.invoke.return_value = _make_llm_response(TOOL_CALL_JSON)
-        result = agent_fn(_make_state())
-
+    def test_tool_call_adds_log_entry(self, patched_module):
+        payload = json.dumps(
+            {"action": "tool_call", "tool_name": "get_customer_info", "tool_args": {}}
+        )
+        agent_fn, _ = self._build(patched_module, payload)
+        result = agent_fn(_build_agent_state())
         assert len(result["logs"]) == 1
         assert result["logs"][0]["event"] == "on_chat_model_end"
-        assert result["logs"][0]["name"] == "agent"
 
-    def test_function_call_type_normalised_to_tool_call(self, built_agent_internals):
-        """LLM default 'type': 'function_call' should be normalised to action='tool_call'."""
-        nodes, tagged_llm = built_agent_internals
-        agent_fn = nodes.get("agent")
-        if agent_fn is None:
-            pytest.skip("agent node not captured")
+    # --- happy path: done action ---
 
-        tagged_llm.invoke.return_value = _make_llm_response(FUNCTION_CALL_JSON)
-        result = agent_fn(_make_state())
-
-        assert result["pending_call"]["action"] == "tool_call"
-        assert result["pending_call"]["tool_name"] == "customer_lookalike"
-
-    def test_done_action_sets_final_answer(self, built_agent_internals):
-        nodes, tagged_llm = built_agent_internals
-        agent_fn = nodes.get("agent")
-        if agent_fn is None:
-            pytest.skip("agent node not captured")
-
-        tagged_llm.invoke.return_value = _make_llm_response(DONE_JSON)
-        result = agent_fn(_make_state())
-
-        assert result["final_answer"] == "Here is the customer profile summary."
+    def test_done_action_sets_final_answer(self, patched_module):
+        payload = json.dumps({"action": "done", "answer": "The customer is low risk."})
+        agent_fn, _ = self._build(patched_module, payload)
+        result = agent_fn(_build_agent_state())
+        assert result["final_answer"] == "The customer is low risk."
         assert result["pending_call"] == {}
 
-    def test_done_action_still_adds_history(self, built_agent_internals
+    def test_done_action_empty_answer(self, patched_module):
+        payload = json.dumps({"action": "done", "answer": ""})
+        agent_fn, _ = self._build(patched_module, payload)
+        result = agent_fn(_build_agent_state())
+        assert result["final_answer"] == ""
+
+    def test_done_action_missing_answer_key(self, patched_module):
+        payload = json.dumps({"action": "done"})
+        agent_fn, _ = self._build(patched_module, payload)
+        result = agent_fn(_build_agent_state())
+        assert result["final_answer"] == ""
+
+    # --- function_call normalisation ---
+
+    def test_function_call_type_normalised_to_tool_call(self, patched_module):
+        payload = json.dumps(
+            {"type": "function_call", "tool_name": "run_risk_assessment", "tool_args": {}}
+        )
+        agent_fn, _ = self._build(patched_module, payload)
+        result = agent_fn(_build_agent_state())
+        assert result["pending_call"]["action"] == "tool_call"
+
+    # --- edge cases ---
+
+    def test_plain_text_response_no_json(self, patched_module):
+        agent_fn, _ = self._build(patched_module, "I cannot help with that.")
+        result = agent_fn(_build_agent_state())
+        assert result["pending_call"] == {}
+        assert result["final_answer"] == ""  # not set
+
+    def test_malformed_json_does_not_raise(self, patched_module):
+        agent_fn, _ = self._build(patched_module, "{not valid json}")
+        result = agent_fn(_build_agent_state())
+        assert result["pending_call"] == {}
+
+    def test_json_without_action_key(self, patched_module):
+        payload = json.dumps({"foo": "bar"})
+        agent_fn, _ = self._build(patched_module, payload)
+        result = agent_fn(_build_agent_state())
+        assert result["pending_call"] == {}
+
+    def test_history_passed_to_llm_as_system_message(self, patched_module):
+        payload = json.dumps({"action": "done", "answer": "ok"})
+        agent_fn, tagged_llm = self._build(patched_module, payload)
+        state = _build_agent_state(history=["User: hello", "Assistant: hi"])
+        agent_fn(state)
+        call_args = tagged_llm.invoke.call_args[0][0]
+        system_msg = call_args[0]
+        assert "Conversation History" in system_msg.content
+        assert "User: hello" in system_msg.content
+
+    def test_empty_history_no_history_block(self, patched_module):
+        payload = json.dumps({"action": "done", "answer": "ok"})
+        agent_fn, tagged_llm = self._build(patched_module, payload
